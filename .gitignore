@@ -1,0 +1,11 @@
+# Rust build output
+/target
+
+# Project metadata
+/AGENTS.md
+/plan.md
+/docs/
+
+# Agents
+/.codex/
+/.claude/
