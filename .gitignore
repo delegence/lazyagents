@@ -1,11 +1,22 @@
-# Rust build output
-/target
+# Environment
+.env
+.env*.local
 
-# Project metadata
-/AGENTS.md
-/plan.md
-/docs/
+# System Files
+.DS_Store
+Thumbs.db
 
 # Agents
-/.codex/
-/.claude/
+.codex/
+.claude/
+.gemini/
+.tickets/
+.tickets2/
+tkt
+loop
+PROMPT.md
+
+# Rust
+target/
+
+# Project

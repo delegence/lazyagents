@@ -1,6 +1,11 @@
+mod cli;
+mod harness;
+mod integrations;
+mod profile;
+
 fn main() {
-    if let Err(err) = mews::cli::run() {
-        eprintln!("{err}");
+    if let Err(error) = cli::run() {
+        eprintln!("error: {error:#}");
         std::process::exit(1);
     }
 }
