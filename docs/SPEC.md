@@ -305,10 +305,56 @@ Each harness integration owns:
 The intended architecture is:
 
 - one harness = one harness integration file
-- common behavior lives in `src/harness/`
+- common harness mechanics live in `src/harness/`
 - harness-specific behavior does not move into a giant enum match
 - a `HarnessKind` enum may centralize identity and display metadata only
-- adding a new harness should usually mean adding one `src/integrations/<harness>.rs` file and registering it
+- adding a new harness should usually mean adding one `src/integrations/<harness>.rs` file, adding it to the built-in registry in `src/app/harness_registry.rs`, and making it pass the shared integration test suite in `src/integrations/test_suite.rs`
+
+## Architecture Layers
+
+lazyagents uses a small layered architecture:
+
+```text
+src/profile/
+  Profile domain and storage primitives: profile names, config schema, neutral MCP parsing,
+  validation, inspection, skeleton creation, profile filesystem writes.
+
+src/harness/
+  Generic harness primitives and mechanics: harness identity, integration trait, config paths,
+  managed surfaces, drift report type, artifact comparison helpers, transactional apply,
+  backup/rollback, atomic filesystem helpers.
+
+src/integrations/
+  Concrete harness implementations for Codex, Claude Code, and OpenCode. Each integration owns
+  native paths, detection, import/export, native config patching, native MCP mapping, drift checks,
+  apply, preflight, and verification. `test_suite.rs` contains shared test-only contract tests for
+  integration implementations.
+
+src/app/
+  UI-independent product workflows and composition: profile creation/import, deletion safety checks,
+  edit path resolution, profile inspection, doctor report assembly, profile use/drift decisions,
+  active state persistence, and the built-in harness registry.
+
+src/cli/
+  Terminal UI only: clap argument parsing, terminal prompts, rendering, and launching `$EDITOR`.
+```
+
+Dependency direction:
+
+- `profile/` and production `harness/` must not depend on `app/`, `cli/`, or concrete `integrations/`.
+- `integrations/` may depend on `profile/` and `harness/`, but not on `app/` or `cli/` in production code.
+- `app/` may compose `profile/`, `harness/`, and concrete `integrations/` through `app/harness_registry.rs`.
+- `cli/` depends on `app/` and renders typed app results. CLI must not own workflow policy such as drift handling, active-state updates, delete safety checks, or doctor status assembly.
+- Test-only modules may cross these boundaries when they intentionally exercise full workflows.
+
+Important files:
+
+- `src/app/harness_registry.rs` defines `HarnessRegistry` and `BuiltInHarnessRegistry`.
+- `src/app/state.rs` is the single owner of lazyagents active profile state serialization.
+- `src/app/use_profile.rs` owns product-level use/drift decision flow.
+- `src/harness/apply.rs` owns lower-level rollback-protected mutation of one already-approved harness.
+- `src/harness/drift.rs` owns the shared `DriftReport`/`DriftItem` contract returned by harness integrations.
+- `src/integrations/test_suite.rs` owns reusable test-only behavior checks for concrete integrations.
 
 ## Harness Paths
 
@@ -615,7 +661,7 @@ Keep the codebase simple and Rust-idiomatic:
 - use clear user-facing error messages
 - keep harness-specific behavior in harness integration files, but extract shared domain parsing (such as neutral `mcps.json` deserialization and `"default"` config sentinel handling) into the `profile` module to avoid duplication across integrations.
 - keep CLI, TUI, GUI, and other presentation layers separate from storage and core domain logic
-- domain workflows should return typed results or summaries that any UI can render
+- app workflows should return typed results or summaries that any UI can render
 - avoid async
 - avoid new external dependencies unless clearly useful
 
@@ -623,8 +669,8 @@ Preferred module shape:
 
 ```text
 src/
+  app/
   cli/
-  core/
   harness/
   integrations/
   profile/
@@ -633,12 +679,9 @@ src/
 
 Future cleanup tickets already capture:
 
-- split profile store responsibilities
-- add HarnessKind metadata
 - split harness trait into focused modules
-- extract shared apply-to-one workflow
 - improve validation through show/doctor
-- normalize naming
+- keep CLI rendering thin as app workflows grow
 
 ## Recovery Acceptance Criteria
 

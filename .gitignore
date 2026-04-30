@@ -11,9 +11,10 @@ Thumbs.db
 .claude/
 .gemini/
 .tickets/
-.tickets2/
+cmt
 tkt
 loop
+PLAN.md
 PROMPT.md
 
 # Rust

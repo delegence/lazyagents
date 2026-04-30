@@ -1,8 +1,6 @@
-use clap::{Args, Parser, Subcommand, ValueEnum};
-use std::fmt;
+use clap::{Args, Parser, Subcommand};
 
-use crate::harness::apply::DriftPolicy;
-use crate::harness::kind::HarnessKind;
+use crate::app::use_profile::DriftDecision;
 
 #[derive(Parser)]
 #[command(
@@ -34,8 +32,8 @@ pub enum Command {
 #[derive(Args)]
 pub struct CreateArgs {
     pub name: String,
-    #[arg(long, value_enum)]
-    pub from: Option<HarnessId>,
+    #[arg(long, value_name = "HARNESS")]
+    pub from: Option<String>,
 }
 
 #[derive(Args)]
@@ -53,8 +51,8 @@ pub struct DeleteArgs {
 #[derive(Args)]
 pub struct UseArgs {
     pub profile: String,
-    #[arg(long, value_enum, conflicts_with = "all")]
-    pub harness: Option<HarnessId>,
+    #[arg(long, value_name = "HARNESS", conflicts_with = "all")]
+    pub harness: Option<String>,
     #[arg(long, conflicts_with = "harness")]
     pub all: bool,
     #[arg(long, conflicts_with = "discard_changes")]
@@ -77,17 +75,17 @@ impl UseArgs {
     }
 
     pub fn target(&self) -> UseTarget {
-        match self.harness {
-            Some(harness) => UseTarget::Harness(harness),
+        match &self.harness {
+            Some(harness) => UseTarget::Harness(harness.clone()),
             None => UseTarget::All,
         }
     }
 
-    pub fn drift_policy(&self) -> Option<DriftPolicy> {
+    pub fn drift_decision(&self) -> Option<DriftDecision> {
         if self.save_changes {
-            Some(DriftPolicy::SaveChanges)
+            Some(DriftDecision::SaveChanges)
         } else if self.discard_changes {
-            Some(DriftPolicy::Discard)
+            Some(DriftDecision::DiscardChanges)
         } else {
             None
         }
@@ -95,34 +93,6 @@ impl UseArgs {
 }
 
 pub enum UseTarget {
-    Harness(HarnessId),
+    Harness(String),
     All,
-}
-
-#[derive(Clone, Copy, ValueEnum)]
-pub enum HarnessId {
-    Codex,
-    Claude,
-    Opencode,
-}
-
-impl fmt::Display for HarnessId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            Self::Codex => "codex",
-            Self::Claude => "claude",
-            Self::Opencode => "opencode",
-        };
-        formatter.write_str(name)
-    }
-}
-
-impl HarnessId {
-    pub fn kind(self) -> HarnessKind {
-        match self {
-            Self::Codex => HarnessKind::Codex,
-            Self::Claude => HarnessKind::Claude,
-            Self::Opencode => HarnessKind::OpenCode,
-        }
-    }
 }

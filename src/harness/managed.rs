@@ -50,15 +50,15 @@ pub struct ManagedBackup {
 impl ManagedBackup {
     pub fn capture(
         lazyagents_home: &Path,
-        harness_id: &str,
+        harness_kind: crate::harness::kind::HarnessKind,
         surfaces: &[ManagedSurface],
     ) -> Result<Self> {
         let backups_root = lazyagents_home.join("backups");
         fs::create_dir_all(&backups_root)
             .with_context(|| format!("failed to create backups dir {}", backups_root.display()))?;
 
-        let backup_dir = backups_root.join(harness_id);
-        let temp_dir = backups_root.join(format!(".{}.tmp", harness_id));
+        let backup_dir = backups_root.join(harness_kind.id());
+        let temp_dir = backups_root.join(format!(".{}.tmp", harness_kind.id()));
 
         if temp_dir.exists() {
             fs::remove_dir_all(&temp_dir)
@@ -375,7 +375,7 @@ mod tests {
     fn managed_backup_captures_and_restores_surfaces_on_disk() {
         let temp = tempfile::tempdir().unwrap();
         let lazyagents_home = temp.path().join("lazyagents");
-        let harness_id = "test-harness";
+        let harness_kind = crate::harness::kind::HarnessKind::Codex;
 
         let surfaces_dir = temp.path().join("surfaces");
         fs::create_dir_all(&surfaces_dir).unwrap();
@@ -396,10 +396,10 @@ mod tests {
         ];
 
         // Capture
-        let backup = ManagedBackup::capture(&lazyagents_home, harness_id, &surfaces).unwrap();
+        let backup = ManagedBackup::capture(&lazyagents_home, harness_kind, &surfaces).unwrap();
 
         // Assert backup is on disk
-        let backup_dir = lazyagents_home.join("backups").join(harness_id);
+        let backup_dir = lazyagents_home.join("backups").join(harness_kind.id());
         assert!(backup_dir.exists());
         assert!(backup_dir.join("metadata.json").exists());
         assert!(backup_dir.join("0-test_file.txt").exists());
@@ -436,7 +436,7 @@ mod tests {
         // Assert no temp dir remains
         let temp_dir = lazyagents_home
             .join("backups")
-            .join(format!(".{}.tmp", harness_id));
+            .join(format!(".{}.tmp", harness_kind.id()));
         assert!(!temp_dir.exists());
 
         // Modify surfaces
@@ -460,7 +460,7 @@ mod tests {
     fn managed_surface_directory_ignores_hidden_files() {
         let temp = tempfile::tempdir().unwrap();
         let lazyagents_home = temp.path().join("lazyagents");
-        let harness_id = "test-hidden-harness";
+        let harness_kind = crate::harness::kind::HarnessKind::Codex;
 
         let dir_path = temp.path().join("skills");
         fs::create_dir_all(&dir_path).unwrap();
@@ -474,10 +474,10 @@ mod tests {
         let surfaces = vec![ManagedSurface::directory(&dir_path)];
 
         // Capture backup
-        let backup = ManagedBackup::capture(&lazyagents_home, harness_id, &surfaces).unwrap();
+        let backup = ManagedBackup::capture(&lazyagents_home, harness_kind, &surfaces).unwrap();
 
         // Check backup dir doesn't contain hidden files
-        let backup_dir = lazyagents_home.join("backups").join(harness_id);
+        let backup_dir = lazyagents_home.join("backups").join(harness_kind.id());
         assert!(backup_dir.join("0-skills").join("visible.txt").exists());
         assert!(!backup_dir.join("0-skills").join(".hidden.txt").exists());
         assert!(!backup_dir.join("0-skills").join(".system").exists());
@@ -512,16 +512,16 @@ mod tests {
     fn managed_backup_restore_fails_clearly_for_malformed_manifest() {
         let temp = tempfile::tempdir().unwrap();
         let lazyagents_home = temp.path().join("lazyagents");
-        let harness_id = "test-corrupt-manifest";
+        let harness_kind = crate::harness::kind::HarnessKind::Codex;
         let file_path = temp.path().join("settings.json");
         fs::write(&file_path, "before").unwrap();
         let surfaces = vec![ManagedSurface::file(&file_path)];
 
-        let backup = ManagedBackup::capture(&lazyagents_home, harness_id, &surfaces).unwrap();
+        let backup = ManagedBackup::capture(&lazyagents_home, harness_kind, &surfaces).unwrap();
         fs::write(
             lazyagents_home
                 .join("backups")
-                .join(harness_id)
+                .join(harness_kind.id())
                 .join("metadata.json"),
             "not json",
         )

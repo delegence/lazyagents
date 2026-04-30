@@ -1,14 +1,22 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 
+use crate::harness::artifacts::{
+    collect_directory_link_drift, collect_directory_link_drift_recursive, import_commands,
+    import_skills, link_commands, link_skills, profile_commands_recursive, valid_skills,
+};
 use crate::harness::drift::{DriftItem, DriftReport};
+use crate::harness::fs::{
+    detect_binary, normalize_json_text, read_json, read_optional_string, symlink_file,
+    symlink_points_to,
+};
 use crate::harness::integration::{
-    Detection, HarnessIntegration, HarnessPaths, ImportedDirectory, ImportedFile, LoadedProfile,
-    PreferenceImport, ProfileImport, RuntimeEnv,
+    AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedPreference,
+    ProfileImport, ProfileRef,
 };
 use crate::harness::kind::HarnessKind;
 use crate::harness::managed::{write_text_atomic, ManagedSurface};
@@ -22,13 +30,13 @@ impl HarnessIntegration for ClaudeIntegration {
         HarnessKind::Claude
     }
 
-    fn detect(&self, env: &RuntimeEnv) -> Result<Detection> {
+    fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection> {
         Ok(detect_binary(env, self.kind().binary_name()))
     }
 
-    fn paths(&self, env: &RuntimeEnv) -> Result<HarnessPaths> {
+    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
         let config_dir = env.user_home.join(".claude");
-        Ok(HarnessPaths {
+        Ok(HarnessConfigPaths {
             instruction_target: config_dir.join("CLAUDE.md"),
             skills_dir: config_dir.join("skills"),
             commands_dir: config_dir.join("commands"),
@@ -38,7 +46,7 @@ impl HarnessIntegration for ClaudeIntegration {
         })
     }
 
-    fn managed_surfaces(&self, paths: &HarnessPaths) -> Vec<ManagedSurface> {
+    fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
         vec![
             ManagedSurface::file(&paths.instruction_target),
             ManagedSurface::directory(&paths.skills_dir),
@@ -48,11 +56,11 @@ impl HarnessIntegration for ClaudeIntegration {
         ]
     }
 
-    fn preflight(&self, _profile: &LoadedProfile) -> Result<()> {
+    fn preflight(&self, _profile: &ProfileRef) -> Result<()> {
         Ok(())
     }
 
-    fn detect_drift(&self, active: &LoadedProfile, paths: &HarnessPaths) -> Result<DriftReport> {
+    fn detect_drift(&self, active: &ProfileRef, paths: &HarnessConfigPaths) -> Result<DriftReport> {
         let mut items = Vec::new();
         let instruction_source = active.path.join("AGENTS.md");
         if !symlink_points_to(&paths.instruction_target, &instruction_source) {
@@ -88,7 +96,7 @@ impl HarnessIntegration for ClaudeIntegration {
         Ok(DriftReport { items })
     }
 
-    fn import_from_harness(&self, paths: &HarnessPaths) -> Result<ProfileImport> {
+    fn import_from_harness(&self, paths: &HarnessConfigPaths) -> Result<ProfileImport> {
         let settings = read_json(&paths.settings_file)?;
         let mcps_doc = read_json(&paths.mcp_file)?;
         Ok(ProfileImport {
@@ -96,13 +104,13 @@ impl HarnessIntegration for ClaudeIntegration {
             skills: import_skills(&paths.skills_dir)?,
             commands: import_commands(&paths.commands_dir)?,
             mcp_definitions: Some(import_claude_mcps(&mcps_doc)?),
-            model_preference: PreferenceImport::new(
+            model_preference: ImportedPreference::new(
                 settings
                     .get("primaryModel")
                     .cloned()
                     .unwrap_or_else(|| json!("default")),
             ),
-            permission_preference: PreferenceImport::new(
+            permission_preference: ImportedPreference::new(
                 settings
                     .get("permissions")
                     .cloned()
@@ -111,7 +119,7 @@ impl HarnessIntegration for ClaudeIntegration {
         })
     }
 
-    fn apply(&self, profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()> {
+    fn apply(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
         fs::create_dir_all(&paths.config_dir)
             .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
         fs::create_dir_all(&paths.skills_dir)
@@ -127,7 +135,7 @@ impl HarnessIntegration for ClaudeIntegration {
         Ok(())
     }
 
-    fn verify(&self, profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()> {
+    fn verify(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
         let instruction_source = profile.path.join("AGENTS.md");
         if !symlink_points_to(&paths.instruction_target, &instruction_source) {
             anyhow::bail!(
@@ -149,9 +157,7 @@ impl HarnessIntegration for ClaudeIntegration {
         }
 
         for command in profile_commands_recursive(&profile.path)? {
-            let relative = command
-                .strip_prefix(&profile.path.join("commands"))
-                .unwrap();
+            let relative = command.strip_prefix(profile.path.join("commands")).unwrap();
             let target = paths.commands_dir.join(relative);
             if !symlink_points_to(&target, &command) {
                 anyhow::bail!("Claude command link {} was not applied", target.display());
@@ -164,247 +170,18 @@ impl HarnessIntegration for ClaudeIntegration {
     }
 }
 
-fn link_skills(profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()> {
-    for skill in valid_skills(&profile.path)? {
-        let target = paths.skills_dir.join(
-            skill
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("invalid skill path {}", skill.display()))?,
-        );
-        symlink_dir(skill, target)?;
-    }
-    Ok(())
-}
-
-fn link_commands(profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()> {
-    for command in profile_commands_recursive(&profile.path)? {
-        let relative = command
-            .strip_prefix(&profile.path.join("commands"))
-            .unwrap();
-        let target = paths.commands_dir.join(relative);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        symlink_file(command, target)?;
-    }
-    Ok(())
-}
-
-fn collect_directory_link_drift(
-    surface: &str,
-    expected_sources: Vec<PathBuf>,
-    target_dir: &Path,
-    items: &mut Vec<DriftItem>,
-) -> Result<()> {
-    let mut expected_names = BTreeSet::new();
-    for source in expected_sources {
-        let name = source
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("invalid source path {}", source.display()))?
-            .to_string_lossy()
-            .into_owned();
-        expected_names.insert(name.clone());
-        if !symlink_points_to(&target_dir.join(&name), &source) {
-            items.push(DriftItem {
-                surface: surface.to_string(),
-                detail: format!(
-                    "{} is not linked to active profile",
-                    target_dir.join(&name).display()
-                ),
-            });
-        }
-    }
-    if target_dir.exists() {
-        for entry in fs::read_dir(target_dir)
-            .with_context(|| format!("failed to read {}", target_dir.display()))?
-        {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            if !expected_names.contains(&name) {
-                items.push(DriftItem {
-                    surface: surface.to_string(),
-                    detail: format!("unexpected managed entry {}", entry.path().display()),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-fn collect_directory_link_drift_recursive(
-    surface: &str,
-    expected_sources: Vec<PathBuf>,
-    target_dir: &Path,
-    profile_cmd_dir: &Path,
-    items: &mut Vec<DriftItem>,
-) -> Result<()> {
-    let mut expected_rel_paths = BTreeSet::new();
-    for source in expected_sources {
-        let rel_path = source.strip_prefix(profile_cmd_dir).unwrap().to_path_buf();
-        expected_rel_paths.insert(rel_path.clone());
-        let target = target_dir.join(&rel_path);
-        if !symlink_points_to(&target, &source) {
-            items.push(DriftItem {
-                surface: surface.to_string(),
-                detail: format!("{} is not linked to active profile", target.display()),
-            });
-        }
-    }
-    if target_dir.exists() {
-        let actual_files = import_files_recursive(target_dir, target_dir)?;
-        for file in actual_files {
-            if !expected_rel_paths.contains(&file.relative_path) {
-                items.push(DriftItem {
-                    surface: surface.to_string(),
-                    detail: format!(
-                        "unexpected managed entry {}",
-                        target_dir.join(&file.relative_path).display()
-                    ),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-fn normalize_json_text(text: &str) -> Value {
-    if text.trim().is_empty() {
-        json!([])
-    } else {
-        serde_json::from_str(text).unwrap_or_else(|_| json!(text.trim()))
-    }
-}
-
-fn read_optional_string(path: &Path) -> Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
-    }
-}
-
-fn import_skills(path: &Path) -> Result<Vec<ImportedDirectory>> {
-    let mut skills = Vec::new();
-    if !path.exists() {
-        return Ok(skills);
-    }
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        if !entry.path().metadata()?.is_dir() || !entry.path().join("SKILL.md").is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        skills.push(ImportedDirectory {
-            name,
-            files: import_files_recursive(&entry.path(), &entry.path())?,
-        });
-    }
-    skills.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(skills)
-}
-
-fn import_commands(path: &Path) -> Result<Vec<ImportedFile>> {
-    let mut commands = Vec::new();
-    if !path.exists() {
-        return Ok(commands);
-    }
-    let files = import_files_recursive(path, path)?;
-    for file in files {
-        if file
-            .relative_path
-            .extension()
-            .is_some_and(|ext| ext == "md")
-        {
-            commands.push(file);
-        }
-    }
-    commands.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(commands)
-}
-
-fn import_files_recursive(root: &Path, path: &Path) -> Result<Vec<ImportedFile>> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let path = entry.path();
-        if path.metadata()?.is_dir() {
-            files.extend(import_files_recursive(root, &path)?);
-        } else if path.metadata()?.is_file() {
-            files.push(ImportedFile {
-                relative_path: path
-                    .strip_prefix(root)
-                    .with_context(|| format!("{} is not under {}", path.display(), root.display()))?
-                    .to_path_buf(),
-                contents: fs::read(&path)
-                    .with_context(|| format!("failed to read {}", path.display()))?,
-            });
-        }
-    }
-    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(files)
-}
-
-fn valid_skills(profile_path: &Path) -> Result<Vec<PathBuf>> {
-    let skills_dir = profile_path.join("skills");
-    let mut skills = Vec::new();
-    if !skills_dir.exists() {
-        return Ok(skills);
-    }
-    for entry in fs::read_dir(&skills_dir)
-        .with_context(|| format!("failed to read {}", skills_dir.display()))?
-    {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() && entry.path().join("SKILL.md").is_file() {
-            skills.push(entry.path());
-        }
-    }
-    skills.sort();
-    Ok(skills)
-}
-
-fn profile_commands_recursive(profile_path: &Path) -> Result<Vec<PathBuf>> {
-    let commands_dir = profile_path.join("commands");
-    let mut commands = Vec::new();
-    if !commands_dir.exists() {
-        return Ok(commands);
-    }
-    collect_commands_recursive(&commands_dir, &mut commands)?;
-    commands.sort();
-    Ok(commands)
-}
-
-fn collect_commands_recursive(dir: &Path, commands: &mut Vec<PathBuf>) -> Result<()> {
-    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            collect_commands_recursive(&entry.path(), commands)?;
-        } else if entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == "md")
-        {
-            commands.push(entry.path());
-        }
-    }
-    Ok(())
-}
-
-fn patch_claude_config(profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()> {
+fn patch_claude_config(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
     let profile_config = read_profile_config(&profile.path)?;
     let mut document = read_json(&paths.settings_file)?;
 
-    if let Some(model) = non_default_value(profile_config.model_preference("claude")) {
+    if let Some(model) = non_default_value(
+        profile_config.model_preference(crate::harness::kind::HarnessKind::Claude),
+    ) {
         document.insert("primaryModel".to_string(), model);
     }
-    if let Some(permission) = non_default_value(profile_config.permission_preference("claude")) {
+    if let Some(permission) = non_default_value(
+        profile_config.permission_preference(crate::harness::kind::HarnessKind::Claude),
+    ) {
         patch_claude_permissions(&mut document, permission)?;
     }
 
@@ -415,7 +192,7 @@ fn patch_claude_config(profile: &LoadedProfile, paths: &HarnessPaths) -> Result<
     .with_context(|| format!("failed to write {}", paths.settings_file.display()))
 }
 
-fn patch_claude_mcps(profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()> {
+fn patch_claude_mcps(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
     let mcp_definitions = read_mcp_definitions(&profile.path)?;
     let mut document = read_json(&paths.mcp_file)?;
 
@@ -441,26 +218,6 @@ fn read_profile_config(profile_path: &Path) -> Result<ProfileConfig> {
         .with_context(|| format!("missing or unreadable profile config at {}", path.display()))?;
     serde_json::from_str(&text)
         .with_context(|| format!("invalid profile config at {}", path.display()))
-}
-
-fn read_json(path: &Path) -> Result<Map<String, Value>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()))
-        }
-    };
-    if text.trim().is_empty() {
-        return Ok(Map::new());
-    }
-    let value: Value = serde_json::from_str(&text)
-        .with_context(|| format!("invalid JSON at {}", path.display()))?;
-    if let Value::Object(map) = value {
-        Ok(map)
-    } else {
-        anyhow::bail!("JSON at {} is not an object", path.display())
-    }
 }
 
 fn import_claude_mcps(document: &Map<String, Value>) -> Result<String> {
@@ -613,635 +370,111 @@ impl McpDefinition {
     }
 }
 
-fn detect_binary(env: &RuntimeEnv, binary_name: &str) -> Detection {
-    for path in &env.path_entries {
-        let binary_path = path.join(binary_name);
-        if binary_path.is_file() {
-            return Detection::Detected { binary_path };
-        }
-    }
-    Detection::NotDetected
-}
-
-fn symlink_points_to(link: &Path, source: &Path) -> bool {
-    fs::read_link(link)
-        .map(|target| target == source)
-        .unwrap_or(false)
-}
-
-#[cfg(unix)]
-fn symlink_file(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<()> {
-    std::os::unix::fs::symlink(source.as_ref(), target.as_ref())
-        .with_context(|| format!("failed to link {}", target.as_ref().display()))
-}
-
-#[cfg(unix)]
-fn symlink_dir(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<()> {
-    std::os::unix::fs::symlink(source.as_ref(), target.as_ref())
-        .with_context(|| format!("failed to link {}", target.as_ref().display()))
-}
-
-#[cfg(windows)]
-fn symlink_file(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<()> {
-    std::os::windows::fs::symlink_file(source.as_ref(), target.as_ref())
-        .with_context(|| format!("failed to link {}", target.as_ref().display()))
-}
-
-#[cfg(windows)]
-fn symlink_dir(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<()> {
-    std::os::windows::fs::symlink_dir(source.as_ref(), target.as_ref())
-        .with_context(|| format!("failed to link {}", target.as_ref().display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::apply::{use_profile, DriftPolicy};
-    use crate::profile::{LazyagentsHome, ProfileName, ProfileStore};
+    use crate::harness::integration::{HarnessConfigPaths, HarnessIntegration, ProfileImport};
+    use crate::integrations::test_suite::template::HarnessTestAdapter;
+    use crate::profile::ProfileConfig;
+    use std::fs;
+    use std::path::Path;
 
-    #[test]
-    fn claude_use_applies_profile_artifacts_preferences_mcp_and_state() {
-        let fixture = ClaudeFixture::new();
-        let profile = fixture.profile("work");
-        add_skill(&profile, "writer");
-        add_command(&profile, "plan.md");
-        write_config(
-            &profile,
-            r#"{
+    #[derive(Default)]
+    struct ClaudeAdapter;
+
+    impl HarnessTestAdapter for ClaudeAdapter {
+        fn integration(&self) -> Box<dyn HarnessIntegration> {
+            Box::new(ClaudeIntegration)
+        }
+        fn bin_name(&self) -> &'static str {
+            "claude"
+        }
+        fn assert_mcp_cleared(&self, paths: &HarnessConfigPaths) {
+            let config = fs::read_to_string(&paths.mcp_file).unwrap_or_else(|_| "{}".to_string());
+            assert_eq!(
+                crate::harness::fs::normalize_json_text(&config),
+                serde_json::json!({})
+            );
+        }
+        fn write_malformed_native_config(&self, paths: &HarnessConfigPaths) {
+            fs::write(&paths.settings_file, "{ malformed }").unwrap();
+        }
+        fn supports_nested_commands(&self) -> bool {
+            true
+        }
+        fn write_existing_native_settings(&self, paths: &HarnessConfigPaths) {
+            fs::write(&paths.settings_file, r#"{"theme": "dark"}"#).unwrap();
+        }
+        fn assert_native_settings_preserved(&self, paths: &HarnessConfigPaths) {
+            let config = fs::read_to_string(&paths.settings_file).unwrap();
+            assert!(config.contains(r#""theme":"dark""#) || config.contains(r#""theme": "dark""#));
+        }
+        fn setup_native_config_for_import(&self, paths: &HarnessConfigPaths) {
+            fs::write(
+                &paths.settings_file,
+                r#"{"primaryModel": "opus", "permissions": {"defaultMode": "acceptEdits"}}"#,
+            )
+            .unwrap();
+            fs::write(
+                &paths.mcp_file,
+                r#"{
+  "mcpServers": {
+    "local": {"command":"server"},
+    "remote": {"command":"server", "env": {"Authorization": "$TOKEN"}}
+  }
+}"#,
+            )
+            .unwrap();
+        }
+        fn assert_imported_native_config(&self, import: &ProfileImport) {
+            assert_eq!(
+                import.model_preference.clone().into_value(),
+                serde_json::json!("opus")
+            );
+            assert!(import
+                .mcp_definitions
+                .as_ref()
+                .unwrap()
+                .contains("\"Authorization\": \"$TOKEN\""));
+        }
+        fn setup_drift_native_config(&self, paths: &HarnessConfigPaths) {
+            fs::write(
+                &paths.settings_file,
+                r#"{"primaryModel": "drift-model", "permissions": {"defaultMode": "drift-perm"}}"#,
+            )
+            .unwrap();
+        }
+        fn assert_drift_saved(&self, config: &ProfileConfig) {
+            assert_eq!(
+                config.model_preference(crate::harness::kind::HarnessKind::Claude),
+                "drift-model"
+            );
+            assert_eq!(
+                config.permission_preference(crate::harness::kind::HarnessKind::Claude),
+                serde_json::json!({"defaultMode": "drift-perm"})
+            );
+        }
+        fn write_profile_config(&self, profile: &Path) {
+            crate::integrations::test_suite::template::write_config(
+                profile,
+                r#"{
   "name": "work",
   "description": "",
   "models": {"claude": "opus"},
   "permissions": {"claude": "acceptEdits"}
 }"#,
-        );
-        fs::write(
-            profile.join("mcps.json"),
-            r#"[
-  {"name":"local","transport":"stdio","command":"server","args":["--x"],"env":{"TOKEN":"$TOKEN"}},
-  {"name":"remote","transport":"http","url":"https://mcp.example","headers":{"Authorization":"$TOKEN","X-Literal":"abc"}},
-  {"name":"disabled","enabled":false,"transport":"stdio","command":"draft-server"}
-]"#,
-        )
-        .unwrap();
-        fs::create_dir_all(fixture.claude_dir()).unwrap();
-        fs::write(
-            fixture.claude_dir().join("settings.json"),
-            "{\"other\": true}",
-        )
-        .unwrap();
-
-        use_profile(
-            &ClaudeIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-
-        assert_symlink_to(
-            fixture.claude_dir().join("CLAUDE.md"),
-            profile.join("AGENTS.md"),
-        );
-        assert_symlink_to(
-            fixture.claude_dir().join("skills").join("writer"),
-            profile.join("skills").join("writer"),
-        );
-        assert_symlink_to(
-            fixture.claude_dir().join("commands").join("plan.md"),
-            profile.join("commands").join("plan.md"),
-        );
-        let config = fs::read_to_string(fixture.claude_dir().join("settings.json")).unwrap();
-        assert!(config.contains("\"other\": true"));
-        assert!(config.contains("\"primaryModel\": \"opus\""));
-        assert!(config.contains("\"permissions\""));
-        assert!(config.contains("\"defaultMode\": \"acceptEdits\""));
-        assert!(!config.contains("\"theme\""));
-        let mcp_config = fs::read_to_string(
-            fixture
-                .home
-                .parent()
-                .unwrap()
-                .join("user")
-                .join(".claude.json"),
-        )
-        .unwrap();
-        assert!(mcp_config.contains("\"local\""));
-        assert!(mcp_config.contains("\"server\""));
-        assert!(mcp_config.contains("\"remote\""));
-        assert!(!mcp_config.contains("\"disabled\""));
-        assert_eq!(
-            fs::read_to_string(fixture.home.join("state.json")).unwrap(),
-            "{\n  \"active_profiles\": {\n    \"claude\": \"work\"\n  }\n}\n"
-        );
-    }
-
-    #[test]
-    fn claude_use_normalizes_missing_optional_artifacts() {
-        let fixture = ClaudeFixture::new();
-        let profile = fixture.profile("work");
-        fs::remove_file(profile.join("AGENTS.md")).unwrap();
-        fs::remove_file(profile.join("mcps.json")).unwrap();
-        fs::remove_dir_all(profile.join("skills")).unwrap();
-        fs::remove_dir_all(profile.join("commands")).unwrap();
-
-        use_profile(
-            &ClaudeIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-
-        assert!(profile.join("AGENTS.md").is_file());
-        assert!(profile.join("mcps.json").is_file());
-        assert!(profile.join("skills").is_dir());
-        assert!(profile.join("commands").is_dir());
-        assert_symlink_to(
-            fixture.claude_dir().join("CLAUDE.md"),
-            profile.join("AGENTS.md"),
-        );
-    }
-
-    #[test]
-    fn claude_use_removes_stale_surfaces_and_clears_mcp_list() {
-        let fixture = ClaudeFixture::new();
-        let full = fixture.profile("full");
-        add_skill(&full, "writer");
-        add_command(&full, "plan.md");
-        fs::write(
-            full.join("mcps.json"),
-            r#"[{"name":"local","transport":"stdio","command":"server"}]"#,
-        )
-        .unwrap();
-        fixture.profile("empty");
-
-        use_profile(
-            &ClaudeIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("full").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-        use_profile(
-            &ClaudeIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("empty").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-
-        assert!(fs::read_dir(fixture.claude_dir().join("skills"))
-            .unwrap()
-            .next()
-            .is_none());
-        assert!(fs::read_dir(fixture.claude_dir().join("commands"))
-            .unwrap()
-            .next()
-            .is_none());
-        let config = fs::read_to_string(
-            fixture
-                .home
-                .parent()
-                .unwrap()
-                .join("user")
-                .join(".claude.json"),
-        )
-        .unwrap();
-        assert!(!config.contains("\"mcpServers\""));
-    }
-
-    #[test]
-    fn claude_use_default_preferences_do_not_modify_existing_native_settings() {
-        let fixture = ClaudeFixture::new();
-        fixture.profile("work");
-        fs::create_dir_all(fixture.claude_dir()).unwrap();
-        fs::write(
-            fixture.claude_dir().join("settings.json"),
-            "{\"primaryModel\": \"existing\", \"theme\": \"dark\", \"permissions\": {\"defaultMode\": \"acceptEdits\", \"allow\": [\"Bash(npm test)\"]}}",
-        )
-        .unwrap();
-
-        use_profile(
-            &ClaudeIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-
-        let config = fs::read_to_string(fixture.claude_dir().join("settings.json")).unwrap();
-        assert!(config.contains("\"primaryModel\": \"existing\""));
-        assert!(config.contains("\"theme\": \"dark\""));
-        assert!(config.contains("\"defaultMode\": \"acceptEdits\""));
-        assert!(config.contains("\"Bash(npm test)\""));
-    }
-
-    #[test]
-    fn claude_use_preserves_theme_and_writes_permission_default_mode() {
-        let fixture = ClaudeFixture::new();
-        let profile = fixture.profile("work");
-        write_config(
-            &profile,
-            r#"{
-  "name": "work",
-  "description": "",
-  "models": {},
-  "permissions": {"claude": "dontAsk"}
-}"#,
-        );
-        fs::create_dir_all(fixture.claude_dir()).unwrap();
-        fs::write(
-            fixture.claude_dir().join("settings.json"),
-            r#"{"theme":"dark","permissions":{"allow":["Bash(npm test)"]}}"#,
-        )
-        .unwrap();
-
-        use_profile(
-            &ClaudeIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-
-        let settings = read_json(&fixture.claude_dir().join("settings.json")).unwrap();
-        assert_eq!(settings.get("theme"), Some(&json!("dark")));
-        assert_eq!(
-            settings
-                .get("permissions")
-                .and_then(Value::as_object)
-                .and_then(|permissions| permissions.get("defaultMode")),
-            Some(&json!("dontAsk"))
-        );
-        assert_eq!(
-            settings
-                .get("permissions")
-                .and_then(Value::as_object)
-                .and_then(|permissions| permissions.get("allow")),
-            Some(&json!(["Bash(npm test)"]))
-        );
-    }
-
-    #[test]
-    fn claude_use_allows_nested_commands() {
-        let fixture = ClaudeFixture::new();
-        let profile = fixture.profile("work");
-        fs::create_dir_all(profile.join("commands").join("nested")).unwrap();
-        fs::write(profile.join("commands").join("nested").join("good.md"), "").unwrap();
-
-        use_profile(
-            &ClaudeIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-
-        assert!(fixture
-            .claude_dir()
-            .join("commands")
-            .join("nested")
-            .join("good.md")
-            .exists());
-        assert_symlink_to(
-            fixture
-                .claude_dir()
-                .join("commands")
-                .join("nested")
-                .join("good.md"),
-            profile.join("commands").join("nested").join("good.md"),
-        );
-    }
-
-    #[test]
-    fn claude_use_rejects_invalid_disabled_mcp_without_state_update() {
-        let fixture = ClaudeFixture::new();
-        let profile = fixture.profile("work");
-        fs::write(
-            profile.join("mcps.json"),
-            r#"[{"name":"draft","enabled":false}]"#,
-        )
-        .unwrap();
-
-        let error = use_profile(
-            &ClaudeIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap_err();
-
-        assert!(format!("{error:#}").contains("MCP draft requires transport"));
-        assert!(!fixture.home.join("state.json").exists());
-        assert!(!fixture.claude_dir().join("settings.json").exists());
-    }
-
-    #[test]
-    fn claude_use_rolls_back_and_dereferences_symlink_backup_on_failure() {
-        let fixture = ClaudeFixture::new();
-        let profile = fixture.profile("work");
-        fs::write(
-            profile.join("mcps.json"),
-            r#"[{"name":"bad","transport":"stdio"}]"#,
-        )
-        .unwrap();
-        fs::create_dir_all(fixture.claude_dir()).unwrap();
-        let old_source = fixture.temp.path().join("old-source.md");
-        fs::write(&old_source, "previous instructions").unwrap();
-        symlink_file(&old_source, fixture.claude_dir().join("CLAUDE.md")).unwrap();
-        fs::create_dir_all(fixture.claude_dir().join("skills")).unwrap();
-        fs::write(fixture.claude_dir().join("skills").join("old.txt"), "old").unwrap();
-        fs::write(
-            fixture.claude_dir().join("settings.json"),
-            "{\"primaryModel\": \"old\"}",
-        )
-        .unwrap();
-
-        let error = use_profile(
-            &ClaudeIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap_err();
-
-        assert!(format!("{error:#}").contains("requires command"));
-        assert_eq!(
-            fs::read_to_string(fixture.claude_dir().join("CLAUDE.md")).unwrap(),
-            "previous instructions"
-        );
-        assert!(
-            !fs::symlink_metadata(fixture.claude_dir().join("CLAUDE.md"))
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(
-            fs::read_to_string(fixture.claude_dir().join("skills").join("old.txt")).unwrap(),
-            "old"
-        );
-        assert_eq!(
-            fs::read_to_string(fixture.claude_dir().join("settings.json")).unwrap(),
-            "{\"primaryModel\": \"old\"}"
-        );
-        assert!(!fixture.home.join("state.json").exists());
-    }
-
-    #[test]
-    fn claude_import_reads_managed_state_and_dereferences_symlinks() {
-        let fixture = ClaudeFixture::new();
-        fs::create_dir_all(fixture.claude_dir().join("skills")).unwrap();
-        fs::create_dir_all(fixture.claude_dir().join("commands")).unwrap();
-        let instruction_source = fixture.temp.path().join("instruction-source.md");
-        fs::write(&instruction_source, "imported instructions").unwrap();
-        symlink_file(&instruction_source, fixture.claude_dir().join("CLAUDE.md")).unwrap();
-        let skill_source = fixture.temp.path().join("skill-source");
-        fs::create_dir_all(&skill_source).unwrap();
-        fs::write(skill_source.join("SKILL.md"), "skill body").unwrap();
-        symlink_dir(
-            &skill_source,
-            fixture.claude_dir().join("skills").join("linked"),
-        )
-        .unwrap();
-        fs::write(
-            fixture.claude_dir().join("commands").join("cmd.md"),
-            "command",
-        )
-        .unwrap();
-        fs::write(
-            fixture.claude_dir().join("settings.json"),
-            r#"{"primaryModel": "gpt-imported", "theme": "dark", "permissions": {"defaultMode": "acceptEdits", "deny": ["Read(./.env)"]}}"#,
-        )
-        .unwrap();
-        fs::write(
-            fixture
-                .home
-                .parent()
-                .unwrap()
-                .join("user")
-                .join(".claude.json"),
-            r#"{
-              "mcpServers": {
-                "local": {
-                  "type": "stdio",
-                  "command": "server",
-                  "args": ["--flag"],
-                  "env": {
-                    "TOKEN": "$TOKEN"
-                  }
-                },
-                "remote": {
-                  "type": "http",
-                  "url": "https://mcp.example",
-                  "headers": {
-                    "X-Literal": "abc"
-                  }
-                }
-              }
-            }"#,
-        )
-        .unwrap();
-
-        let paths = ClaudeIntegration.paths(&fixture.env).unwrap();
-
-        let imported = ClaudeIntegration.import_from_harness(&paths).unwrap();
-
-        assert_eq!(
-            imported.instruction.as_deref(),
-            Some("imported instructions")
-        );
-        assert_eq!(imported.skills[0].name, "linked");
-        assert_eq!(imported.skills[0].files[0].contents, b"skill body");
-        assert_eq!(imported.commands[0].contents, b"command");
-        assert_eq!(
-            imported.model_preference.into_value(),
-            serde_json::json!("gpt-imported")
-        );
-        assert_eq!(
-            imported.permission_preference.into_value(),
-            serde_json::json!({"defaultMode": "acceptEdits", "deny": ["Read(./.env)"]})
-        );
-        assert!(imported.mcp_definitions.unwrap().contains("\"$TOKEN\""));
-    }
-
-    #[test]
-    fn claude_import_fails_on_malformed_native_config() {
-        let fixture = ClaudeFixture::new();
-        fs::create_dir_all(fixture.claude_dir()).unwrap();
-        fs::write(fixture.claude_dir().join("settings.json"), "not = [").unwrap();
-        let paths = ClaudeIntegration.paths(&fixture.env).unwrap();
-
-        let error = ClaudeIntegration.import_from_harness(&paths).unwrap_err();
-
-        assert!(error.to_string().contains("invalid JSON at"));
-    }
-
-    #[test]
-    fn claude_save_changes_imports_drift_into_active_profile_before_switching() {
-        let fixture = ClaudeFixture::new();
-        let active = fixture.profile("active");
-        let target = fixture.profile("target");
-        fs::write(
-            fixture.home.join("state.json"),
-            r#"{"active_profiles":{"claude":"active"}}"#,
-        )
-        .unwrap();
-        fs::create_dir_all(fixture.claude_dir().join("skills").join("newskill")).unwrap();
-        fs::write(
-            fixture
-                .claude_dir()
-                .join("skills")
-                .join("newskill")
-                .join("SKILL.md"),
-            "new skill",
-        )
-        .unwrap();
-        fs::create_dir_all(fixture.claude_dir().join("commands")).unwrap();
-        fs::write(
-            fixture.claude_dir().join("commands").join("new.md"),
-            "new command",
-        )
-        .unwrap();
-        fs::write(fixture.claude_dir().join("CLAUDE.md"), "drifted").unwrap();
-        fs::write(
-            fixture.claude_dir().join("settings.json"),
-            "{\"primaryModel\": \"drift-model\", \"theme\": \"drift-theme\", \"permissions\": {\"defaultMode\": \"dontAsk\"}}",
-        )
-        .unwrap();
-
-        use_profile(
-            &ClaudeIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("target").unwrap(),
-            DriftPolicy::SaveChanges,
-        )
-        .unwrap();
-
-        assert_eq!(
-            fs::read_to_string(active.join("AGENTS.md")).unwrap(),
-            "drifted"
-        );
-        assert_eq!(
-            fs::read_to_string(active.join("skills").join("newskill").join("SKILL.md")).unwrap(),
-            "new skill"
-        );
-        assert_eq!(
-            fs::read_to_string(active.join("commands").join("new.md")).unwrap(),
-            "new command"
-        );
-        let active_config = fixture
-            .store
-            .load_config(&ProfileName::parse("active").unwrap())
-            .unwrap();
-        assert_eq!(active_config.model_preference("claude"), "drift-model");
-        assert_eq!(
-            active_config.permission_preference("claude"),
-            json!({"defaultMode": "dontAsk"})
-        );
-        assert_eq!(active_config.model_preference("codex"), "default");
-        assert_symlink_to(
-            fixture.claude_dir().join("CLAUDE.md"),
-            target.join("AGENTS.md"),
-        );
-    }
-
-    #[test]
-    fn claude_discard_changes_switches_without_updating_active_profile() {
-        let fixture = ClaudeFixture::new();
-        let active = fixture.profile("active");
-        let target = fixture.profile("target");
-        fs::write(active.join("AGENTS.md"), "original").unwrap();
-        fs::write(
-            fixture.home.join("state.json"),
-            r#"{"active_profiles":{"claude":"active"}}"#,
-        )
-        .unwrap();
-        fs::create_dir_all(fixture.claude_dir()).unwrap();
-        fs::write(fixture.claude_dir().join("CLAUDE.md"), "drifted").unwrap();
-
-        use_profile(
-            &ClaudeIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("target").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-
-        assert_eq!(
-            fs::read_to_string(active.join("AGENTS.md")).unwrap(),
-            "original"
-        );
-        assert_symlink_to(
-            fixture.claude_dir().join("CLAUDE.md"),
-            target.join("AGENTS.md"),
-        );
-    }
-
-    struct ClaudeFixture {
-        temp: tempfile::TempDir,
-        home: PathBuf,
-        env: RuntimeEnv,
-        store: ProfileStore,
-    }
-
-    impl ClaudeFixture {
-        fn new() -> Self {
-            let temp = tempfile::tempdir().unwrap();
-            let home = temp.path().join("lazyagents");
-            let user_home = temp.path().join("user");
-            let bin = temp.path().join("bin");
-            fs::create_dir_all(&bin).unwrap();
-            fs::write(bin.join("claude"), "").unwrap();
-            let env = RuntimeEnv {
-                lazyagents_home: home.clone(),
-                user_home,
-                path_entries: vec![bin],
-            };
-            let store = ProfileStore::new(LazyagentsHome::from_path(&home));
-            Self {
-                temp,
-                home,
-                env,
-                store,
-            }
+            );
         }
-
-        fn profile(&self, name: &str) -> PathBuf {
-            let name = ProfileName::parse(name).unwrap();
-            self.store.create_skeleton(&name).unwrap()
-        }
-
-        fn claude_dir(&self) -> PathBuf {
-            self.env.user_home.join(".claude")
+        fn assert_applied_native_config(&self, paths: &HarnessConfigPaths) {
+            let config = fs::read_to_string(&paths.settings_file).unwrap();
+            assert!(config.contains("opus"));
+            assert!(config.contains("acceptEdits"));
+            let mcp = fs::read_to_string(&paths.mcp_file).unwrap();
+            assert!(mcp.contains("local"));
+            assert!(mcp.contains("server"));
+            assert!(!mcp.contains("disabled"));
         }
     }
 
-    fn add_skill(profile: &Path, name: &str) {
-        let path = profile.join("skills").join(name);
-        fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("SKILL.md"), "").unwrap();
-    }
-
-    fn add_command(profile: &Path, name: &str) {
-        fs::write(profile.join("commands").join(name), "").unwrap();
-    }
-
-    fn write_config(profile: &Path, text: &str) {
-        fs::write(profile.join("config.json"), text).unwrap();
-    }
-
-    fn assert_symlink_to(link: impl AsRef<Path>, source: impl AsRef<Path>) {
-        assert_eq!(fs::read_link(link).unwrap(), source.as_ref());
-    }
+    crate::define_standard_harness_tests!(ClaudeAdapter);
 }

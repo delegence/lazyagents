@@ -1,62 +1,79 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::Path;
+use anyhow::Result;
 
-use anyhow::{Context, Result};
-use serde::Deserialize;
-
+use crate::app::harness_registry::HarnessRegistry;
+use crate::app::state::LazyagentsState;
 use crate::harness::drift::DriftReport;
-use crate::harness::integration::{Detection, HarnessIntegration, LoadedProfile, RuntimeEnv};
+use crate::harness::integration::{
+    AppEnvironment, HarnessDetection, HarnessIntegration, ProfileRef,
+};
 use crate::harness::kind::HarnessKind;
-use crate::harness::registry;
-use crate::profile::{ProfileName, ProfileStore};
+use crate::profile::{ProfileConfigStatus, ProfileName, ProfileStore};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StatusRow {
-    pub harness: HarnessKind,
-    pub profile: StatusProfile,
+pub struct DoctorReport {
+    pub harnesses: Vec<HarnessStatus>,
+    pub profiles: ProfileDoctorReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StatusProfile {
+pub struct HarnessStatus {
+    pub harness: HarnessKind,
+    pub profile: HarnessProfileStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HarnessProfileStatus {
     Inactive,
     Active {
         name: ProfileName,
-        drift: DriftState,
+        drift: DriftStatus,
         has_validation_errors: bool,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DriftState {
+pub enum DriftStatus {
     Clean,
     Drifted,
     Error,
 }
 
-pub fn status_rows(env: &RuntimeEnv, profile_store: &ProfileStore) -> Result<Vec<StatusRow>> {
-    status_rows_for(env, profile_store, registry::all())
+pub struct ProfileDoctorReport {
+    pub marker: &'static str,
+    pub summary: Vec<String>,
+    pub lines: Vec<String>,
 }
 
-pub fn status_rows_for(
-    env: &RuntimeEnv,
+pub fn doctor_report(
+    registry: &dyn HarnessRegistry,
+    env: &AppEnvironment,
+    store: &ProfileStore,
+) -> Result<DoctorReport> {
+    let harnesses = status_rows_for(env, store, registry.all())?;
+    let profiles = profile_doctor_report(store, &harnesses)?;
+    Ok(DoctorReport {
+        harnesses,
+        profiles,
+    })
+}
+
+fn status_rows_for(
+    env: &AppEnvironment,
     profile_store: &ProfileStore,
     integrations: Vec<Box<dyn HarnessIntegration>>,
-) -> Result<Vec<StatusRow>> {
+) -> Result<Vec<HarnessStatus>> {
     let state = LazyagentsState::load(&env.lazyagents_home.join("state.json"))?;
     let mut rows = Vec::new();
 
     for integration in integrations {
-        if !matches!(integration.detect(env)?, Detection::Detected { .. }) {
+        if !matches!(integration.detect(env)?, HarnessDetection::Detected { .. }) {
             continue;
         }
 
-        let profile = match state.active_profiles.get(integration.kind().id()) {
+        let profile = match state.active_profiles.get(&integration.kind()) {
             Some(name) => {
-                let name = ProfileName::parse(name.clone())?;
-                let loaded = LoadedProfile {
-                    path: profile_store.profile_dir(&name),
+                let loaded = ProfileRef {
                     name: name.clone(),
+                    path: profile_store.profile_dir(name),
                 };
 
                 let has_validation_errors = if loaded.path.exists() {
@@ -83,18 +100,18 @@ pub fn status_rows_for(
                         .map(|report| drift_state(&report))
                 }) {
                     Ok(state) => state,
-                    Err(_) => DriftState::Error,
+                    Err(_) => DriftStatus::Error,
                 };
-                StatusProfile::Active {
-                    name,
+                HarnessProfileStatus::Active {
+                    name: name.clone(),
                     drift,
                     has_validation_errors,
                 }
             }
-            None => StatusProfile::Inactive,
+            None => HarnessProfileStatus::Inactive,
         };
 
-        rows.push(StatusRow {
+        rows.push(HarnessStatus {
             harness: integration.kind(),
             profile,
         });
@@ -104,47 +121,129 @@ pub fn status_rows_for(
     Ok(rows)
 }
 
-fn drift_state(report: &DriftReport) -> DriftState {
-    if report.is_clean() {
-        DriftState::Clean
+fn profile_doctor_report(
+    store: &ProfileStore,
+    rows: &[HarnessStatus],
+) -> Result<ProfileDoctorReport> {
+    let profiles = store.list_profiles()?;
+    let mut lines = Vec::new();
+    let mut drifted = 0usize;
+    let mut errors = 0usize;
+
+    for profile in profiles {
+        let mut states = Vec::new();
+        let mut clean = Vec::new();
+        let mut drift = Vec::new();
+        let mut error = Vec::new();
+
+        for row in rows {
+            let HarnessProfileStatus::Active {
+                name,
+                drift: drift_state,
+                has_validation_errors,
+            } = &row.profile
+            else {
+                continue;
+            };
+            if name != &profile.name {
+                continue;
+            }
+
+            match drift_state {
+                DriftStatus::Clean => clean.push(row.harness.id().to_string()),
+                DriftStatus::Drifted => drift.push(row.harness.id().to_string()),
+                DriftStatus::Error => error.push(row.harness.id().to_string()),
+            }
+            if *has_validation_errors && !error.contains(&row.harness.id().to_string()) {
+                error.push(row.harness.id().to_string());
+            }
+        }
+
+        drifted += drift.len();
+        errors += error.len();
+
+        let validation_error =
+            profile_validation_error(store, &profile.name, &profile.config_status);
+        if validation_error.is_some() {
+            errors += 1;
+        }
+
+        if !clean.is_empty() {
+            states.push(format!("used by {}", clean.join(", ")));
+        }
+        if !drift.is_empty() {
+            states.push(format!("drifted by {}", drift.join(", ")));
+        }
+        if !error.is_empty() {
+            states.push(format!("error: {}", error.join(", ")));
+        }
+        if let Some(error) = validation_error {
+            states.push(format!("invalid: {error}"));
+        }
+        if states.is_empty() {
+            states.push("unused".to_string());
+        }
+
+        lines.push(format!("  - {} ({})", profile.name, states.join(", ")));
+    }
+
+    let marker = if drifted == 0 && errors == 0 {
+        "[✓]"
     } else {
-        DriftState::Drifted
+        "[!]"
+    };
+    let mut summary = Vec::new();
+    if drifted > 0 {
+        summary.push(format!("{drifted} drifted"));
+    }
+    if errors > 0 {
+        summary.push(format!("{errors} error"));
+    }
+
+    Ok(ProfileDoctorReport {
+        marker,
+        summary,
+        lines,
+    })
+}
+
+fn profile_validation_error(
+    store: &ProfileStore,
+    name: &ProfileName,
+    config_status: &ProfileConfigStatus,
+) -> Option<String> {
+    match config_status {
+        ProfileConfigStatus::Valid => {
+            let path = store.profile_dir(name);
+            let issues = crate::profile::validation::validate_profile(&path);
+            issues
+                .into_iter()
+                .find(|issue| issue.severity == crate::profile::validation::Severity::Error)
+                .map(|issue| issue.message)
+        }
+        ProfileConfigStatus::Missing => Some("missing config.json".to_string()),
+        ProfileConfigStatus::Invalid(error) => Some(format!("config.json {error}")),
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-struct LazyagentsState {
-    #[serde(default)]
-    active_profiles: BTreeMap<String, String>,
-}
-
-impl LazyagentsState {
-    fn load(path: &Path) -> Result<Self> {
-        let text = match fs::read_to_string(path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default())
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to read state file at {}", path.display()));
-            }
-        };
-
-        serde_json::from_str(&text)
-            .with_context(|| format!("invalid state file at {}", path.display()))
+fn drift_state(report: &DriftReport) -> DriftStatus {
+    if report.is_clean() {
+        DriftStatus::Clean
+    } else {
+        DriftStatus::Drifted
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::PathBuf;
 
     use anyhow::{anyhow, Result};
 
     use super::*;
     use crate::harness::drift::DriftItem;
-    use crate::harness::integration::{HarnessPaths, PreferenceImport, ProfileImport};
+    use crate::harness::integration::{HarnessConfigPaths, ImportedPreference, ProfileImport};
     use crate::harness::managed::ManagedSurface;
     use crate::profile::LazyagentsHome;
 
@@ -185,19 +284,19 @@ mod tests {
             self.kind
         }
 
-        fn detect(&self, _env: &RuntimeEnv) -> Result<Detection> {
+        fn detect(&self, _env: &AppEnvironment) -> Result<HarnessDetection> {
             if self.detected {
-                Ok(Detection::Detected {
+                Ok(HarnessDetection::Detected {
                     binary_path: PathBuf::from("/bin/fake"),
                 })
             } else {
-                Ok(Detection::NotDetected)
+                Ok(HarnessDetection::NotDetected)
             }
         }
 
-        fn paths(&self, env: &RuntimeEnv) -> Result<HarnessPaths> {
+        fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
             let root = env.user_home.join(self.kind.id());
-            Ok(HarnessPaths {
+            Ok(HarnessConfigPaths {
                 config_dir: root.clone(),
                 instruction_target: root.join("AGENTS.md"),
                 skills_dir: root.join("skills"),
@@ -207,18 +306,18 @@ mod tests {
             })
         }
 
-        fn managed_surfaces(&self, _paths: &HarnessPaths) -> Vec<ManagedSurface> {
+        fn managed_surfaces(&self, _paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
             Vec::new()
         }
 
-        fn preflight(&self, _profile: &LoadedProfile) -> Result<()> {
+        fn preflight(&self, _profile: &ProfileRef) -> Result<()> {
             Ok(())
         }
 
         fn detect_drift(
             &self,
-            _active: &LoadedProfile,
-            _paths: &HarnessPaths,
+            _active: &ProfileRef,
+            _paths: &HarnessConfigPaths,
         ) -> Result<DriftReport> {
             match &self.drift {
                 Ok(report) => Ok(report.clone()),
@@ -226,22 +325,22 @@ mod tests {
             }
         }
 
-        fn import_from_harness(&self, _paths: &HarnessPaths) -> Result<ProfileImport> {
+        fn import_from_harness(&self, _paths: &HarnessConfigPaths) -> Result<ProfileImport> {
             Ok(ProfileImport {
                 instruction: None,
                 skills: Vec::new(),
                 commands: Vec::new(),
                 mcp_definitions: None,
-                model_preference: PreferenceImport::default_value(),
-                permission_preference: PreferenceImport::default_value(),
+                model_preference: ImportedPreference::default_value(),
+                permission_preference: ImportedPreference::default_value(),
             })
         }
 
-        fn apply(&self, _profile: &LoadedProfile, _paths: &HarnessPaths) -> Result<()> {
+        fn apply(&self, _profile: &ProfileRef, _paths: &HarnessConfigPaths) -> Result<()> {
             Ok(())
         }
 
-        fn verify(&self, _profile: &LoadedProfile, _paths: &HarnessPaths) -> Result<()> {
+        fn verify(&self, _profile: &ProfileRef, _paths: &HarnessConfigPaths) -> Result<()> {
             Ok(())
         }
     }
@@ -260,7 +359,7 @@ mod tests {
             r#"{"active_profiles":{"codex":"work","claude":"play"}}"#,
         )
         .unwrap();
-        let env = RuntimeEnv {
+        let env = AppEnvironment {
             lazyagents_home: home,
             user_home: temp.path().join("user"),
             path_entries: Vec::new(),
@@ -291,13 +390,13 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(
             rows[0].profile,
-            StatusProfile::Active {
+            HarnessProfileStatus::Active {
                 name: work,
-                drift: DriftState::Clean,
+                drift: DriftStatus::Clean,
                 has_validation_errors: false,
             }
         );
-        assert_eq!(rows[1].profile, StatusProfile::Inactive);
+        assert_eq!(rows[1].profile, HarnessProfileStatus::Inactive);
     }
 
     #[test]
@@ -312,7 +411,7 @@ mod tests {
             r#"{"active_profiles":{"codex":"work"}}"#,
         )
         .unwrap();
-        let env = RuntimeEnv {
+        let env = AppEnvironment {
             lazyagents_home: home,
             user_home: temp.path().join("user"),
             path_entries: Vec::new(),
@@ -329,9 +428,9 @@ mod tests {
 
         assert_eq!(
             rows[0].profile,
-            StatusProfile::Active {
+            HarnessProfileStatus::Active {
                 name: work,
-                drift: DriftState::Error,
+                drift: DriftStatus::Error,
                 has_validation_errors: false,
             }
         );
@@ -350,7 +449,7 @@ mod tests {
             r#"{"active_profiles":{"codex":"work"}}"#,
         )
         .unwrap();
-        let env = RuntimeEnv {
+        let env = AppEnvironment {
             lazyagents_home: home,
             user_home: temp.path().join("user"),
             path_entries: Vec::new(),
@@ -368,11 +467,60 @@ mod tests {
 
         assert_eq!(
             rows[0].profile,
-            StatusProfile::Active {
+            HarnessProfileStatus::Active {
                 name: work,
-                drift: DriftState::Error,
+                drift: DriftStatus::Error,
                 has_validation_errors: true,
             }
         );
+    }
+
+    #[test]
+    fn doctor_report_prepares_profile_lines_for_cli_rendering() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("lazyagents");
+        let store = ProfileStore::new(LazyagentsHome::from_path(&home));
+        let work = ProfileName::parse("work").unwrap();
+        store.create_skeleton(&work).unwrap();
+        fs::write(
+            home.join("state.json"),
+            r#"{"active_profiles":{"codex":"work"}}"#,
+        )
+        .unwrap();
+        let env = AppEnvironment {
+            lazyagents_home: home,
+            user_home: temp.path().join("user"),
+            path_entries: Vec::new(),
+        };
+        let registry = TestRegistry {
+            integrations: vec![Box::new(StatusIntegration::detected(
+                HarnessKind::Codex,
+                DriftReport::clean(),
+            ))],
+        };
+
+        let report = doctor_report(&registry, &env, &store).unwrap();
+
+        assert_eq!(report.profiles.marker, "[✓]");
+        assert_eq!(report.profiles.summary, Vec::<String>::new());
+        assert_eq!(report.profiles.lines, vec!["  - work (used by codex)"]);
+    }
+
+    struct TestRegistry {
+        integrations: Vec<Box<dyn HarnessIntegration>>,
+    }
+
+    impl HarnessRegistry for TestRegistry {
+        fn all(&self) -> Vec<Box<dyn HarnessIntegration>> {
+            self.integrations
+                .iter()
+                .map(|integration| {
+                    Box::new(StatusIntegration::detected(
+                        integration.kind(),
+                        DriftReport::clean(),
+                    )) as Box<dyn HarnessIntegration>
+                })
+                .collect()
+        }
     }
 }

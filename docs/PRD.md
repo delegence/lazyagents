@@ -190,9 +190,9 @@ The TUI is explicitly out of scope for this PRD.
 - Empty MCP files mean no MCPs. Invalid non-empty MCP files fail validation.
 - Secrets are not materialized. Environment variable references are passed through and translated only where a harness requires syntax adaptation.
 - No per-harness MCP overrides are supported in v1. If a harness cannot represent a profile MCP, that harness apply fails and rolls back.
-- Use a harness integration contract as a deep module boundary. Each harness integration owns detection, target path resolution, profile-to-harness application, harness-to-profile import, drift detection, config patching, and native format translation.
+- Use a harness integration contract as a deep module boundary under `src/harness/integration.rs`. Each concrete harness implementation under `src/integrations/` owns detection, target path resolution, profile-to-harness application, harness-to-profile import, drift detection, config patching, and native format translation.
 - Implement initial harness integrations for Codex, Claude Code, and opencode.
-- Adding a new harness should usually require adding one `src/integrations/<harness>.rs` file that implements the harness integration contract, plus one registration entry. Shared orchestration should not need harness-specific branches beyond identity/registration.
+- Adding a new harness should usually require adding one `src/integrations/<harness>.rs` file that implements the harness integration contract, adding it to `src/app/harness_registry.rs`, and making it pass the shared test suite in `src/integrations/test_suite.rs`. Shared orchestration should not need harness-specific branches beyond identity/registration.
 - Harness detection uses Rust-native PATH lookup. Explicit harness use and profile import require detection. `--all` applies only to detected supported harnesses and silently ignores undetected ones.
 - If no supported harness is detected during `--all`, the command fails.
 - The harness integration declares managed surfaces: instruction file, skills directory contents, commands directory contents, MCP native section/list, and selected config keys.
@@ -238,13 +238,16 @@ The TUI is explicitly out of scope for this PRD.
 - `doctor` shows detected harnesses only and performs lightweight drift checks for active profiles on detected harnesses.
 - `doctor` uses a line-based health summary with `[✓]`, `[!]`, and `[x]` markers instead of tables.
 - No global verbose mode, JSON output, dry-run, public rollback, TUI, or project-local profile support is included in v1.
-- CLI, TUI, GUI, and other presentation layers are separate from domain logic. Domain workflows return typed results, summaries, and errors that any UI can render; profile, harness, state, backup, drift, and transaction modules must not print directly.
+- CLI, TUI, GUI, and other presentation layers are separate from domain logic. App workflows return typed results, summaries, and errors that any UI can render; profile, harness, integrations, state, backup, drift, and transaction modules must not print directly.
 - Profile switching isolation is a required test theme: switching from a profile with skills, commands, or MCP servers to a profile without them must remove stale managed surfaces, and failed apply must restore previous managed surfaces without updating state.
-- Suggested deep modules:
-  - CLI command parsing and command orchestration.
-  - Profile store, skeleton normalization, validation, and summaries.
-  - JSON schema parsing for profile config and MCPs. This includes extracting neutral `mcps.json` parsing into `src/profile/mcp.rs` to avoid duplicating `McpDefinition` structs in every harness integration, and placing `"default"` sentinel parsing logic in `src/profile/config.rs`.
-  - Harness integration trait plus integration registry.
-  - Harness-specific integrations for Codex, Claude Code, and opencode.
-  - Managed filesystem operations for symlinks, directory clearing, copying, and dereferencing.
-  - Transaction and backup manager.
+- Current source layers:
+  - `src/profile/`: profile names, profile config schema, neutral MCP parsing, profile validation, profile summaries, skeleton creation, profile filesystem storage, and import writes.
+  - `src/harness/`: generic harness primitives and mechanics: `HarnessKind`, the `HarnessIntegration` trait, managed surfaces, artifact comparison helpers, drift report types, transactional apply, backup/rollback, symlink helpers, and atomic filesystem helpers.
+  - `src/integrations/`: one concrete implementation file per supported harness, plus `test_suite.rs` for shared test-only contract checks.
+  - `src/app/`: UI-independent product workflows and composition: create/import profile, delete safety checks, edit path lookup, inspect profile, doctor report assembly, active state persistence, profile use/drift decisions, and the built-in harness registry.
+  - `src/cli/`: terminal-only adapter for clap parsing, prompts, rendering, and `$EDITOR` process execution.
+- Dependency direction:
+  - Production `profile/` and `harness/` do not depend on `app/`, `cli/`, or concrete `integrations/`.
+  - Production `integrations/` depend on `profile/` and `harness/`.
+  - `app/` composes `profile/`, `harness/`, and concrete `integrations/` through `src/app/harness_registry.rs`.
+  - `cli/` depends on `app/` and should stay presentation-focused.

@@ -10,13 +10,13 @@ use crate::harness::managed::ManagedSurface;
 use crate::profile::ProfileName;
 
 #[derive(Debug, Clone)]
-pub struct RuntimeEnv {
+pub struct AppEnvironment {
     pub lazyagents_home: PathBuf,
     pub user_home: PathBuf,
     pub path_entries: Vec<PathBuf>,
 }
 
-impl RuntimeEnv {
+impl AppEnvironment {
     pub fn resolve(lazyagents_home: PathBuf) -> Result<Self> {
         let user_home = env::var_os("HOME")
             .map(PathBuf::from)
@@ -34,13 +34,13 @@ impl RuntimeEnv {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Detection {
+pub enum HarnessDetection {
     Detected { binary_path: PathBuf },
     NotDetected,
 }
 
 #[derive(Debug, Clone)]
-pub struct HarnessPaths {
+pub struct HarnessConfigPaths {
     pub config_dir: PathBuf,
     pub instruction_target: PathBuf,
     pub skills_dir: PathBuf,
@@ -50,7 +50,7 @@ pub struct HarnessPaths {
 }
 
 #[derive(Debug, Clone)]
-pub struct LoadedProfile {
+pub struct ProfileRef {
     pub name: ProfileName,
     pub path: PathBuf,
 }
@@ -61,8 +61,8 @@ pub struct ProfileImport {
     pub skills: Vec<ImportedDirectory>,
     pub commands: Vec<ImportedFile>,
     pub mcp_definitions: Option<String>,
-    pub model_preference: PreferenceImport,
-    pub permission_preference: PreferenceImport,
+    pub model_preference: ImportedPreference,
+    pub permission_preference: ImportedPreference,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,9 +78,9 @@ pub struct ImportedFile {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct PreferenceImport(Value);
+pub struct ImportedPreference(Value);
 
-impl PreferenceImport {
+impl ImportedPreference {
     pub fn new(value: Value) -> Self {
         Self(value)
     }
@@ -94,7 +94,7 @@ impl PreferenceImport {
     }
 }
 
-impl Default for PreferenceImport {
+impl Default for ImportedPreference {
     fn default() -> Self {
         Self::default_value()
     }
@@ -102,12 +102,12 @@ impl Default for PreferenceImport {
 
 pub trait HarnessIntegration {
     fn kind(&self) -> HarnessKind;
-    fn detect(&self, env: &RuntimeEnv) -> Result<Detection>;
-    fn paths(&self, env: &RuntimeEnv) -> Result<HarnessPaths>;
-    fn managed_surfaces(&self, paths: &HarnessPaths) -> Vec<ManagedSurface>;
-    fn preflight(&self, profile: &LoadedProfile) -> Result<()>;
-    fn detect_drift(&self, active: &LoadedProfile, paths: &HarnessPaths) -> Result<DriftReport>;
-    fn import_from_harness(&self, paths: &HarnessPaths) -> Result<ProfileImport>;
-    fn apply(&self, profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()>;
-    fn verify(&self, profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()>;
+    fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection>;
+    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths>;
+    fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface>;
+    fn preflight(&self, profile: &ProfileRef) -> Result<()>;
+    fn detect_drift(&self, active: &ProfileRef, paths: &HarnessConfigPaths) -> Result<DriftReport>;
+    fn import_from_harness(&self, paths: &HarnessConfigPaths) -> Result<ProfileImport>;
+    fn apply(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()>;
+    fn verify(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()>;
 }

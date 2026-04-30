@@ -30,6 +30,8 @@
 | **Instruction Target** | The harness-specific instruction file linked to the profile **Instruction Source**. | Instruction file, AGENTS.md, CLAUDE.md |
 | **Native Config File** | A harness-specific settings file patched by a **Harness Integration**. | Config file, settings file, harness config |
 | **MCP List** | The complete native set of MCP servers owned by lazyagents for a harness. | MCP section, MCP servers |
+| **Harness Registry** | The app-layer catalog of supported built-in harness integrations used to resolve one or all harnesses for workflows. | Catalog, integration list |
+| **Integration Test Suite** | Shared test-only behavior checks that each concrete harness integration must pass. | Test template, integration tests |
 
 ## Profile use lifecycle
 
@@ -47,6 +49,24 @@
 | **Backup** | The latest per-harness copy of managed surfaces captured immediately before use. | Snapshot, restore point |
 | **Rollback** | The internal restoration of a harness from its **Backup** after a failed use. | Restore, revert |
 | **State** | Lazyagents metadata recording the last successful profile use per harness. | state.json, active record |
+| **App Workflow** | A UI-independent product operation, such as create profile, delete profile, inspect profile, doctor, or profile use. | CLI command logic, controller |
+
+## Source layers
+
+| Layer | Responsibility |
+| --- | --- |
+| `profile/` | Profile names, profile config, neutral MCP parsing, validation, inspection, skeleton creation, and profile filesystem storage. |
+| `harness/` | Generic harness primitives and mechanics: harness identity, integration trait, managed surfaces, drift report types, artifact helpers, transactional apply, backup/rollback, symlink helpers, and atomic writes. |
+| `integrations/` | Concrete Codex, Claude Code, and OpenCode implementations plus shared test-only integration behavior checks. |
+| `app/` | UI-independent product workflows, active state persistence, doctor report assembly, profile use decisions, and built-in harness registry composition. |
+| `cli/` | Terminal UI adapter: argument parsing, prompts, rendering, and launching `$EDITOR`. |
+
+Dependency direction:
+
+- `profile/` and production `harness/` are lower-level modules and do not depend on `app/`, `cli/`, or concrete `integrations/`.
+- `integrations/` implement the harness integration contract using `profile/` and `harness/`.
+- `app/` composes profile, harness, and integrations into product workflows.
+- `cli/` renders app results and handles terminal-specific input/output.
 
 ## Configuration concepts
 

@@ -1,15 +1,11 @@
-use std::collections::BTreeMap;
 use std::env;
-use std::io::{self, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
 use serde_json::Value;
 
-use crate::harness::integration::{ImportedDirectory, ImportedFile, ProfileImport, RuntimeEnv};
-use crate::harness::registry;
+use crate::harness::integration::{ImportedDirectory, ImportedFile, ProfileImport};
 
 use crate::profile::config::{ProfileConfig, ProfileConfigStatus};
 use crate::profile::inspect::{
@@ -135,24 +131,24 @@ impl ProfileStore {
     pub fn update_harness_preferences(
         &self,
         name: &ProfileName,
-        harness_id: &str,
+        harness_kind: crate::harness::kind::HarnessKind,
         model_preference: Value,
         permission_preference: Value,
     ) -> Result<()> {
         let mut config = self.load_config(name)?;
         config
             .models
-            .insert(harness_id.to_string(), model_preference);
+            .insert(harness_kind.id().to_string(), model_preference);
         config
             .permissions
-            .insert(harness_id.to_string(), permission_preference);
+            .insert(harness_kind.id().to_string(), permission_preference);
         self.write_config(name, &config)
     }
 
     pub fn apply_import(
         &self,
         name: &ProfileName,
-        harness_id: &str,
+        harness_kind: crate::harness::kind::HarnessKind,
         imported: ProfileImport,
     ) -> Result<()> {
         self.normalize_optional_artifacts(name)?;
@@ -181,7 +177,7 @@ impl ProfileStore {
 
         self.update_harness_preferences(
             name,
-            harness_id,
+            harness_kind,
             imported.model_preference.into_value(),
             imported.permission_preference.into_value(),
         )
@@ -196,7 +192,6 @@ impl ProfileStore {
 
     pub fn list_profiles(&self) -> Result<Vec<ProfileListItem>> {
         let profiles_dir = self.home.path().join("profiles");
-        let active = self.load_state()?.active_by_profile();
         if !profiles_dir.exists() {
             return Ok(Vec::new());
         }
@@ -231,10 +226,6 @@ impl ProfileStore {
             items.push(ProfileListItem {
                 name: profile_name.clone(),
                 config_status,
-                last_used_by: active
-                    .get(profile_name.as_str())
-                    .cloned()
-                    .unwrap_or_default(),
             });
         }
 
@@ -275,89 +266,12 @@ impl ProfileStore {
         })
     }
 
-    pub fn edit_target(&self, name: &str) -> Result<EditTarget> {
+    pub fn get_path(&self, name: &str) -> Result<PathBuf> {
         let path = self.profile_dir_for_raw_name(name)?;
         if !path.is_dir() {
             anyhow::bail!("profile {name} does not exist at {}", path.display());
         }
-
-        Ok(match env::var_os("EDITOR") {
-            Some(editor) if !editor.is_empty() => EditTarget::OpenEditor {
-                editor: PathBuf::from(editor),
-                path,
-            },
-            _ => EditTarget::PrintPath(path),
-        })
-    }
-
-    pub fn delete_profile(&self, name: &str, runtime_env: &RuntimeEnv) -> Result<PathBuf> {
-        let path = self.profile_dir_for_raw_name(name)?;
-        if !path.exists() {
-            anyhow::bail!("profile {name} does not exist at {}", path.display());
-        }
-
-        let active_reasons = self.profile_active_reasons(name, &path, runtime_env)?;
-        if !active_reasons.is_empty() {
-            anyhow::bail!(
-                "cannot delete active profile {name}: {}",
-                active_reasons.join("; ")
-            );
-        }
-
-        std::fs::remove_dir_all(&path)
-            .with_context(|| format!("failed to delete profile at {}", path.display()))?;
         Ok(path)
-    }
-
-    fn profile_active_reasons(
-        &self,
-        name: &str,
-        profile_dir: &Path,
-        runtime_env: &RuntimeEnv,
-    ) -> Result<Vec<String>> {
-        let mut reasons = Vec::new();
-        let state = self.load_state()?;
-        for (harness, profile) in state.active_profiles {
-            if profile == name {
-                reasons.push(format!("state marks it active for {harness}"));
-            }
-        }
-
-        for integration in registry::all() {
-            let paths = integration.paths(runtime_env)?;
-            let mut linked = Vec::new();
-            for surface in integration.managed_surfaces(&paths) {
-                collect_profile_symlinks(&surface.path, profile_dir, &mut linked)?;
-            }
-            linked.sort();
-            linked.dedup();
-            if !linked.is_empty() {
-                reasons.push(format!(
-                    "{} config links to it at {}",
-                    integration.kind().display_name(),
-                    linked.join(", ")
-                ));
-            }
-        }
-
-        Ok(reasons)
-    }
-
-    fn load_state(&self) -> Result<LazyagentsState> {
-        let path = self.home.path().join("state.json");
-        let text = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(LazyagentsState::default());
-            }
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to read state file at {}", path.display()));
-            }
-        };
-
-        serde_json::from_str(&text)
-            .with_context(|| format!("invalid state file at {}", path.display()))
     }
 }
 
@@ -433,37 +347,6 @@ fn create_file_if_missing(path: &Path, contents: &str) -> Result<()> {
     }
 }
 
-pub enum EditTarget {
-    PrintPath(PathBuf),
-    OpenEditor { editor: PathBuf, path: PathBuf },
-}
-
-impl EditTarget {
-    pub fn execute(self) -> Result<Option<PathBuf>> {
-        match self {
-            Self::PrintPath(path) => Ok(Some(path)),
-            Self::OpenEditor { editor, path } => {
-                let status = Command::new(&editor)
-                    .arg(&path)
-                    .status()
-                    .with_context(|| format!("failed to run editor {}", editor.display()))?;
-                if !status.success() {
-                    anyhow::bail!("editor {} exited with {status}", editor.display());
-                }
-                Ok(None)
-            }
-        }
-    }
-}
-
-pub fn confirm_delete(name: &str) -> Result<bool> {
-    print!("Delete profile {name}? [y/N] ");
-    io::stdout().flush()?;
-    let mut input = String::new();
-    io::stdin().read_line(&mut input)?;
-    Ok(matches!(input.trim(), "y" | "Y" | "yes" | "YES"))
-}
-
 fn ensure_single_path_component(name: &str) -> Result<()> {
     if name.is_empty() {
         anyhow::bail!("profile name cannot be empty");
@@ -477,44 +360,6 @@ fn ensure_single_path_component(name: &str) -> Result<()> {
     if components.next().is_some() || !matches!(component, std::path::Component::Normal(_)) {
         anyhow::bail!("profile name must be a single directory name");
     }
-    Ok(())
-}
-
-fn collect_profile_symlinks(
-    path: &Path,
-    profile_dir: &Path,
-    linked: &mut Vec<String>,
-) -> Result<()> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to inspect {}", path.display()));
-        }
-    };
-
-    if metadata.file_type().is_symlink() {
-        let target = std::fs::read_link(path)
-            .with_context(|| format!("failed to read symlink {}", path.display()))?;
-        let absolute_target = if target.is_absolute() {
-            target
-        } else {
-            path.parent().unwrap_or_else(|| Path::new("/")).join(target)
-        };
-        if absolute_target.starts_with(profile_dir) {
-            linked.push(path.display().to_string());
-        }
-        return Ok(());
-    }
-
-    if metadata.is_dir() {
-        for entry in
-            std::fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
-        {
-            collect_profile_symlinks(&entry?.path(), profile_dir, linked)?;
-        }
-    }
-
     Ok(())
 }
 
@@ -545,34 +390,17 @@ fn write_default_skeleton(path: &Path, name: &ProfileName) -> Result<()> {
 pub struct ProfileListItem {
     pub name: ProfileName,
     pub config_status: ProfileConfigStatus,
-    pub last_used_by: Vec<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct LazyagentsState {
-    #[serde(default)]
-    active_profiles: BTreeMap<String, String>,
-}
-
-impl LazyagentsState {
-    fn active_by_profile(&self) -> BTreeMap<String, Vec<String>> {
-        let mut active = BTreeMap::<String, Vec<String>>::new();
-        for (harness, profile) in &self.active_profiles {
-            active
-                .entry(profile.clone())
-                .or_default()
-                .push(harness.clone());
-        }
-        active
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::harness_registry::BuiltInHarnessRegistry;
+    use crate::harness::integration::AppEnvironment;
     use crate::profile::inspect::ArtifactStatus;
     use crate::profile::mcp::parse_mcp_definitions;
     use crate::profile::mcp::McpSummary;
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -646,7 +474,11 @@ mod tests {
         let config = store.load_config(&profile_name).unwrap();
         assert_eq!(config.name.as_deref(), Some("work"));
         assert_eq!(config.description.as_deref(), Some(""));
-        for harness in ["codex", "claude", "opencode"] {
+        for harness in [
+            crate::harness::kind::HarnessKind::Codex,
+            crate::harness::kind::HarnessKind::Claude,
+            crate::harness::kind::HarnessKind::OpenCode,
+        ] {
             assert_eq!(config.model_preference(harness), "default");
             assert_eq!(config.permission_preference(harness), "default");
         }
@@ -688,12 +520,6 @@ mod tests {
         std::fs::create_dir_all(profiles_dir.join("missing")).unwrap();
         std::fs::create_dir_all(profiles_dir.join("invalid")).unwrap();
         std::fs::write(profiles_dir.join("invalid").join("config.json"), "{").unwrap();
-        std::fs::write(
-            temp.path().join("state.json"),
-            r#"{"active_profiles":{"codex":"alpha","claude":"beta","opencode":"alpha"}}"#,
-        )
-        .unwrap();
-
         let items = store.list_profiles().unwrap();
 
         assert_eq!(
@@ -704,10 +530,6 @@ mod tests {
             vec!["alpha", "beta", "invalid", "missing"]
         );
         assert_eq!(items[0].config_status, ProfileConfigStatus::Valid);
-        assert_eq!(
-            items[0].last_used_by,
-            vec!["codex".to_string(), "opencode".to_string()]
-        );
         assert!(matches!(
             items[2].config_status,
             ProfileConfigStatus::Invalid(_)
@@ -773,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn edit_target_accepts_invalid_profile_names_without_normalizing() {
+    fn get_path_accepts_invalid_profile_names_without_normalizing() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         env::remove_var("EDITOR");
@@ -781,12 +603,9 @@ mod tests {
         let profile_dir = temp.path().join("profiles").join("bad_name");
         std::fs::create_dir_all(&profile_dir).unwrap();
 
-        let target = store.edit_target("bad_name").unwrap();
+        let target = store.get_path("bad_name").unwrap();
 
-        match target {
-            EditTarget::PrintPath(path) => assert_eq!(path, profile_dir),
-            EditTarget::OpenEditor { .. } => panic!("expected print path without EDITOR"),
-        }
+        assert_eq!(target, profile_dir);
     }
 
     #[test]
@@ -800,7 +619,13 @@ mod tests {
         std::fs::write(&backup_file, "backup").unwrap();
         let env = test_runtime_env(temp.path());
 
-        let deleted = store.delete_profile("bad_name", &env).unwrap();
+        let deleted = crate::app::delete_profile::delete_profile(
+            &BuiltInHarnessRegistry,
+            &env,
+            &store,
+            "bad_name",
+        )
+        .unwrap();
 
         assert_eq!(deleted, profile_dir);
         assert!(!deleted.exists());
@@ -820,7 +645,13 @@ mod tests {
         .unwrap();
         let env = test_runtime_env(temp.path());
 
-        let error = store.delete_profile("work", &env).unwrap_err();
+        let error = crate::app::delete_profile::delete_profile(
+            &BuiltInHarnessRegistry,
+            &env,
+            &store,
+            "work",
+        )
+        .unwrap_err();
 
         assert!(error
             .to_string()
@@ -839,13 +670,19 @@ mod tests {
         let codex_dir = user_home.join(".codex");
         std::fs::create_dir_all(&codex_dir).unwrap();
         create_symlink(profile_dir.join("AGENTS.md"), codex_dir.join("AGENTS.md"));
-        let env = RuntimeEnv {
+        let env = AppEnvironment {
             lazyagents_home: home,
             user_home,
             path_entries: Vec::new(),
         };
 
-        let error = store.delete_profile("work", &env).unwrap_err();
+        let error = crate::app::delete_profile::delete_profile(
+            &BuiltInHarnessRegistry,
+            &env,
+            &store,
+            "work",
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("Codex config links to it"));
         assert!(profile_dir.exists());
@@ -884,8 +721,8 @@ mod tests {
         }
     }
 
-    fn test_runtime_env(home: &Path) -> RuntimeEnv {
-        RuntimeEnv {
+    fn test_runtime_env(home: &Path) -> AppEnvironment {
+        AppEnvironment {
             lazyagents_home: home.to_path_buf(),
             user_home: home.join("user"),
             path_entries: Vec::new(),

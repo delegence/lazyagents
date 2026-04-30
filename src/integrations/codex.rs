@@ -1,15 +1,22 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
+use crate::harness::artifacts::{
+    collect_directory_link_drift, flat_profile_commands, import_flat_commands, import_skills,
+    link_flat_commands, link_skills, valid_skills,
+};
 use crate::harness::drift::{DriftItem, DriftReport};
+use crate::harness::fs::{
+    detect_binary, normalize_json_text, read_optional_string, symlink_file, symlink_points_to,
+};
 use crate::harness::integration::{
-    Detection, HarnessIntegration, HarnessPaths, ImportedDirectory, ImportedFile, LoadedProfile,
-    PreferenceImport, ProfileImport, RuntimeEnv,
+    AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedPreference,
+    ProfileImport, ProfileRef,
 };
 use crate::harness::kind::HarnessKind;
 use crate::harness::managed::{write_text_atomic, ManagedSurface};
@@ -23,13 +30,13 @@ impl HarnessIntegration for CodexIntegration {
         HarnessKind::Codex
     }
 
-    fn detect(&self, env: &RuntimeEnv) -> Result<Detection> {
+    fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection> {
         Ok(detect_binary(env, self.kind().binary_name()))
     }
 
-    fn paths(&self, env: &RuntimeEnv) -> Result<HarnessPaths> {
+    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
         let config_dir = env.user_home.join(".codex");
-        Ok(HarnessPaths {
+        Ok(HarnessConfigPaths {
             instruction_target: config_dir.join("AGENTS.md"),
             skills_dir: config_dir.join("skills"),
             commands_dir: config_dir.join("prompts"),
@@ -39,7 +46,7 @@ impl HarnessIntegration for CodexIntegration {
         })
     }
 
-    fn managed_surfaces(&self, paths: &HarnessPaths) -> Vec<ManagedSurface> {
+    fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
         vec![
             ManagedSurface::file(&paths.instruction_target),
             ManagedSurface::directory(&paths.skills_dir),
@@ -48,11 +55,11 @@ impl HarnessIntegration for CodexIntegration {
         ]
     }
 
-    fn preflight(&self, profile: &LoadedProfile) -> Result<()> {
+    fn preflight(&self, profile: &ProfileRef) -> Result<()> {
         flat_profile_commands(&profile.path).map(|_| ())
     }
 
-    fn detect_drift(&self, active: &LoadedProfile, paths: &HarnessPaths) -> Result<DriftReport> {
+    fn detect_drift(&self, active: &ProfileRef, paths: &HarnessConfigPaths) -> Result<DriftReport> {
         let mut items = Vec::new();
         let instruction_source = active.path.join("AGENTS.md");
         if !symlink_points_to(&paths.instruction_target, &instruction_source) {
@@ -87,20 +94,20 @@ impl HarnessIntegration for CodexIntegration {
         Ok(DriftReport { items })
     }
 
-    fn import_from_harness(&self, paths: &HarnessPaths) -> Result<ProfileImport> {
+    fn import_from_harness(&self, paths: &HarnessConfigPaths) -> Result<ProfileImport> {
         let document = read_config(&paths.settings_file)?;
         Ok(ProfileImport {
             instruction: read_optional_string(&paths.instruction_target)?,
             skills: import_skills(&paths.skills_dir)?,
-            commands: import_commands(&paths.commands_dir)?,
+            commands: import_flat_commands(&paths.commands_dir)?,
             mcp_definitions: Some(import_codex_mcps(&document)?),
-            model_preference: PreferenceImport::new(
+            model_preference: ImportedPreference::new(
                 document["model"]
                     .as_str()
                     .map(|value| json!(value))
                     .unwrap_or_else(|| json!("default")),
             ),
-            permission_preference: PreferenceImport::new(
+            permission_preference: ImportedPreference::new(
                 document["approval_policy"]
                     .as_str()
                     .map(|value| json!(value))
@@ -109,7 +116,7 @@ impl HarnessIntegration for CodexIntegration {
         })
     }
 
-    fn apply(&self, profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()> {
+    fn apply(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
         fs::create_dir_all(&paths.config_dir)
             .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
         fs::create_dir_all(&paths.skills_dir)
@@ -119,12 +126,12 @@ impl HarnessIntegration for CodexIntegration {
 
         symlink_file(profile.path.join("AGENTS.md"), &paths.instruction_target)?;
         link_skills(profile, paths)?;
-        link_commands(profile, paths)?;
+        link_flat_commands(profile, paths)?;
         patch_codex_config(profile, paths)?;
         Ok(())
     }
 
-    fn verify(&self, profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()> {
+    fn verify(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
         let instruction_source = profile.path.join("AGENTS.md");
         if !symlink_points_to(&paths.instruction_target, &instruction_source) {
             anyhow::bail!(
@@ -160,248 +167,19 @@ impl HarnessIntegration for CodexIntegration {
     }
 }
 
-fn link_skills(profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()> {
-    for skill in valid_skills(&profile.path)? {
-        let target = paths.skills_dir.join(
-            skill
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("invalid skill path {}", skill.display()))?,
-        );
-        symlink_dir(skill, target)?;
-    }
-    Ok(())
-}
-
-fn link_commands(profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()> {
-    for command in flat_profile_commands(&profile.path)? {
-        let target = paths.commands_dir.join(
-            command
-                .file_name()
-                .ok_or_else(|| anyhow::anyhow!("invalid command path {}", command.display()))?,
-        );
-        symlink_file(command, target)?;
-    }
-    Ok(())
-}
-
-fn collect_directory_link_drift(
-    surface: &str,
-    expected_sources: Vec<PathBuf>,
-    target_dir: &Path,
-    items: &mut Vec<DriftItem>,
-) -> Result<()> {
-    let mut expected_names = BTreeSet::new();
-    for source in expected_sources {
-        let name = source
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("invalid source path {}", source.display()))?
-            .to_string_lossy()
-            .into_owned();
-        expected_names.insert(name.clone());
-        if !symlink_points_to(&target_dir.join(&name), &source) {
-            items.push(DriftItem {
-                surface: surface.to_string(),
-                detail: format!(
-                    "{} is not linked to active profile",
-                    target_dir.join(&name).display()
-                ),
-            });
-        }
-    }
-    if target_dir.exists() {
-        for entry in fs::read_dir(target_dir)
-            .with_context(|| format!("failed to read {}", target_dir.display()))?
-        {
-            let entry = entry?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            if !expected_names.contains(&name) {
-                items.push(DriftItem {
-                    surface: surface.to_string(),
-                    detail: format!("unexpected managed entry {}", entry.path().display()),
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
-fn normalize_json_text(text: &str) -> Value {
-    if text.trim().is_empty() {
-        json!([])
-    } else {
-        serde_json::from_str(text).unwrap_or_else(|_| json!(text.trim()))
-    }
-}
-
-fn read_optional_string(path: &Path) -> Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
-    }
-}
-
-fn import_skills(path: &Path) -> Result<Vec<ImportedDirectory>> {
-    let mut skills = Vec::new();
-    if !path.exists() {
-        return Ok(skills);
-    }
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        if !entry.path().metadata()?.is_dir() || !entry.path().join("SKILL.md").is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().into_owned();
-        skills.push(ImportedDirectory {
-            name,
-            files: import_files_recursive(&entry.path(), &entry.path())?,
-        });
-    }
-    skills.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(skills)
-}
-
-fn import_commands(path: &Path) -> Result<Vec<ImportedFile>> {
-    let mut commands = Vec::new();
-    if !path.exists() {
-        return Ok(commands);
-    }
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        if entry.path().metadata()?.is_dir() {
-            if contains_markdown_file(&entry.path())? {
-                anyhow::bail!(
-                    "Codex command import does not support nested commands: {}",
-                    entry.path().display()
-                );
-            }
-            continue;
-        }
-        if entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == "md")
-        {
-            commands.push(ImportedFile {
-                relative_path: PathBuf::from(entry.file_name()),
-                contents: fs::read(entry.path())
-                    .with_context(|| format!("failed to read {}", entry.path().display()))?,
-            });
-        }
-    }
-    commands.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(commands)
-}
-
-fn import_files_recursive(root: &Path, path: &Path) -> Result<Vec<ImportedFile>> {
-    let mut files = Vec::new();
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
-            continue;
-        }
-        let path = entry.path();
-        if path.metadata()?.is_dir() {
-            files.extend(import_files_recursive(root, &path)?);
-        } else if path.metadata()?.is_file() {
-            files.push(ImportedFile {
-                relative_path: path
-                    .strip_prefix(root)
-                    .with_context(|| format!("{} is not under {}", path.display(), root.display()))?
-                    .to_path_buf(),
-                contents: fs::read(&path)
-                    .with_context(|| format!("failed to read {}", path.display()))?,
-            });
-        }
-    }
-    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(files)
-}
-
-fn valid_skills(profile_path: &Path) -> Result<Vec<PathBuf>> {
-    let skills_dir = profile_path.join("skills");
-    let mut skills = Vec::new();
-    if !skills_dir.exists() {
-        return Ok(skills);
-    }
-    for entry in fs::read_dir(&skills_dir)
-        .with_context(|| format!("failed to read {}", skills_dir.display()))?
-    {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() && entry.path().join("SKILL.md").is_file() {
-            skills.push(entry.path());
-        }
-    }
-    skills.sort();
-    Ok(skills)
-}
-
-fn flat_profile_commands(profile_path: &Path) -> Result<Vec<PathBuf>> {
-    let commands_dir = profile_path.join("commands");
-    let mut commands = Vec::new();
-    if !commands_dir.exists() {
-        return Ok(commands);
-    }
-    for entry in fs::read_dir(&commands_dir)
-        .with_context(|| format!("failed to read {}", commands_dir.display()))?
-    {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            let has_markdown = contains_markdown_file(&entry.path())?;
-            if has_markdown {
-                anyhow::bail!(
-                    "Codex does not support nested profile commands: {}",
-                    entry.path().display()
-                );
-            }
-            continue;
-        }
-        if entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == "md")
-        {
-            commands.push(entry.path());
-        }
-    }
-    commands.sort();
-    Ok(commands)
-}
-
-fn contains_markdown_file(path: &Path) -> Result<bool> {
-    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            if contains_markdown_file(&entry.path())? {
-                return Ok(true);
-            }
-        } else if entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension == "md")
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn patch_codex_config(profile: &LoadedProfile, paths: &HarnessPaths) -> Result<()> {
+fn patch_codex_config(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
     let profile_config = read_profile_config(&profile.path)?;
     let mcp_definitions = read_mcp_definitions(&profile.path)?;
     let mut document = read_config(&paths.settings_file)?;
 
-    if let Some(model) =
-        non_default_string(profile_config.model_preference("codex"), "Model Preference")?
-    {
+    if let Some(model) = non_default_string(
+        profile_config.model_preference(crate::harness::kind::HarnessKind::Codex),
+        "Model Preference",
+    )? {
         document["model"] = value(model);
     }
     if let Some(permission) = non_default_string(
-        profile_config.permission_preference("codex"),
+        profile_config.permission_preference(crate::harness::kind::HarnessKind::Codex),
         "Permission Preference",
     )? {
         document["approval_policy"] = value(permission);
@@ -591,326 +369,46 @@ fn split_headers(
     (literal, env_headers)
 }
 
-fn detect_binary(env: &RuntimeEnv, binary_name: &str) -> Detection {
-    for path in &env.path_entries {
-        let binary_path = path.join(binary_name);
-        if binary_path.is_file() {
-            return Detection::Detected { binary_path };
-        }
-    }
-    Detection::NotDetected
-}
-
-fn symlink_points_to(link: &Path, source: &Path) -> bool {
-    fs::read_link(link)
-        .map(|target| target == source)
-        .unwrap_or(false)
-}
-
-#[cfg(unix)]
-fn symlink_file(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<()> {
-    std::os::unix::fs::symlink(source.as_ref(), target.as_ref())
-        .with_context(|| format!("failed to link {}", target.as_ref().display()))
-}
-
-#[cfg(unix)]
-fn symlink_dir(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<()> {
-    std::os::unix::fs::symlink(source.as_ref(), target.as_ref())
-        .with_context(|| format!("failed to link {}", target.as_ref().display()))
-}
-
-#[cfg(windows)]
-fn symlink_file(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<()> {
-    std::os::windows::fs::symlink_file(source.as_ref(), target.as_ref())
-        .with_context(|| format!("failed to link {}", target.as_ref().display()))
-}
-
-#[cfg(windows)]
-fn symlink_dir(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Result<()> {
-    std::os::windows::fs::symlink_dir(source.as_ref(), target.as_ref())
-        .with_context(|| format!("failed to link {}", target.as_ref().display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::apply::{use_profile, DriftPolicy};
-    use crate::profile::{LazyagentsHome, ProfileName, ProfileStore};
+    use crate::harness::integration::{HarnessConfigPaths, HarnessIntegration, ProfileImport};
+    use crate::integrations::test_suite::template::HarnessTestAdapter;
+    use crate::profile::ProfileConfig;
+    use std::fs;
+    use std::path::Path;
 
-    #[test]
-    fn codex_use_applies_profile_artifacts_preferences_mcp_and_state() {
-        let fixture = CodexFixture::new();
-        let profile = fixture.profile("work");
-        add_skill(&profile, "writer");
-        add_command(&profile, "plan.md");
-        write_config(
-            &profile,
-            r#"{
-  "name": "work",
-  "description": "",
-  "models": {"codex": "gpt-5.2"},
-  "permissions": {"codex": "on-request"}
-}"#,
-        );
-        fs::write(
-            profile.join("mcps.json"),
-            r#"[
-  {"name":"local","transport":"stdio","command":"server","args":["--x"],"env":{"TOKEN":"$TOKEN"}},
-  {"name":"remote","transport":"http","url":"https://mcp.example","headers":{"Authorization":"$TOKEN","X-Literal":"abc"}},
-  {"name":"disabled","enabled":false,"transport":"stdio","command":"draft-server"}
-]"#,
-        )
-        .unwrap();
-        fs::create_dir_all(fixture.codex_dir()).unwrap();
-        fs::write(fixture.codex_dir().join("config.toml"), "other = true\n").unwrap();
+    #[derive(Default)]
+    struct CodexAdapter;
 
-        use_profile(
-            &CodexIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-
-        assert_symlink_to(
-            fixture.codex_dir().join("AGENTS.md"),
-            profile.join("AGENTS.md"),
-        );
-        assert_symlink_to(
-            fixture.codex_dir().join("skills").join("writer"),
-            profile.join("skills").join("writer"),
-        );
-        assert_symlink_to(
-            fixture.codex_dir().join("prompts").join("plan.md"),
-            profile.join("commands").join("plan.md"),
-        );
-        let config = fs::read_to_string(fixture.codex_dir().join("config.toml")).unwrap();
-        assert!(config.contains("other = true"));
-        assert!(config.contains("model = \"gpt-5.2\""));
-        assert!(config.contains("approval_policy = \"on-request\""));
-        assert!(config.contains("[mcp_servers.local]"));
-        assert!(config.contains("command = \"server\""));
-        assert!(config.contains("[mcp_servers.remote.env_http_headers]"));
-        assert!(!config.contains("disabled"));
-        assert_eq!(
-            fs::read_to_string(fixture.home.join("state.json")).unwrap(),
-            "{\n  \"active_profiles\": {\n    \"codex\": \"work\"\n  }\n}\n"
-        );
-    }
-
-    #[test]
-    fn codex_use_normalizes_missing_optional_artifacts() {
-        let fixture = CodexFixture::new();
-        let profile = fixture.profile("work");
-        fs::remove_file(profile.join("AGENTS.md")).unwrap();
-        fs::remove_file(profile.join("mcps.json")).unwrap();
-        fs::remove_dir_all(profile.join("skills")).unwrap();
-        fs::remove_dir_all(profile.join("commands")).unwrap();
-
-        use_profile(
-            &CodexIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-
-        assert!(profile.join("AGENTS.md").is_file());
-        assert!(profile.join("mcps.json").is_file());
-        assert!(profile.join("skills").is_dir());
-        assert!(profile.join("commands").is_dir());
-        assert_symlink_to(
-            fixture.codex_dir().join("AGENTS.md"),
-            profile.join("AGENTS.md"),
-        );
-    }
-
-    #[test]
-    fn codex_use_removes_stale_surfaces_and_clears_mcp_list() {
-        let fixture = CodexFixture::new();
-        let full = fixture.profile("full");
-        add_skill(&full, "writer");
-        add_command(&full, "plan.md");
-        fs::write(
-            full.join("mcps.json"),
-            r#"[{"name":"local","transport":"stdio","command":"server"}]"#,
-        )
-        .unwrap();
-        fixture.profile("empty");
-
-        use_profile(
-            &CodexIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("full").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-        use_profile(
-            &CodexIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("empty").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-
-        assert!(fs::read_dir(fixture.codex_dir().join("skills"))
-            .unwrap()
-            .next()
-            .is_none());
-        assert!(fs::read_dir(fixture.codex_dir().join("prompts"))
-            .unwrap()
-            .next()
-            .is_none());
-        let config = fs::read_to_string(fixture.codex_dir().join("config.toml")).unwrap();
-        assert!(!config.contains("mcp_servers"));
-    }
-
-    #[test]
-    fn codex_use_default_preferences_do_not_modify_existing_native_settings() {
-        let fixture = CodexFixture::new();
-        fixture.profile("work");
-        fs::create_dir_all(fixture.codex_dir()).unwrap();
-        fs::write(
-            fixture.codex_dir().join("config.toml"),
-            "model = \"existing\"\napproval_policy = \"never\"\n",
-        )
-        .unwrap();
-
-        use_profile(
-            &CodexIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-
-        let config = fs::read_to_string(fixture.codex_dir().join("config.toml")).unwrap();
-        assert!(config.contains("model = \"existing\""));
-        assert!(config.contains("approval_policy = \"never\""));
-    }
-
-    #[test]
-    fn codex_use_rejects_nested_commands_before_partial_writes() {
-        let fixture = CodexFixture::new();
-        let profile = fixture.profile("work");
-        fs::create_dir_all(profile.join("commands").join("nested")).unwrap();
-        fs::write(profile.join("commands").join("nested").join("bad.md"), "").unwrap();
-
-        let error = use_profile(
-            &CodexIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap_err();
-
-        assert!(error
-            .to_string()
-            .contains("Codex does not support nested profile commands"));
-        assert!(!fixture.codex_dir().join("AGENTS.md").exists());
-        assert!(!fixture.home.join("state.json").exists());
-    }
-
-    #[test]
-    fn codex_use_rejects_invalid_disabled_mcp_without_state_update() {
-        let fixture = CodexFixture::new();
-        let profile = fixture.profile("work");
-        fs::write(
-            profile.join("mcps.json"),
-            r#"[{"name":"draft","enabled":false}]"#,
-        )
-        .unwrap();
-
-        let error = use_profile(
-            &CodexIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap_err();
-
-        assert!(format!("{error:#}").contains("MCP draft requires transport"));
-        assert!(!fixture.home.join("state.json").exists());
-        assert!(!fixture.codex_dir().join("config.toml").exists());
-    }
-
-    #[test]
-    fn codex_use_rolls_back_and_dereferences_symlink_backup_on_failure() {
-        let fixture = CodexFixture::new();
-        let profile = fixture.profile("work");
-        fs::write(
-            profile.join("mcps.json"),
-            r#"[{"name":"bad","transport":"stdio"}]"#,
-        )
-        .unwrap();
-        fs::create_dir_all(fixture.codex_dir()).unwrap();
-        let old_source = fixture.temp.path().join("old-source.md");
-        fs::write(&old_source, "previous instructions").unwrap();
-        symlink_file(&old_source, fixture.codex_dir().join("AGENTS.md")).unwrap();
-        fs::create_dir_all(fixture.codex_dir().join("skills")).unwrap();
-        fs::write(fixture.codex_dir().join("skills").join("old.txt"), "old").unwrap();
-        fs::write(fixture.codex_dir().join("config.toml"), "model = \"old\"\n").unwrap();
-
-        let error = use_profile(
-            &CodexIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("work").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap_err();
-
-        assert!(format!("{error:#}").contains("requires command"));
-        assert_eq!(
-            fs::read_to_string(fixture.codex_dir().join("AGENTS.md")).unwrap(),
-            "previous instructions"
-        );
-        assert!(!fs::symlink_metadata(fixture.codex_dir().join("AGENTS.md"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(
-            fs::read_to_string(fixture.codex_dir().join("skills").join("old.txt")).unwrap(),
-            "old"
-        );
-        assert_eq!(
-            fs::read_to_string(fixture.codex_dir().join("config.toml")).unwrap(),
-            "model = \"old\"\n"
-        );
-        assert!(!fixture.home.join("state.json").exists());
-    }
-
-    #[test]
-    fn codex_import_reads_managed_state_and_dereferences_symlinks() {
-        let fixture = CodexFixture::new();
-        fs::create_dir_all(fixture.codex_dir().join("skills")).unwrap();
-        fs::create_dir_all(fixture.codex_dir().join("prompts")).unwrap();
-        let instruction_source = fixture.temp.path().join("instruction-source.md");
-        fs::write(&instruction_source, "imported instructions").unwrap();
-        symlink_file(&instruction_source, fixture.codex_dir().join("AGENTS.md")).unwrap();
-        let skill_source = fixture.temp.path().join("skill-source");
-        fs::create_dir_all(&skill_source).unwrap();
-        fs::write(skill_source.join("SKILL.md"), "skill body").unwrap();
-        symlink_dir(
-            &skill_source,
-            fixture.codex_dir().join("skills").join("linked"),
-        )
-        .unwrap();
-        fs::write(
-            fixture.codex_dir().join("prompts").join("cmd.md"),
-            "command",
-        )
-        .unwrap();
-        fs::write(
-            fixture.codex_dir().join("config.toml"),
-            r#"
+    impl HarnessTestAdapter for CodexAdapter {
+        fn integration(&self) -> Box<dyn HarnessIntegration> {
+            Box::new(CodexIntegration)
+        }
+        fn bin_name(&self) -> &'static str {
+            "codex"
+        }
+        fn assert_mcp_cleared(&self, paths: &HarnessConfigPaths) {
+            let config = fs::read_to_string(&paths.settings_file).unwrap();
+            assert!(!config.contains("mcp_servers"));
+        }
+        fn write_malformed_native_config(&self, paths: &HarnessConfigPaths) {
+            fs::write(&paths.settings_file, "malformed = [").unwrap();
+        }
+        fn supports_nested_commands(&self) -> bool {
+            false
+        }
+        fn write_existing_native_settings(&self, paths: &HarnessConfigPaths) {
+            fs::write(&paths.settings_file, "other = true\n").unwrap();
+        }
+        fn assert_native_settings_preserved(&self, paths: &HarnessConfigPaths) {
+            let config = fs::read_to_string(&paths.settings_file).unwrap_or_default();
+            assert!(config.contains("other = true"));
+        }
+        fn setup_native_config_for_import(&self, paths: &HarnessConfigPaths) {
+            fs::write(
+                &paths.settings_file,
+                r#"
 model = "gpt-imported"
 approval_policy = "on-request"
 
@@ -931,195 +429,57 @@ X-Literal = "abc"
 [mcp_servers.remote.env_http_headers]
 Authorization = "TOKEN"
 "#,
-        )
-        .unwrap();
-        let paths = CodexIntegration.paths(&fixture.env).unwrap();
-
-        let imported = CodexIntegration.import_from_harness(&paths).unwrap();
-
-        assert_eq!(
-            imported.instruction.as_deref(),
-            Some("imported instructions")
-        );
-        assert_eq!(imported.skills[0].name, "linked");
-        assert_eq!(imported.skills[0].files[0].contents, b"skill body");
-        assert_eq!(imported.commands[0].contents, b"command");
-        assert_eq!(
-            imported.model_preference.into_value(),
-            serde_json::json!("gpt-imported")
-        );
-        assert!(imported
-            .mcp_definitions
-            .unwrap()
-            .contains("\"Authorization\": \"$TOKEN\""));
-    }
-
-    #[test]
-    fn codex_import_fails_on_malformed_native_config() {
-        let fixture = CodexFixture::new();
-        fs::create_dir_all(fixture.codex_dir()).unwrap();
-        fs::write(fixture.codex_dir().join("config.toml"), "not = [").unwrap();
-        let paths = CodexIntegration.paths(&fixture.env).unwrap();
-
-        let error = CodexIntegration.import_from_harness(&paths).unwrap_err();
-
-        assert!(error.to_string().contains("invalid Codex config TOML"));
-    }
-
-    #[test]
-    fn codex_save_changes_imports_drift_into_active_profile_before_switching() {
-        let fixture = CodexFixture::new();
-        let active = fixture.profile("active");
-        let target = fixture.profile("target");
-        fs::write(
-            fixture.home.join("state.json"),
-            r#"{"active_profiles":{"codex":"active"}}"#,
-        )
-        .unwrap();
-        fs::create_dir_all(fixture.codex_dir().join("skills").join("newskill")).unwrap();
-        fs::write(
-            fixture
-                .codex_dir()
-                .join("skills")
-                .join("newskill")
-                .join("SKILL.md"),
-            "new skill",
-        )
-        .unwrap();
-        fs::create_dir_all(fixture.codex_dir().join("prompts")).unwrap();
-        fs::write(
-            fixture.codex_dir().join("prompts").join("new.md"),
-            "new command",
-        )
-        .unwrap();
-        fs::write(fixture.codex_dir().join("AGENTS.md"), "drifted").unwrap();
-        fs::write(
-            fixture.codex_dir().join("config.toml"),
-            "model = \"drift-model\"\napproval_policy = \"drift-perm\"\n",
-        )
-        .unwrap();
-
-        use_profile(
-            &CodexIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("target").unwrap(),
-            DriftPolicy::SaveChanges,
-        )
-        .unwrap();
-
-        assert_eq!(
-            fs::read_to_string(active.join("AGENTS.md")).unwrap(),
-            "drifted"
-        );
-        assert_eq!(
-            fs::read_to_string(active.join("skills").join("newskill").join("SKILL.md")).unwrap(),
-            "new skill"
-        );
-        assert_eq!(
-            fs::read_to_string(active.join("commands").join("new.md")).unwrap(),
-            "new command"
-        );
-        let active_config = fixture
-            .store
-            .load_config(&ProfileName::parse("active").unwrap())
+            )
             .unwrap();
-        assert_eq!(active_config.model_preference("codex"), "drift-model");
-        assert_eq!(active_config.permission_preference("codex"), "drift-perm");
-        assert_eq!(active_config.model_preference("claude"), "default");
-        assert_symlink_to(
-            fixture.codex_dir().join("AGENTS.md"),
-            target.join("AGENTS.md"),
-        );
-    }
-
-    #[test]
-    fn codex_discard_changes_switches_without_updating_active_profile() {
-        let fixture = CodexFixture::new();
-        let active = fixture.profile("active");
-        let target = fixture.profile("target");
-        fs::write(active.join("AGENTS.md"), "original").unwrap();
-        fs::write(
-            fixture.home.join("state.json"),
-            r#"{"active_profiles":{"codex":"active"}}"#,
-        )
-        .unwrap();
-        fs::create_dir_all(fixture.codex_dir()).unwrap();
-        fs::write(fixture.codex_dir().join("AGENTS.md"), "drifted").unwrap();
-
-        use_profile(
-            &CodexIntegration,
-            &fixture.env,
-            &fixture.store,
-            &ProfileName::parse("target").unwrap(),
-            DriftPolicy::Discard,
-        )
-        .unwrap();
-
-        assert_eq!(
-            fs::read_to_string(active.join("AGENTS.md")).unwrap(),
-            "original"
-        );
-        assert_symlink_to(
-            fixture.codex_dir().join("AGENTS.md"),
-            target.join("AGENTS.md"),
-        );
-    }
-
-    struct CodexFixture {
-        temp: tempfile::TempDir,
-        home: PathBuf,
-        env: RuntimeEnv,
-        store: ProfileStore,
-    }
-
-    impl CodexFixture {
-        fn new() -> Self {
-            let temp = tempfile::tempdir().unwrap();
-            let home = temp.path().join("lazyagents");
-            let user_home = temp.path().join("user");
-            let bin = temp.path().join("bin");
-            fs::create_dir_all(&bin).unwrap();
-            fs::write(bin.join("codex"), "").unwrap();
-            let env = RuntimeEnv {
-                lazyagents_home: home.clone(),
-                user_home,
-                path_entries: vec![bin],
-            };
-            let store = ProfileStore::new(LazyagentsHome::from_path(&home));
-            Self {
-                temp,
-                home,
-                env,
-                store,
-            }
         }
-
-        fn profile(&self, name: &str) -> PathBuf {
-            let name = ProfileName::parse(name).unwrap();
-            self.store.create_skeleton(&name).unwrap()
+        fn assert_imported_native_config(&self, import: &ProfileImport) {
+            assert_eq!(
+                import.model_preference.clone().into_value(),
+                serde_json::json!("gpt-imported")
+            );
+            assert!(import
+                .mcp_definitions
+                .as_ref()
+                .unwrap()
+                .contains("\"Authorization\": \"$TOKEN\""));
         }
-
-        fn codex_dir(&self) -> PathBuf {
-            self.env.user_home.join(".codex")
+        fn setup_drift_native_config(&self, paths: &HarnessConfigPaths) {
+            fs::write(
+                &paths.settings_file,
+                "model = \"drift-model\"\napproval_policy = \"drift-perm\"\n",
+            )
+            .unwrap();
+        }
+        fn assert_drift_saved(&self, config: &ProfileConfig) {
+            assert_eq!(
+                config.model_preference(crate::harness::kind::HarnessKind::Codex),
+                "drift-model"
+            );
+            assert_eq!(
+                config.permission_preference(crate::harness::kind::HarnessKind::Codex),
+                "drift-perm"
+            );
+        }
+        fn write_profile_config(&self, profile: &Path) {
+            crate::integrations::test_suite::template::write_config(
+                profile,
+                r#"{
+  "name": "work",
+  "description": "",
+  "models": {"codex": "gpt-5.2"},
+  "permissions": {"codex": "on-request"}
+}"#,
+            );
+        }
+        fn assert_applied_native_config(&self, paths: &HarnessConfigPaths) {
+            let config = fs::read_to_string(&paths.settings_file).unwrap();
+            assert!(config.contains("model = \"gpt-5.2\""));
+            assert!(config.contains("approval_policy = \"on-request\""));
+            assert!(config.contains("[mcp_servers.local]"));
+            assert!(config.contains("command = \"server\""));
+            assert!(!config.contains("disabled"));
         }
     }
 
-    fn add_skill(profile: &Path, name: &str) {
-        let path = profile.join("skills").join(name);
-        fs::create_dir_all(&path).unwrap();
-        fs::write(path.join("SKILL.md"), "").unwrap();
-    }
-
-    fn add_command(profile: &Path, name: &str) {
-        fs::write(profile.join("commands").join(name), "").unwrap();
-    }
-
-    fn write_config(profile: &Path, text: &str) {
-        fs::write(profile.join("config.json"), text).unwrap();
-    }
-
-    fn assert_symlink_to(link: impl AsRef<Path>, source: impl AsRef<Path>) {
-        assert_eq!(fs::read_link(link).unwrap(), source.as_ref());
-    }
+    crate::define_standard_harness_tests!(CodexAdapter);
 }

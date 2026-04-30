@@ -1,7 +1,7 @@
 # Agent Guidelines
 
-study [README.md](README.md) to learn about project.
-study docs/* for product conract, specifications and etc.
+study README.md to learn about project.
+study docs/* for product contract, specifications and etc.
 
 ## How to run
 - `cargo run` shows CLI help.
