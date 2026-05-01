@@ -5,6 +5,7 @@ pub enum HarnessKind {
     Codex,
     Claude,
     OpenCode,
+    Pi,
 }
 
 impl HarnessKind {
@@ -13,6 +14,7 @@ impl HarnessKind {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
+            Self::Pi => "pi",
         }
     }
 
@@ -21,6 +23,7 @@ impl HarnessKind {
             Self::Codex => "Codex",
             Self::Claude => "Claude Code",
             Self::OpenCode => "OpenCode",
+            Self::Pi => "Pi",
         }
     }
 
@@ -29,6 +32,7 @@ impl HarnessKind {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
+            Self::Pi => "pi",
         }
     }
 }

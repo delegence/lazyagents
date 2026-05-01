@@ -57,6 +57,9 @@ pub struct ExampleIntegration;
 
 impl HarnessIntegration for ExampleIntegration {
     fn kind(&self) -> HarnessKind { ... }
+    fn supports_skills(&self) -> bool { ... } // optional; defaults to true
+    fn supports_commands(&self) -> bool { ... } // optional; defaults to true
+    fn supports_mcp(&self) -> bool { ... } // optional; defaults to true
     fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection> { ... }
     fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> { ... }
     fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> { ... }
@@ -106,11 +109,11 @@ Then invoke:
 crate::define_standard_harness_tests!(ExampleAdapter);
 ```
 
-The shared suite checks normalization, stale surface clearing, default preference behavior, invalid MCP failure, rollback, import, save/discard drift, apply/state updates, and nested command behavior.
+The shared suite checks normalization, stale surface clearing, default preference behavior, optional skill/command/MCP behavior, rollback, import, save/discard drift, apply/state updates, and nested command behavior.
 
 The adapter must define harness-specific test setup and assertions for:
 
-- MCP clear behavior
+- whether skills, commands, and native MCP are supported, and clear behavior when they are
 - malformed native config
 - whether nested commands are supported
 - native settings preservation
@@ -144,6 +147,12 @@ Do not leave docs saying only Codex, Claude Code, and OpenCode are supported if 
 
 Return the new `HarnessKind` variant.
 
+### `supports_skills`, `supports_commands`, and `supports_mcp`
+
+Return `false` for any profile artifact type the harness cannot represent. Unsupported artifact types are ignored by the integration: do not apply, verify, drift-check, import, or clear them. The defaults are `true` for existing harnesses.
+
+For MCP specifically, returning `false` also tells app-layer drift setup not to validate the active profile's `mcps.json` for this harness.
+
 ### `detect`
 
 Use `harness::fs::detect_binary(env, self.kind().binary_name())` unless the harness has a stronger detection rule.
@@ -158,12 +167,12 @@ Use:
 
 - `config_dir` for the harness config root
 - `instruction_target` for the harness-native instruction file
-- `skills_dir` for managed skill directory contents
-- `commands_dir` for managed command file contents
+- `skills_dir` for managed skill directory contents, when supported
+- `commands_dir` for managed command file contents, when supported
 - `settings_file` for native model/permission config
-- `mcp_file` for the native MCP config location
+- `mcp_file` for the native MCP config location, when the harness has one
 
-`settings_file` and `mcp_file` may be the same path.
+`settings_file` and `mcp_file` may be the same path. If the harness does not support skills, commands, or MCP, set the corresponding path to a harmless config path such as `config_dir`, do not include it as a managed surface for that artifact type, and ignore that artifact type in the integration methods.
 
 ### `managed_surfaces`
 
@@ -190,9 +199,9 @@ Compare the active profile to current harness managed surfaces and return `Drift
 Drift should include:
 
 - instruction target not linked to active profile instruction source
-- skill set mismatch
-- command set mismatch
-- MCP differences
+- skill set mismatch, when skills are supported
+- command set mismatch, when commands are supported
+- MCP differences, when native MCP is supported
 - managed surface damage
 
 Model and permission differences should not trigger drift prompts.
@@ -206,13 +215,13 @@ Read current harness managed state into a `ProfileImport` without mutating the h
 Rules:
 
 - dereference imported symlinks
-- import only valid skill directories
-- import Markdown command files
+- import only valid skill directories, when skills are supported
+- import Markdown command files, when commands are supported
 - preserve nested command paths when the harness supports them
 - parse malformed native config as an error
 - import native model/permission values when present
 - use `ImportedPreference::default_value()` when the native key is absent
-- produce neutral `mcps.json` text for `mcp_definitions`
+- produce neutral `mcps.json` text for `mcp_definitions` when the harness supports native MCP; otherwise return `None` so existing profile MCP definitions are preserved
 
 ### `apply`
 
@@ -221,9 +230,9 @@ Apply a profile to the harness after shared transaction code has captured backup
 Rules:
 
 - create missing config directories
-- symlink profile-owned instructions, valid skills, and command files with absolute symlinks
+- symlink profile-owned instructions and supported valid skills/command files with absolute symlinks
 - patch native config files, preserving unrelated keys
-- translate neutral MCP definitions into native format
+- translate neutral MCP definitions into native format, when the harness supports native MCP
 - honor `"default"` model/permission values by not mutating those native keys
 - write native config atomically with `write_text_atomic`
 
@@ -235,16 +244,18 @@ Check that the managed harness state now matches the profile.
 
 Verification failures trigger rollback. Keep errors clear and path-specific.
 
-## MCP Rules
+## Artifact Support And MCP Rules
 
-Use `crate::profile::mcp::read_mcp_definitions` to parse profile MCP definitions.
+Skill, command, and MCP support are optional per harness. If the harness has no native support for one of these artifact types, the integration should not apply, verify, drift-check, import, or clear it. Returning `mcp_definitions: None` from `import_from_harness` preserves existing profile MCPs during `--save-changes` and `create --from`.
+
+For harnesses with native MCP support, use `crate::profile::mcp::read_mcp_definitions` to parse profile MCP definitions.
 
 Current neutral transports:
 
 - `stdio`
 - `http`
 
-Disabled MCP entries are validated and emitted to native config as disabled entries. If the harness cannot represent an MCP definition, fail apply so rollback can restore the previous harness state.
+Disabled MCP entries are validated and emitted to native config as disabled entries. If a harness supports native MCP but cannot represent a specific MCP definition, apply must fail so rollback can restore the previous harness state.
 
 ## Native Config Rules
 
@@ -289,8 +300,8 @@ Before considering the integration done, confirm:
 - explicit `use --harness <new>` fails when the binary is not detected
 - `use --all` applies only when the harness is detected
 - `create --from <new>` imports without mutating harness state
-- applying an empty profile clears stale skills, commands, and MCPs
-- applying invalid MCP config fails without updating state
+- applying an empty profile clears stale skills, commands, and supported MCPs
+- applying invalid MCP config fails without updating state for harnesses that support MCP, and is ignored by harnesses that do not
 - apply failure rolls back managed files and native config
 - state is updated only after successful apply and verify
 - `--save-changes` imports drift into the previous active profile

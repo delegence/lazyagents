@@ -1,8 +1,8 @@
 # lazyagents
 
-Manage reusable coding-agent profiles across Claude Code, Codex, and OpenCode.
+Manage reusable Agent profiles across various coding agents.
 
-`lazyagents` lets you save a configured agent setup once, then apply it to one or more local coding harnesses. A profile can contain shared instructions, skills, saved prompts, MCP servers, model preferences, and permission preferences.
+`lazyagents` lets you save a configured agent setup once, then apply it to one or more local coding harnesses. A profile can contain shared instructions, skills, saved prompts, MCP servers, model preferences, and permission preferences. Harnesses apply the parts they natively support.
 
 The tool is local-first. It manages files on your machine, does not install harnesses, and does not fetch remote skills or plugins.
 
@@ -32,11 +32,11 @@ cargo run -- doctor
 lazyagents help
 lazyagents doctor
 lazyagents create <name>
-lazyagents create <name> --from <claude|codex|opencode>
+lazyagents create <name> --from <claude|codex|opencode|pi>
 lazyagents show <name>
 lazyagents edit <name>
 lazyagents delete <name> [--yes]
-lazyagents use <name> --harness <claude|codex|opencode>
+lazyagents use <name> --harness <claude|codex|opencode|pi>
 lazyagents use <name> --all
 ```
 
@@ -78,7 +78,7 @@ When you apply a profile, `lazyagents`:
 2. Checks whether the currently active profile has unsaved drift.
 3. Creates a backup of the harness-managed files.
 4. Symlinks profile instructions, skills, and commands into the harness config.
-5. Patches native model, permission, and MCP settings.
+5. Patches native model, permission, and MCP settings when supported by the harness.
 6. Verifies the result.
 7. Updates `~/.lazyagents/state.json` only after success.
 
@@ -105,7 +105,7 @@ Drift checks include:
 - instruction links
 - skills
 - commands
-- MCP definitions
+- MCP definitions, for harnesses with native MCP support
 - managed directory damage
 
 Model and permission differences do not block switching.
@@ -150,7 +150,7 @@ Supported transports:
 - `stdio`
 - `http`
 
-Disabled MCP entries are validated and emitted to harness configs as disabled entries.
+Disabled MCP entries are validated and emitted to harness configs as disabled entries for harnesses with native MCP support. Harnesses without native MCP support ignore `mcps.json` and preserve it during imports/save-changes.
 
 ## Configuration
 
@@ -176,6 +176,7 @@ Missing model or permission entries behave like `"default"`, which means `lazyag
 - Claude Code
 - Codex
 - OpenCode
+- Pi
 
 ## Development
 
@@ -196,7 +197,7 @@ Main source layout:
 ```text
 src/profile/       profile schema, validation, inspection, storage
 src/harness/       shared harness mechanics, backup, rollback, drift
-src/integrations/  Claude Code, Codex, and OpenCode integrations
+src/integrations/  Coding Agents' integrations
 src/app/           UI-independent workflows
 src/cli/           terminal parsing, prompts, and rendering
 docs/              documentation

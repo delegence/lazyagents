@@ -14,7 +14,7 @@ pub struct ProfileConfig {
 impl ProfileConfig {
     pub fn default_for(name: &ProfileName) -> Self {
         Self {
-            name: Some(name.as_str().to_string()),
+            name: Some(default_display_name(name)),
             description: Some(String::new()),
             models: BTreeMap::new(),
             permissions: BTreeMap::new(),
@@ -36,6 +36,14 @@ impl ProfileConfig {
     }
 }
 
+fn default_display_name(name: &ProfileName) -> String {
+    let mut chars = name.as_str().chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 pub fn default_preference_value() -> Value {
     json!("default")
 }
@@ -50,6 +58,13 @@ pub enum ProfileConfigStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_profile_display_name_capitalizes_folder_name() {
+        let config = ProfileConfig::default_for(&ProfileName::parse("work-profile").unwrap());
+
+        assert_eq!(config.name.as_deref(), Some("Work-profile"));
+    }
 
     #[test]
     fn profile_config_missing_preferences_resolve_to_default() {

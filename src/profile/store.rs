@@ -543,7 +543,7 @@ mod tests {
         assert!(profile_dir.join("commands").is_dir());
 
         let config = store.load_config(&profile_name).unwrap();
-        assert_eq!(config.name.as_deref(), Some("work"));
+        assert_eq!(config.name.as_deref(), Some("Work"));
         assert_eq!(config.description.as_deref(), Some(""));
         for harness in [
             crate::harness::kind::HarnessKind::Codex,

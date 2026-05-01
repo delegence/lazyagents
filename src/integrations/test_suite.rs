@@ -84,6 +84,15 @@ pub mod template {
         fn assert_mcp_cleared(&self, paths: &HarnessConfigPaths);
         fn write_malformed_native_config(&self, paths: &HarnessConfigPaths);
 
+        fn supports_skills(&self) -> bool {
+            self.integration().supports_skills()
+        }
+        fn supports_commands(&self) -> bool {
+            self.integration().supports_commands()
+        }
+        fn supports_mcp(&self) -> bool {
+            self.integration().supports_mcp()
+        }
         fn supports_nested_commands(&self) -> bool;
 
         fn write_existing_native_settings(&self, paths: &HarnessConfigPaths);
@@ -160,7 +169,9 @@ pub mod template {
         assert_symlink_to(paths.instruction_target.clone(), profile.join("AGENTS.md"));
     }
 
-    pub fn test_use_removes_stale_surfaces_and_clears_mcp_list<A: HarnessTestAdapter>(adapter: &A) {
+    pub fn test_use_removes_stale_surfaces_and_optionally_clears_mcp_list<A: HarnessTestAdapter>(
+        adapter: &A,
+    ) {
         let fixture = HarnessTestFixture::new(adapter.bin_name());
         let full = fixture.profile("full");
         add_skill(&full, "writer");
@@ -177,9 +188,15 @@ pub mod template {
         use_profile_for_test(adapter, &fixture, "empty", DriftDecision::DiscardChanges).unwrap();
 
         let paths = integration.paths(&fixture.env).unwrap();
-        assert!(fs::read_dir(&paths.skills_dir).unwrap().next().is_none());
-        assert!(fs::read_dir(&paths.commands_dir).unwrap().next().is_none());
-        adapter.assert_mcp_cleared(&paths);
+        if adapter.supports_skills() {
+            assert!(fs::read_dir(&paths.skills_dir).unwrap().next().is_none());
+        }
+        if adapter.supports_commands() {
+            assert!(fs::read_dir(&paths.commands_dir).unwrap().next().is_none());
+        }
+        if adapter.supports_mcp() {
+            adapter.assert_mcp_cleared(&paths);
+        }
     }
 
     pub fn test_use_default_preferences_do_not_modify_existing_native_settings<
@@ -204,7 +221,9 @@ pub mod template {
         adapter.assert_native_settings_preserved(&paths);
     }
 
-    pub fn test_use_rejects_invalid_disabled_mcp_without_state_update<A: HarnessTestAdapter>(
+    pub fn test_use_handles_invalid_disabled_mcp_according_to_harness_support<
+        A: HarnessTestAdapter,
+    >(
         adapter: &A,
     ) {
         let fixture = HarnessTestFixture::new(adapter.bin_name());
@@ -218,16 +237,29 @@ pub mod template {
         let integration = adapter.integration();
         let result = use_profile_for_test(adapter, &fixture, "work", DriftDecision::DiscardChanges);
 
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("MCP")
-                && (err.contains("requires") || err.contains("missing") || err.contains("invalid"))
-        );
-
         let state =
             crate::app::state::LazyagentsState::load(&fixture.home.join("state.json")).unwrap();
-        assert!(state.active_profiles.get(&integration.kind()).is_none());
+        if adapter.supports_mcp() {
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("MCP")
+                    && (err.contains("requires")
+                        || err.contains("missing")
+                        || err.contains("invalid"))
+            );
+            assert!(state.active_profiles.get(&integration.kind()).is_none());
+        } else {
+            result.unwrap();
+            assert_eq!(
+                state
+                    .active_profiles
+                    .get(&integration.kind())
+                    .unwrap()
+                    .as_str(),
+                "work"
+            );
+        }
     }
 
     pub fn test_use_rolls_back_and_dereferences_symlink_backup_on_failure<A: HarnessTestAdapter>(
@@ -240,6 +272,9 @@ pub mod template {
             r#"[{"name":"bad","transport":"stdio"}]"#,
         )
         .unwrap();
+        if !adapter.supports_mcp() {
+            return;
+        }
 
         let integration = adapter.integration();
         let paths = integration.paths(&fixture.env).unwrap();
@@ -248,8 +283,10 @@ pub mod template {
         let old_source = fixture.temp.path().join("old-source.md");
         fs::write(&old_source, "previous instructions").unwrap();
         symlink_file(&old_source, &paths.instruction_target).unwrap();
-        fs::create_dir_all(&paths.skills_dir).unwrap();
-        fs::write(paths.skills_dir.join("old.txt"), "old").unwrap();
+        if adapter.supports_skills() {
+            fs::create_dir_all(&paths.skills_dir).unwrap();
+            fs::write(paths.skills_dir.join("old.txt"), "old").unwrap();
+        }
         adapter.write_existing_native_settings(&paths);
 
         let error = use_profile_for_test(adapter, &fixture, "work", DriftDecision::DiscardChanges)
@@ -264,10 +301,12 @@ pub mod template {
             .unwrap()
             .file_type()
             .is_symlink());
-        assert_eq!(
-            fs::read_to_string(paths.skills_dir.join("old.txt")).unwrap(),
-            "old"
-        );
+        if adapter.supports_skills() {
+            assert_eq!(
+                fs::read_to_string(paths.skills_dir.join("old.txt")).unwrap(),
+                "old"
+            );
+        }
         adapter.assert_native_settings_preserved(&paths);
         assert!(!fixture.home.join("state.json").exists());
     }
@@ -280,8 +319,12 @@ pub mod template {
         let paths = integration.paths(&fixture.env).unwrap();
 
         fs::create_dir_all(&paths.config_dir).unwrap();
-        fs::create_dir_all(&paths.skills_dir).unwrap();
-        fs::create_dir_all(&paths.commands_dir).unwrap();
+        if adapter.supports_skills() {
+            fs::create_dir_all(&paths.skills_dir).unwrap();
+        }
+        if adapter.supports_commands() {
+            fs::create_dir_all(&paths.commands_dir).unwrap();
+        }
         if let Some(parent) = paths.instruction_target.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -293,9 +336,13 @@ pub mod template {
         let skill_source = fixture.temp.path().join("skill-source");
         fs::create_dir_all(&skill_source).unwrap();
         fs::write(skill_source.join("SKILL.md"), "skill body").unwrap();
-        symlink_dir(&skill_source, paths.skills_dir.join("linked")).unwrap();
+        if adapter.supports_skills() {
+            symlink_dir(&skill_source, paths.skills_dir.join("linked")).unwrap();
+        }
 
-        fs::write(paths.commands_dir.join("cmd.md"), "command").unwrap();
+        if adapter.supports_commands() {
+            fs::write(paths.commands_dir.join("cmd.md"), "command").unwrap();
+        }
 
         adapter.setup_native_config_for_import(&paths);
 
@@ -305,10 +352,23 @@ pub mod template {
             imported.instruction.as_deref(),
             Some("imported instructions")
         );
-        assert_eq!(imported.skills[0].name, "linked");
-        assert_eq!(imported.skills[0].files[0].contents, b"skill body");
-        assert_eq!(imported.commands[0].contents, b"command");
+        if adapter.supports_skills() {
+            assert_eq!(imported.skills[0].name, "linked");
+            assert_eq!(imported.skills[0].files[0].contents, b"skill body");
+        } else {
+            assert!(imported.skills.is_empty());
+        }
+        if adapter.supports_commands() {
+            assert_eq!(imported.commands[0].contents, b"command");
+        } else {
+            assert!(imported.commands.is_empty());
+        }
 
+        if adapter.supports_mcp() {
+            assert!(imported.mcp_definitions.is_some());
+        } else {
+            assert!(imported.mcp_definitions.is_none());
+        }
         adapter.assert_imported_native_config(&imported);
     }
 
@@ -355,14 +415,18 @@ pub mod template {
 
         let paths = integration.paths(&fixture.env).unwrap();
         fs::create_dir_all(&paths.config_dir).unwrap();
-        fs::create_dir_all(paths.skills_dir.join("newskill")).unwrap();
-        fs::write(
-            paths.skills_dir.join("newskill").join("SKILL.md"),
-            "new skill",
-        )
-        .unwrap();
-        fs::create_dir_all(&paths.commands_dir).unwrap();
-        fs::write(paths.commands_dir.join("new.md"), "new command").unwrap();
+        if adapter.supports_skills() {
+            fs::create_dir_all(paths.skills_dir.join("newskill")).unwrap();
+            fs::write(
+                paths.skills_dir.join("newskill").join("SKILL.md"),
+                "new skill",
+            )
+            .unwrap();
+        }
+        if adapter.supports_commands() {
+            fs::create_dir_all(&paths.commands_dir).unwrap();
+            fs::write(paths.commands_dir.join("new.md"), "new command").unwrap();
+        }
         if let Some(parent) = paths.instruction_target.parent() {
             fs::create_dir_all(parent).unwrap();
         }
@@ -376,14 +440,19 @@ pub mod template {
             fs::read_to_string(active.join("AGENTS.md")).unwrap(),
             "drifted"
         );
-        assert_eq!(
-            fs::read_to_string(active.join("skills").join("newskill").join("SKILL.md")).unwrap(),
-            "new skill"
-        );
-        assert_eq!(
-            fs::read_to_string(active.join("commands").join("new.md")).unwrap(),
-            "new command"
-        );
+        if adapter.supports_skills() {
+            assert_eq!(
+                fs::read_to_string(active.join("skills").join("newskill").join("SKILL.md"))
+                    .unwrap(),
+                "new skill"
+            );
+        }
+        if adapter.supports_commands() {
+            assert_eq!(
+                fs::read_to_string(active.join("commands").join("new.md")).unwrap(),
+                "new command"
+            );
+        }
 
         let active_config = fixture
             .store
@@ -413,12 +482,16 @@ pub mod template {
 
         let paths = integration.paths(&fixture.env).unwrap();
         fs::create_dir_all(&paths.config_dir).unwrap();
-        fs::create_dir_all(paths.skills_dir.join("newskill")).unwrap();
-        fs::write(paths.skills_dir.join("newskill").join("SKILL.md"), "drift").unwrap();
+        if adapter.supports_skills() {
+            fs::create_dir_all(paths.skills_dir.join("newskill")).unwrap();
+            fs::write(paths.skills_dir.join("newskill").join("SKILL.md"), "drift").unwrap();
+        }
 
         use_profile_for_test(adapter, &fixture, "target", DriftDecision::DiscardChanges).unwrap();
 
-        assert!(!active.join("skills").join("newskill").exists());
+        if adapter.supports_skills() {
+            assert!(!active.join("skills").join("newskill").exists());
+        }
         assert_symlink_to(paths.instruction_target, target.join("AGENTS.md"));
     }
 
@@ -449,14 +522,18 @@ pub mod template {
         use_profile_for_test(adapter, &fixture, "work", DriftDecision::DiscardChanges).unwrap();
 
         assert_symlink_to(paths.instruction_target.clone(), profile.join("AGENTS.md"));
-        assert_symlink_to(
-            paths.skills_dir.join("writer"),
-            profile.join("skills").join("writer"),
-        );
-        assert_symlink_to(
-            paths.commands_dir.join("plan.md"),
-            profile.join("commands").join("plan.md"),
-        );
+        if adapter.supports_skills() {
+            assert_symlink_to(
+                paths.skills_dir.join("writer"),
+                profile.join("skills").join("writer"),
+            );
+        }
+        if adapter.supports_commands() {
+            assert_symlink_to(
+                paths.commands_dir.join("plan.md"),
+                profile.join("commands").join("plan.md"),
+            );
+        }
 
         adapter.assert_applied_native_config(&paths);
         let drift = integration
@@ -485,6 +562,11 @@ pub mod template {
 
         let integration = adapter.integration();
         let result = use_profile_for_test(adapter, &fixture, "work", DriftDecision::DiscardChanges);
+
+        if !adapter.supports_commands() {
+            result.unwrap();
+            return;
+        }
 
         if adapter.supports_nested_commands() {
             result.unwrap();
@@ -516,7 +598,7 @@ macro_rules! define_standard_harness_tests {
 
         #[test]
         fn test_use_removes_stale_surfaces_and_clears_mcp_list() {
-            $crate::integrations::test_suite::template::test_use_removes_stale_surfaces_and_clears_mcp_list(&<$adapter>::default());
+            $crate::integrations::test_suite::template::test_use_removes_stale_surfaces_and_optionally_clears_mcp_list(&<$adapter>::default());
         }
 
         #[test]
@@ -525,8 +607,8 @@ macro_rules! define_standard_harness_tests {
         }
 
         #[test]
-        fn test_use_rejects_invalid_disabled_mcp_without_state_update() {
-            $crate::integrations::test_suite::template::test_use_rejects_invalid_disabled_mcp_without_state_update(&<$adapter>::default());
+        fn test_use_handles_invalid_disabled_mcp_according_to_harness_support() {
+            $crate::integrations::test_suite::template::test_use_handles_invalid_disabled_mcp_according_to_harness_support(&<$adapter>::default());
         }
 
         #[test]

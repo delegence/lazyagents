@@ -37,6 +37,7 @@ pub enum UseProfileOutcome {
     All(UseProfileAllResult),
     NeedsSingleHarnessDriftDecision {
         harness: HarnessKind,
+        profile: ProfileName,
         drift: DriftReport,
     },
     NeedsAllHarnessDriftDecision {
@@ -46,6 +47,7 @@ pub enum UseProfileOutcome {
 
 pub struct HarnessDrift {
     pub harness: HarnessKind,
+    pub profile: ProfileName,
     pub drift: DriftReport,
 }
 
@@ -73,13 +75,16 @@ pub fn use_profile_workflow(
             let decision = match request.drift_decision {
                 Some(decision) => decision,
                 None => {
-                    let drift = active_drift(integration.as_ref(), env, store)?;
-                    if drift.is_clean() {
+                    let active = active_drift(integration.as_ref(), env, store)?;
+                    if active.drift.is_clean() {
                         DriftDecision::DiscardChanges
                     } else {
                         return Ok(UseProfileOutcome::NeedsSingleHarnessDriftDecision {
                             harness: kind,
-                            drift,
+                            profile: active.profile.ok_or_else(|| {
+                                anyhow::anyhow!("drift reported without an active profile")
+                            })?,
+                            drift: active.drift,
                         });
                     }
                 }
@@ -106,11 +111,14 @@ pub fn use_profile_workflow(
             if request.drift_decision.is_none() {
                 let mut drifted = Vec::new();
                 for integration in &detected {
-                    let drift = active_drift(integration.as_ref(), env, store)?;
-                    if !drift.is_clean() {
+                    let active = active_drift(integration.as_ref(), env, store)?;
+                    if !active.drift.is_clean() {
                         drifted.push(HarnessDrift {
                             harness: integration.kind(),
-                            drift,
+                            profile: active.profile.ok_or_else(|| {
+                                anyhow::anyhow!("drift reported without an active profile")
+                            })?,
+                            drift: active.drift,
                         });
                     }
                 }
@@ -157,7 +165,7 @@ fn apply_one(
     let active_profile = state
         .active_profiles
         .get(&integration.kind())
-        .map(|name| active_profile_for_drift(store, name))
+        .map(|name| active_profile_for_drift(integration, store, name))
         .transpose()?;
     let drift = match active_profile.as_ref() {
         Some(active) => integration.detect_drift(active, &paths)?,
@@ -198,21 +206,32 @@ fn apply_one(
     })
 }
 
+struct ActiveDrift {
+    profile: Option<ProfileName>,
+    drift: DriftReport,
+}
+
 fn active_drift(
     integration: &dyn HarnessIntegration,
     env: &AppEnvironment,
     store: &ProfileStore,
-) -> Result<DriftReport> {
+) -> Result<ActiveDrift> {
     let paths = integration.paths(env)?;
     let state = LazyagentsState::load(&env.lazyagents_home.join("state.json"))?;
     let active_profile = state
         .active_profiles
         .get(&integration.kind())
-        .map(|name| active_profile_for_drift(store, name))
+        .map(|name| active_profile_for_drift(integration, store, name))
         .transpose()?;
     match active_profile.as_ref() {
-        Some(active) => integration.detect_drift(active, &paths),
-        None => Ok(DriftReport::clean()),
+        Some(active) => Ok(ActiveDrift {
+            profile: Some(active.name.clone()),
+            drift: integration.detect_drift(active, &paths)?,
+        }),
+        None => Ok(ActiveDrift {
+            profile: None,
+            drift: DriftReport::clean(),
+        }),
     }
 }
 
@@ -228,7 +247,11 @@ fn ensure_target_profile_can_be_used(store: &ProfileStore, profile: &ProfileName
     Ok(())
 }
 
-fn active_profile_for_drift(store: &ProfileStore, name: &ProfileName) -> Result<ProfileRef> {
+fn active_profile_for_drift(
+    integration: &dyn HarnessIntegration,
+    store: &ProfileStore,
+    name: &ProfileName,
+) -> Result<ProfileRef> {
     let path = store.profile_dir(name);
     if !path.is_dir() {
         anyhow::bail!("active profile {name} is missing at {}", path.display());
@@ -244,7 +267,9 @@ fn active_profile_for_drift(store: &ProfileStore, name: &ProfileName) -> Result<
         );
     }
 
-    read_mcp_definitions(&path)?;
+    if integration.supports_mcp() {
+        read_mcp_definitions(&path)?;
+    }
 
     Ok(ProfileRef {
         name: name.clone(),
@@ -287,6 +312,7 @@ mod tests {
         drift: DriftReport,
         fail_apply: bool,
         replace_state_with_dir: bool,
+        supports_mcp: bool,
         import_called: Cell<bool>,
     }
 
@@ -299,8 +325,14 @@ mod tests {
                 drift: DriftReport::clean(),
                 fail_apply: false,
                 replace_state_with_dir: false,
+                supports_mcp: true,
                 import_called: Cell::new(false),
             }
+        }
+
+        fn without_mcp(mut self) -> Self {
+            self.supports_mcp = false;
+            self
         }
 
         fn with_drift(mut self) -> Self {
@@ -332,6 +364,10 @@ mod tests {
     impl HarnessIntegration for FakeIntegration {
         fn kind(&self) -> HarnessKind {
             self.kind
+        }
+
+        fn supports_mcp(&self) -> bool {
+            self.supports_mcp
         }
 
         fn detect(&self, _env: &AppEnvironment) -> Result<HarnessDetection> {
@@ -543,6 +579,39 @@ mod tests {
         assert!(error
             .to_string()
             .contains("active profile active is missing instruction source"));
+    }
+
+    #[test]
+    fn active_profile_invalid_mcp_is_ignored_for_harness_without_mcp_support() {
+        let fixture = Fixture::new();
+        fixture.profile("active");
+        fixture.profile("target");
+        fs::write(fixture.profile_path("active").join("mcps.json"), "not json").unwrap();
+        fixture.write_state(r#"{"active_profiles":{"codex":"active"}}"#);
+        let integration =
+            FakeIntegration::new(HarnessKind::Codex, fixture.harness("codex")).without_mcp();
+        let registry = FakeCatalog {
+            integrations: vec![integration],
+        };
+
+        let outcome = use_profile_workflow(
+            &registry,
+            &fixture.env,
+            &fixture.store,
+            UseProfileRequest {
+                profile: ProfileName::parse("target").unwrap(),
+                target: UseProfileTarget::Harness(HarnessKind::Codex),
+                drift_decision: None,
+            },
+        )
+        .unwrap();
+
+        match outcome {
+            UseProfileOutcome::Applied(result) => {
+                assert_eq!(result.profile, ProfileName::parse("target").unwrap());
+            }
+            _ => panic!("expected apply outcome"),
+        }
     }
 
     #[test]

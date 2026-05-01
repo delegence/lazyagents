@@ -102,6 +102,15 @@ impl Default for ImportedPreference {
 
 pub trait HarnessIntegration {
     fn kind(&self) -> HarnessKind;
+    fn supports_skills(&self) -> bool {
+        true
+    }
+    fn supports_commands(&self) -> bool {
+        true
+    }
+    fn supports_mcp(&self) -> bool {
+        true
+    }
     fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection>;
     fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths>;
     fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface>;

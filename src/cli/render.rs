@@ -18,19 +18,20 @@ pub fn render_string_list(values: &[String]) -> String {
     }
 }
 
-pub fn render_mcp_summary(summary: &McpSummary) -> String {
-    match summary {
-        McpSummary::Empty => "none".to_string(),
-        McpSummary::Servers(names) => render_string_list(names),
-        McpSummary::Invalid(error) => format!("invalid: {error}"),
-    }
-}
-
 pub fn mcp_summary_count(summary: &McpSummary) -> usize {
     match summary {
         McpSummary::Empty | McpSummary::Invalid(_) => 0,
         McpSummary::Servers(names) => names.len(),
     }
+}
+
+pub fn render_path_in_text(text: &str) -> String {
+    let mut rendered = text.to_string();
+    for home in display_home_candidates() {
+        let home = home.display().to_string();
+        rendered = rendered.replace(&home, "~");
+    }
+    rendered
 }
 
 pub fn render_path(path: &Path) -> String {

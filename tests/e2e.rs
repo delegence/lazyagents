@@ -22,8 +22,8 @@ impl TestContext {
         let bin_dir = temp.path().join("bin");
         fs::create_dir_all(&bin_dir).unwrap();
 
-        // Create dummies for claude, codex, opencode
-        for bin in &["claude", "codex", "opencode"] {
+        // Create dummies for supported harnesses
+        for bin in &["claude", "codex", "opencode", "pi"] {
             let bin_path = bin_dir.join(bin);
             fs::write(&bin_path, "#!/bin/sh\necho hi").unwrap();
             #[cfg(unix)]
@@ -284,7 +284,7 @@ fn e2e_doctor_replaces_list_and_status() {
     let out = ctx.run_cli(&["doctor"]);
     assert!(out.status.success(), "doctor failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("[✓] Harnesses (3 available: codex, claude, opencode)"));
+    assert!(stdout.contains("[✓] Harnesses (4 available: codex, claude, opencode, pi)"));
     assert!(stdout.contains("[✓] Profiles"));
     assert!(stdout.contains("- work (used by codex)"));
     assert!(stdout.contains("- playground (unused)"));

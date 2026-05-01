@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -70,20 +71,14 @@ impl ManagedBackup {
         let mut manifest = BackupManifest {
             surfaces: Vec::new(),
         };
+        let mut used_backup_entries = BTreeSet::from(["metadata.json".to_string()]);
 
-        for (index, surface) in surfaces.iter().enumerate() {
-            let file_name = surface
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .with_context(|| {
-                    format!("surface path has no file name: {}", surface.path.display())
-                })?;
-            let backup_entry = format!("{index}-{file_name}");
-            let backup_path = temp_dir.join(&backup_entry);
-
+        for surface in surfaces {
             match fs::metadata(&surface.path) {
                 Ok(metadata) if metadata.is_file() => {
+                    let backup_entry =
+                        unique_backup_entry(&surface.path, &mut used_backup_entries)?;
+                    let backup_path = temp_dir.join(&backup_entry);
                     fs::copy(&surface.path, &backup_path).with_context(|| {
                         format!("failed to copy file {}", surface.path.display())
                     })?;
@@ -95,6 +90,9 @@ impl ManagedBackup {
                     });
                 }
                 Ok(metadata) if metadata.is_dir() => {
+                    let backup_entry =
+                        unique_backup_entry(&surface.path, &mut used_backup_entries)?;
+                    let backup_path = temp_dir.join(&backup_entry);
                     copy_dir_all(&surface.path, &backup_path).with_context(|| {
                         format!("failed to copy directory {}", surface.path.display())
                     })?;
@@ -207,6 +205,36 @@ enum BackupSurfaceState {
     File,
     Directory,
     Other,
+}
+
+fn unique_backup_entry(path: &Path, used: &mut BTreeSet<String>) -> Result<String> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("surface path has no file name: {}", path.display()))?;
+
+    if used.insert(file_name.to_string()) {
+        return Ok(file_name.to_string());
+    }
+
+    let file_name_path = Path::new(file_name);
+    let stem = file_name_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(file_name);
+    let extension = file_name_path.extension().and_then(|ext| ext.to_str());
+
+    for suffix in 1usize.. {
+        let candidate = match extension {
+            Some(extension) => format!("{stem}-{suffix}.{extension}"),
+            None => format!("{file_name}-{suffix}"),
+        };
+        if used.insert(candidate.clone()) {
+            return Ok(candidate);
+        }
+    }
+
+    unreachable!("unbounded suffix loop always returns")
 }
 
 fn write_manifest(backup_dir: &Path, manifest: &BackupManifest) -> Result<()> {
@@ -402,9 +430,9 @@ mod tests {
         let backup_dir = lazyagents_home.join("backups").join(harness_kind.id());
         assert!(backup_dir.exists());
         assert!(backup_dir.join("metadata.json").exists());
-        assert!(backup_dir.join("0-test_file.txt").exists());
-        assert!(backup_dir.join("1-test_dir").join("nested.txt").exists());
-        assert!(!backup_dir.join("2-missing.txt").exists());
+        assert!(backup_dir.join("test_file.txt").exists());
+        assert!(backup_dir.join("test_dir").join("nested.txt").exists());
+        assert!(!backup_dir.join("missing.txt").exists());
         let manifest: BackupManifest =
             serde_json::from_str(&fs::read_to_string(backup_dir.join("metadata.json")).unwrap())
                 .unwrap();
@@ -417,7 +445,7 @@ mod tests {
         );
         assert_eq!(
             manifest.surfaces[0].backup_entry.as_deref(),
-            Some("0-test_file.txt")
+            Some("test_file.txt")
         );
         assert_eq!(
             manifest.surfaces[1].original_state,
@@ -425,7 +453,7 @@ mod tests {
         );
         assert_eq!(
             manifest.surfaces[1].backup_entry.as_deref(),
-            Some("1-test_dir")
+            Some("test_dir")
         );
         assert_eq!(
             manifest.surfaces[2].original_state,
@@ -457,6 +485,47 @@ mod tests {
     }
 
     #[test]
+    fn managed_backup_suffixes_duplicate_backup_entry_names() {
+        let temp = tempfile::tempdir().unwrap();
+        let lazyagents_home = temp.path().join("lazyagents");
+        let harness_kind = crate::harness::kind::HarnessKind::Codex;
+
+        let first_dir = temp.path().join("first");
+        let second_dir = temp.path().join("second");
+        fs::create_dir_all(&first_dir).unwrap();
+        fs::create_dir_all(&second_dir).unwrap();
+        let first = first_dir.join("settings.json");
+        let second = second_dir.join("settings.json");
+        fs::write(&first, "first").unwrap();
+        fs::write(&second, "second").unwrap();
+
+        let surfaces = vec![ManagedSurface::file(&first), ManagedSurface::file(&second)];
+
+        ManagedBackup::capture(&lazyagents_home, harness_kind, &surfaces).unwrap();
+
+        let backup_dir = lazyagents_home.join("backups").join(harness_kind.id());
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("settings.json")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            fs::read_to_string(backup_dir.join("settings-1.json")).unwrap(),
+            "second"
+        );
+        let manifest: BackupManifest =
+            serde_json::from_str(&fs::read_to_string(backup_dir.join("metadata.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            manifest.surfaces[0].backup_entry.as_deref(),
+            Some("settings.json")
+        );
+        assert_eq!(
+            manifest.surfaces[1].backup_entry.as_deref(),
+            Some("settings-1.json")
+        );
+    }
+
+    #[test]
     fn managed_surface_directory_ignores_hidden_files() {
         let temp = tempfile::tempdir().unwrap();
         let lazyagents_home = temp.path().join("lazyagents");
@@ -478,9 +547,9 @@ mod tests {
 
         // Check backup dir doesn't contain hidden files
         let backup_dir = lazyagents_home.join("backups").join(harness_kind.id());
-        assert!(backup_dir.join("0-skills").join("visible.txt").exists());
-        assert!(!backup_dir.join("0-skills").join(".hidden.txt").exists());
-        assert!(!backup_dir.join("0-skills").join(".system").exists());
+        assert!(backup_dir.join("skills").join("visible.txt").exists());
+        assert!(!backup_dir.join("skills").join(".hidden.txt").exists());
+        assert!(!backup_dir.join("skills").join(".system").exists());
 
         // Clear surfaces (simulating profile apply)
         super::clear_surfaces(&surfaces).unwrap();

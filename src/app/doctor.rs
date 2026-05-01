@@ -77,10 +77,7 @@ fn status_rows_for(
                 };
 
                 let has_validation_errors = if loaded.path.exists() {
-                    let issues = crate::profile::validation::validate_profile(&loaded.path);
-                    issues
-                        .iter()
-                        .any(|i| i.severity == crate::profile::validation::Severity::Error)
+                    has_relevant_validation_errors(integration.as_ref(), &loaded.path)
                 } else {
                     true
                 };
@@ -119,6 +116,23 @@ fn status_rows_for(
 
     rows.sort_by_key(|row| row.harness);
     Ok(rows)
+}
+
+fn has_relevant_validation_errors(
+    integration: &dyn HarnessIntegration,
+    path: &std::path::Path,
+) -> bool {
+    crate::profile::validation::validate_profile(path)
+        .iter()
+        .any(|issue| {
+            issue.severity == crate::profile::validation::Severity::Error
+                && match issue.category.as_str() {
+                    "Skills" => integration.supports_skills(),
+                    "Commands" => integration.supports_commands(),
+                    "MCP" => integration.supports_mcp(),
+                    _ => true,
+                }
+        })
 }
 
 fn profile_doctor_report(

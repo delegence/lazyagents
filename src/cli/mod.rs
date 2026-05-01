@@ -11,19 +11,19 @@ use crate::app::doctor::{doctor_report, DoctorReport, HarnessStatus};
 use crate::app::edit_profile::edit_profile_path;
 use crate::app::harness_registry::{BuiltInHarnessRegistry, HarnessRegistry};
 use crate::app::inspect_profile::inspect_profile;
-use crate::app::state::LazyagentsHomeLock;
+use crate::app::state::{LazyagentsHomeLock, LazyagentsState};
 use crate::app::use_profile::{
     use_profile_workflow, DriftDecision, HarnessDrift, UseProfileOutcome, UseProfileRequest,
     UseProfileTarget,
 };
 use crate::harness::apply::ProfileUseStatus;
 use crate::harness::drift::DriftReport;
-use crate::harness::integration::AppEnvironment;
+use crate::harness::integration::{AppEnvironment, HarnessIntegration, ProfileRef};
 use crate::profile::{LazyagentsHome, ProfileName, ProfileStore};
 
 use args::{Cli, Command, UseTarget};
 use render::{
-    mcp_summary_count, render_artifact_status, render_json_value, render_mcp_summary, render_path,
+    mcp_summary_count, render_artifact_status, render_json_value, render_path, render_path_in_text,
     render_string_list, render_validation_issues,
 };
 
@@ -69,41 +69,46 @@ pub fn run() -> Result<()> {
             let profile = ProfileName::parse(args.name)?;
             let summary = inspect_profile(&store, &profile)?;
             println!(
-                "Profile: {} ({})",
+                "Profile:  {} ({})",
                 summary
                     .display_name
                     .as_deref()
                     .unwrap_or(summary.name.as_str()),
                 summary.name
             );
-            println!("Path: {}", render_path(&summary.path));
+            println!("Location: {}", render_path(&summary.path));
+            if let Some(description) = summary
+                .description
+                .as_deref()
+                .filter(|description| !description.is_empty())
+            {
+                println!("Description: {description}");
+            }
+            println!();
+            println!("Resources:");
             println!(
-                "Description: {}",
-                summary.description.as_deref().unwrap_or("")
-            );
-            println!(
-                "Skills ({}): {}",
+                " Skills ({}): {}",
                 summary.valid_skills.len(),
-                render_string_list(&summary.valid_skills)
+                render_resource_list(&summary.valid_skills)
             );
             println!(
-                "Commands ({}): {}",
+                " Commands ({}): {}",
                 summary.commands.len(),
-                render_string_list(&summary.commands)
+                render_resource_list(&summary.commands)
             );
             println!(
-                "MCPs ({}): {}",
+                " MCPs ({}): {}",
                 mcp_summary_count(&summary.mcp_summary),
-                render_mcp_summary(&summary.mcp_summary)
+                render_mcp_resource_list(&summary.mcp_summary)
             );
-            println!("Model Preferences:");
-            for (harness, value) in summary.models {
-                println!("  {harness}: {}", render_json_value(&value));
-            }
-            println!("Permission Preferences:");
-            for (harness, value) in summary.permissions {
-                println!("  {harness}: {}", render_json_value(&value));
-            }
+            println!();
+            println!("Preferences:");
+            println!(" Model: {}", render_preferences(&registry, &summary.models));
+            println!(
+                " Permission: {}",
+                render_preferences(&registry, &summary.permissions)
+            );
+            println!();
             println!(
                 "Instructions: {}",
                 render_artifact_status(&summary.instruction_source)
@@ -112,7 +117,7 @@ pub fn run() -> Result<()> {
             let has_ignored =
                 !summary.ignored_skills.is_empty() || !summary.ignored_command_files.is_empty();
             if has_ignored || !summary.validation_issues.is_empty() {
-                println!("\nIssues found:");
+                println!("\nIssues:");
                 if !summary.ignored_skills.is_empty() {
                     println!(
                         "Ignored Skill files: {}",
@@ -137,6 +142,21 @@ pub fn run() -> Result<()> {
                     .collect::<Vec<_>>();
                 if !other_issues.is_empty() {
                     print!("{}", render_validation_issues(&other_issues));
+                }
+            }
+
+            let drift_reports = profile_drift_reports(&registry, &runtime_env, &store, &profile)?;
+            if !drift_reports.is_empty() {
+                println!();
+                for (index, (harness, drift)) in drift_reports.into_iter().enumerate() {
+                    if index > 0 {
+                        println!();
+                    }
+                    if index == 0 {
+                        println!("Drift:");
+                    }
+                    println!(" {}:", harness.display_name());
+                    print_drift_report(&drift, "  ");
                 }
             }
         }
@@ -181,11 +201,14 @@ pub fn run() -> Result<()> {
                         UseProfileOutcome::Applied(result) => result,
                         UseProfileOutcome::NeedsSingleHarnessDriftDecision {
                             harness,
+                            profile,
                             drift,
-                            ..
                         } => {
-                            let decision =
-                                prompt_single_drift_decision(harness.display_name(), &drift)?;
+                            let decision = prompt_single_drift_decision(
+                                harness.display_name(),
+                                &profile,
+                                &drift,
+                            )?;
                             match use_profile_workflow(
                                 &registry,
                                 &runtime_env,
@@ -283,6 +306,95 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+fn render_resource_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "—".to_string()
+    } else {
+        values.join(", ")
+    }
+}
+
+fn render_mcp_resource_list(summary: &crate::profile::McpSummary) -> String {
+    match summary {
+        crate::profile::McpSummary::Empty => "—".to_string(),
+        crate::profile::McpSummary::Servers(names) => render_resource_list(names),
+        crate::profile::McpSummary::Invalid(error) => format!("invalid: {error}"),
+    }
+}
+
+fn render_preferences(
+    registry: &dyn HarnessRegistry,
+    values: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> String {
+    registry
+        .all()
+        .into_iter()
+        .map(|integration| {
+            let id = integration.kind().id();
+            let value = values
+                .get(id)
+                .map(render_json_value)
+                .unwrap_or_else(|| "default".to_string());
+            format!("{id}={value}")
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn profile_drift_reports(
+    registry: &dyn HarnessRegistry,
+    runtime_env: &AppEnvironment,
+    store: &ProfileStore,
+    profile: &ProfileName,
+) -> Result<Vec<(crate::harness::kind::HarnessKind, DriftReport)>> {
+    let state = LazyagentsState::load(&runtime_env.lazyagents_home.join("state.json"))?;
+    let mut reports = Vec::new();
+    for integration in registry.all() {
+        if state.active_profiles.get(&integration.kind()) != Some(profile) {
+            continue;
+        }
+        if !matches!(
+            integration.detect(runtime_env)?,
+            crate::harness::integration::HarnessDetection::Detected { .. }
+        ) {
+            continue;
+        }
+        let active = active_profile_for_show(integration.as_ref(), store, profile)?;
+        let paths = integration.paths(runtime_env)?;
+        let drift = integration.detect_drift(&active, &paths)?;
+        if !drift.is_clean() {
+            reports.push((integration.kind(), drift));
+        }
+    }
+    Ok(reports)
+}
+
+fn active_profile_for_show(
+    integration: &dyn HarnessIntegration,
+    store: &ProfileStore,
+    name: &ProfileName,
+) -> Result<ProfileRef> {
+    let path = store.profile_dir(name);
+    if !path.is_dir() {
+        anyhow::bail!("active profile {name} is missing at {}", path.display());
+    }
+    store.load_config(name)?;
+    let instruction_source = path.join("AGENTS.md");
+    if !instruction_source.is_file() {
+        anyhow::bail!(
+            "active profile {name} is missing instruction source at {}",
+            instruction_source.display()
+        );
+    }
+    if integration.supports_mcp() {
+        crate::profile::mcp::read_mcp_definitions(&path)?;
+    }
+    Ok(ProfileRef {
+        name: name.clone(),
+        path,
+    })
+}
+
 fn print_doctor(runtime_env: &AppEnvironment, store: &ProfileStore) -> Result<()> {
     let registry = BuiltInHarnessRegistry;
     let report = doctor_report(&registry, runtime_env, store)?;
@@ -316,16 +428,20 @@ fn confirm_delete(name: &str) -> Result<bool> {
     Ok(matches!(input.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
-fn prompt_single_drift_decision(harness: &str, drift: &DriftReport) -> Result<DriftDecision> {
+fn prompt_single_drift_decision(
+    harness: &str,
+    profile: &ProfileName,
+    drift: &DriftReport,
+) -> Result<DriftDecision> {
     use std::io::IsTerminal;
 
     if !io::stdin().is_terminal() {
         anyhow::bail!(
-            "drift detected in {harness}; pass --save-changes or --discard-changes to proceed"
+            "{harness} has drift in currently selected profile {profile}; pass --save-changes or --discard-changes to proceed"
         );
     }
 
-    println!("Drift detected in {harness}:");
+    println!("{harness} has drift in currently selected profile {profile}:");
     print_drift_report(drift, "  ");
     loop {
         print!("Save changes [s], discard [d], or cancel [c]? ");
@@ -356,7 +472,11 @@ fn prompt_all_drift_discard(harnesses: &[HarnessDrift]) -> Result<bool> {
     println!("Drift detected before applying profile:");
     for harness in harnesses {
         println!();
-        println!("  {}:", harness.harness.display_name());
+        println!(
+            "  {} has drift in currently selected profile {}:",
+            harness.harness.display_name(),
+            harness.profile
+        );
         print_drift_report(&harness.drift, "    ");
     }
     print!("Proceed and discard changes? [y/N] ");
@@ -370,7 +490,11 @@ fn print_drift_report(drift: &DriftReport, indent: &str) {
     const MAX_DRIFT_ITEMS: usize = 5;
 
     for item in drift.items.iter().take(MAX_DRIFT_ITEMS) {
-        println!("{indent}- {}: {}", item.surface, item.detail);
+        println!(
+            "{indent}- {}: {}",
+            item.surface,
+            render_path_in_text(&item.detail)
+        );
     }
 
     let remaining = drift.items.len().saturating_sub(MAX_DRIFT_ITEMS);

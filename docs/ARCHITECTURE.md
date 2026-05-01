@@ -11,11 +11,11 @@ A profile is a named bundle of:
 - shared instructions
 - skills
 - saved prompt commands
-- MCP server definitions
+- MCP server definitions, for harnesses with native MCP support
 - model preferences
 - permission preferences
 
-A harness is an external coding-agent runtime whose global configuration can be managed by `lazyagents`. Current built-in harnesses are Claude Code, Codex, and OpenCode.
+A harness is an external coding-agent runtime whose global configuration can be managed by `lazyagents`. Current built-in harnesses are Claude Code, Codex, OpenCode, and Pi.
 
 The tool is local-first:
 
@@ -28,7 +28,7 @@ The tool is local-first:
 ## Core Terms
 
 - **Profile**: reusable saved configuration stored under `~/.lazyagents/profiles/<name>`.
-- **Harness**: supported external runtime such as Codex, Claude Code, or OpenCode.
+- **Harness**: supported external runtime such as Codex, Claude Code, OpenCode, or Pi.
 - **Profile Use**: applying a profile to one harness or all detected harnesses.
 - **Active Profile**: profile recorded in `state.json` as last successfully used for a harness.
 - **Managed Surface**: harness config path that `lazyagents` owns during profile use.
@@ -43,7 +43,7 @@ Avoid using "agent" for both sides of the system. Use **Profile** for the saved 
 ```text
 src/profile/       profile names, config, MCP parsing, validation, inspection, storage
 src/harness/       generic harness mechanics, drift, backup, rollback, symlinks
-src/integrations/  concrete Claude Code, Codex, OpenCode implementations
+src/integrations/  concrete Claude Code, Codex, OpenCode, Pi implementations
 src/app/           UI-independent workflows and composition
 src/cli/           terminal parsing, prompts, rendering, editor launch
 ```
@@ -143,7 +143,7 @@ Rules:
 - Unknown MCP keys are ignored.
 - Environment variable references are passed through.
 
-Integrations translate the neutral list into native harness config. If a harness cannot represent a valid neutral MCP definition, apply must fail and roll back.
+Integrations with native MCP support translate the neutral list into native harness config. MCP support is optional per harness; integrations without native MCP support ignore profile MCP definitions, do not drift-check them, and preserve existing profile MCPs on import/save by returning no MCP import data. If a harness supports MCP but cannot represent a valid neutral MCP definition, apply must fail and roll back.
 
 ## Profile Use Workflow
 
@@ -180,7 +180,7 @@ Drift includes:
 - instruction link mismatch
 - skill set mismatch
 - command set mismatch
-- MCP differences
+- MCP differences for harnesses with native MCP support
 - managed directory damage
 - malformed native config needed for drift comparison
 
@@ -191,7 +191,7 @@ Saving drift imports current harness managed state into the active profile:
 - instruction target into `AGENTS.md`
 - valid skills into `skills/`
 - Markdown commands into `commands/`
-- native MCP list into `mcps.json`
+- native MCP list into `mcps.json`, when the harness supports native MCP
 - native model/permission values into `config.json`
 
 Saving drift updates only the relevant harness model and permission entries.
@@ -212,7 +212,7 @@ Backups cover only managed surfaces:
 - skills directory contents
 - commands directory contents
 - native settings file
-- native MCP file, if separate
+- native MCP file, if separate and supported by the harness
 
 Backups copy real file contents and dereference symlinks. Rollback must not depend on profile files still existing.
 
@@ -227,6 +227,7 @@ Each harness integration implements `HarnessIntegration` in one file under `src/
 Responsibilities:
 
 - identify the harness kind
+- declare whether skills, commands, and native MCP are supported
 - detect the binary from `AppEnvironment.path_entries`
 - define native config paths from `AppEnvironment.user_home`
 - declare managed surfaces
@@ -288,6 +289,18 @@ MCP file: ~/.config/opencode/opencode.json
 nested commands: yes
 ```
 
+Pi:
+
+```text
+config dir: ~/.pi/agent
+instruction target: ~/.pi/agent/AGENTS.md
+skills dir: ~/.pi/agent/skills
+commands dir: ~/.pi/agent/prompts
+settings file: ~/.pi/agent/settings.json
+MCP file: unsupported
+nested commands: no
+```
+
 ## Testing Strategy
 
 The shared integration test suite is the behavioral contract for harnesses. Every concrete integration should use it.
@@ -295,14 +308,14 @@ The shared integration test suite is the behavioral contract for harnesses. Ever
 It covers:
 
 - optional profile artifact normalization
-- stale managed surface clearing
+- stale managed surface clearing for supported artifact types
 - default preference behavior
-- invalid MCP failure without state update
+- optional skill/command/MCP behavior, including invalid MCP failure for harnesses with native MCP support
 - rollback with symlink dereferencing
 - import behavior
 - malformed native config failures
 - save/discard drift behavior
-- artifact, preference, MCP, and state application
+- supported artifact, preference, MCP, and state application
 - nested command support
 
 Use focused harness-specific tests for native format quirks, config preservation, MCP mapping edge cases, and unsupported shapes.
