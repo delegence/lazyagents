@@ -188,6 +188,14 @@ pub fn valid_skills(profile_path: &Path) -> Result<Vec<PathBuf>> {
         .with_context(|| format!("failed to read {}", skills_dir.display()))?
     {
         let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .map(|name| name.starts_with('.'))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         if entry.file_type()?.is_dir() && entry.path().join("SKILL.md").is_file() {
             skills.push(entry.path());
         }
@@ -210,6 +218,14 @@ pub fn profile_commands_recursive(profile_path: &Path) -> Result<Vec<PathBuf>> {
 fn collect_commands_recursive(dir: &Path, commands: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
         let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .map(|name| name.starts_with('.'))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         if entry.file_type()?.is_dir() {
             collect_commands_recursive(&entry.path(), commands)?;
         } else if entry
@@ -233,6 +249,14 @@ pub fn flat_profile_commands(profile_path: &Path) -> Result<Vec<PathBuf>> {
         .with_context(|| format!("failed to read {}", commands_dir.display()))?
     {
         let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .map(|name| name.starts_with('.'))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         if entry.file_type()?.is_dir() {
             let has_markdown = contains_markdown_file(&entry.path())?;
             if has_markdown {
@@ -256,6 +280,14 @@ pub fn flat_profile_commands(profile_path: &Path) -> Result<Vec<PathBuf>> {
 fn contains_markdown_file(dir: &Path) -> Result<bool> {
     for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
         let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .map(|name| name.starts_with('.'))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         if entry.file_type()?.is_dir() {
             if contains_markdown_file(&entry.path())? {
                 return Ok(true);
@@ -290,6 +322,14 @@ pub fn import_flat_commands(path: &Path) -> Result<Vec<ImportedFile>> {
     }
     for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
         let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .map(|name| name.starts_with('.'))
+            .unwrap_or(false)
+        {
+            continue;
+        }
         if entry.path().metadata()?.is_dir() {
             if contains_markdown_file(&entry.path())? {
                 anyhow::bail!(

@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::profile::mcp::McpSummary;
+use crate::profile::mcp::{parse_mcp_definitions, McpSummary};
 use crate::profile::ProfileName;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +51,9 @@ pub(crate) fn scan_skills(path: &Path) -> Result<(Vec<String>, Vec<String>)> {
     {
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
         if entry.file_type()?.is_dir() && entry.path().join("SKILL.md").is_file() {
             valid.push(name);
         } else {
@@ -86,6 +89,10 @@ fn scan_command_dir(
         std::fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
     {
         let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
         let entry_path = entry.path();
         if entry.file_type()?.is_dir() {
             scan_command_dir(root, &entry_path, commands, ignored)?;
@@ -120,26 +127,17 @@ pub(crate) fn summarize_mcps(path: &Path) -> Result<McpSummary> {
         return Ok(McpSummary::Empty);
     }
 
-    let definitions = match serde_json::from_str::<Vec<Value>>(&text) {
+    let definitions = match parse_mcp_definitions(&text) {
         Ok(definitions) => definitions,
         Err(error) => return Ok(McpSummary::Invalid(error.to_string())),
     };
 
     let mut names = Vec::new();
-    for (index, definition) in definitions.iter().enumerate() {
-        let name = definition
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("<unnamed:{}>", index + 1));
-        let enabled = definition
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-        if enabled {
-            names.push(name);
+    for definition in definitions {
+        if definition.enabled {
+            names.push(definition.name);
         } else {
-            names.push(format!("{name} (disabled)"));
+            names.push(format!("{} (disabled)", definition.name));
         }
     }
     names.sort();

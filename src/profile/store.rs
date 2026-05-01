@@ -3,7 +3,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde_json::Value;
 
 use crate::harness::integration::{ImportedDirectory, ImportedFile, ProfileImport};
 
@@ -128,23 +127,6 @@ impl ProfileStore {
         Ok(())
     }
 
-    pub fn update_harness_preferences(
-        &self,
-        name: &ProfileName,
-        harness_kind: crate::harness::kind::HarnessKind,
-        model_preference: Value,
-        permission_preference: Value,
-    ) -> Result<()> {
-        let mut config = self.load_config(name)?;
-        config
-            .models
-            .insert(harness_kind.id().to_string(), model_preference);
-        config
-            .permissions
-            .insert(harness_kind.id().to_string(), permission_preference);
-        self.write_config(name, &config)
-    }
-
     pub fn apply_import(
         &self,
         name: &ProfileName,
@@ -153,41 +135,56 @@ impl ProfileStore {
     ) -> Result<()> {
         self.normalize_optional_artifacts(name)?;
         let profile_dir = self.profile_dir(name);
+        let profiles_dir = profile_dir.parent().ok_or_else(|| {
+            anyhow::anyhow!("profile path has no parent: {}", profile_dir.display())
+        })?;
 
-        if let Some(instruction) = imported.instruction {
-            std::fs::write(profile_dir.join("AGENTS.md"), instruction).with_context(|| {
+        let staged_dir = tempfile::Builder::new()
+            .prefix(&format!(".{}-import-", name.as_str()))
+            .tempdir_in(profiles_dir)
+            .with_context(|| {
                 format!(
-                    "failed to write {}",
-                    profile_dir.join("AGENTS.md").display()
+                    "failed to create temporary profile import directory under {}",
+                    profiles_dir.display()
                 )
             })?;
+        copy_dir_contents(&profile_dir, staged_dir.path())?;
+        apply_import_to_dir(staged_dir.path(), harness_kind, imported)?;
+
+        let backup_dir = profiles_dir.join(format!(
+            ".{}-rollback-{}",
+            name.as_str(),
+            std::process::id()
+        ));
+        if backup_dir.exists() {
+            std::fs::remove_dir_all(&backup_dir)
+                .with_context(|| format!("failed to remove {}", backup_dir.display()))?;
         }
 
-        replace_imported_directories(&profile_dir.join("skills"), imported.skills)?;
-        replace_imported_files(&profile_dir.join("commands"), imported.commands)?;
+        std::fs::rename(&profile_dir, &backup_dir).with_context(|| {
+            format!(
+                "failed to move {} to {}",
+                profile_dir.display(),
+                backup_dir.display()
+            )
+        })?;
 
-        if let Some(mcps) = imported.mcp_definitions {
-            std::fs::write(profile_dir.join("mcps.json"), mcps).with_context(|| {
-                format!(
-                    "failed to write {}",
-                    profile_dir.join("mcps.json").display()
-                )
-            })?;
+        match std::fs::rename(staged_dir.path(), &profile_dir) {
+            Ok(()) => {
+                std::fs::remove_dir_all(&backup_dir)
+                    .with_context(|| format!("failed to remove {}", backup_dir.display()))?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = std::fs::rename(&backup_dir, &profile_dir);
+                Err(error).with_context(|| {
+                    format!(
+                        "failed to move staged profile import into place at {}",
+                        profile_dir.display()
+                    )
+                })
+            }
         }
-
-        self.update_harness_preferences(
-            name,
-            harness_kind,
-            imported.model_preference.into_value(),
-            imported.permission_preference.into_value(),
-        )
-    }
-
-    fn write_config(&self, name: &ProfileName, config: &ProfileConfig) -> Result<()> {
-        let path = self.profile_dir(name).join("config.json");
-        let text = serde_json::to_string_pretty(config)?;
-        std::fs::write(&path, format!("{text}\n"))
-            .with_context(|| format!("failed to write profile config at {}", path.display()))
     }
 
     pub fn list_profiles(&self) -> Result<Vec<ProfileListItem>> {
@@ -275,6 +272,59 @@ impl ProfileStore {
     }
 }
 
+fn apply_import_to_dir(
+    profile_dir: &Path,
+    harness_kind: crate::harness::kind::HarnessKind,
+    imported: ProfileImport,
+) -> Result<()> {
+    if let Some(instruction) = imported.instruction {
+        std::fs::write(profile_dir.join("AGENTS.md"), instruction).with_context(|| {
+            format!(
+                "failed to write {}",
+                profile_dir.join("AGENTS.md").display()
+            )
+        })?;
+    }
+
+    replace_imported_directories(&profile_dir.join("skills"), imported.skills)?;
+    replace_imported_files(&profile_dir.join("commands"), imported.commands)?;
+
+    if let Some(mcps) = imported.mcp_definitions {
+        std::fs::write(profile_dir.join("mcps.json"), mcps).with_context(|| {
+            format!(
+                "failed to write {}",
+                profile_dir.join("mcps.json").display()
+            )
+        })?;
+    }
+
+    let mut config = load_config_from_dir(profile_dir)?;
+    config.models.insert(
+        harness_kind.id().to_string(),
+        imported.model_preference.into_value(),
+    );
+    config.permissions.insert(
+        harness_kind.id().to_string(),
+        imported.permission_preference.into_value(),
+    );
+    write_config_to_dir(profile_dir, &config)
+}
+
+fn load_config_from_dir(profile_dir: &Path) -> Result<ProfileConfig> {
+    let path = profile_dir.join("config.json");
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("missing or unreadable profile config at {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("invalid profile config at {}", path.display()))
+}
+
+fn write_config_to_dir(profile_dir: &Path, config: &ProfileConfig) -> Result<()> {
+    let path = profile_dir.join("config.json");
+    let text = serde_json::to_string_pretty(config)?;
+    std::fs::write(&path, format!("{text}\n"))
+        .with_context(|| format!("failed to write profile config at {}", path.display()))
+}
+
 fn replace_imported_directories(root: &Path, directories: Vec<ImportedDirectory>) -> Result<()> {
     if root.exists() {
         std::fs::remove_dir_all(root)
@@ -288,6 +338,27 @@ fn replace_imported_directories(root: &Path, directories: Vec<ImportedDirectory>
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;
         write_imported_files(&dir, directory.files)?;
+    }
+    Ok(())
+}
+
+fn copy_dir_contents(source: &Path, target: &Path) -> Result<()> {
+    std::fs::create_dir_all(target)
+        .with_context(|| format!("failed to create {}", target.display()))?;
+    for entry in
+        std::fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let metadata = std::fs::metadata(&source_path)
+            .with_context(|| format!("failed to inspect {}", source_path.display()))?;
+        if metadata.is_dir() {
+            copy_dir_contents(&source_path, &target_path)?;
+        } else if metadata.is_file() {
+            std::fs::copy(&source_path, &target_path)
+                .with_context(|| format!("failed to copy {}", source_path.display()))?;
+        }
     }
     Ok(())
 }
@@ -551,6 +622,7 @@ mod tests {
         .unwrap();
         std::fs::create_dir(profile_dir.join("skills").join("ignored")).unwrap();
         std::fs::write(profile_dir.join("skills").join("notes.txt"), "").unwrap();
+        std::fs::write(profile_dir.join("skills").join(".DS_Store"), "").unwrap();
         std::fs::create_dir(profile_dir.join("commands").join("nested")).unwrap();
         std::fs::write(profile_dir.join("commands").join("run.md"), "").unwrap();
         std::fs::write(
@@ -559,9 +631,10 @@ mod tests {
         )
         .unwrap();
         std::fs::write(profile_dir.join("commands").join("draft.txt"), "").unwrap();
+        std::fs::write(profile_dir.join("commands").join(".DS_Store"), "").unwrap();
         std::fs::write(
             profile_dir.join("mcps.json"),
-            r#"[{"name":"enabled","transport":"stdio","command":"x"},{"name":"draft","enabled":false}]"#,
+            r#"[{"name":"enabled","transport":"stdio","command":"x"},{"name":"draft","enabled":false,"transport":"stdio","command":"draft-server"}]"#,
         )
         .unwrap();
 

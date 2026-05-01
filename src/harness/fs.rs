@@ -7,11 +7,25 @@ use std::path::Path;
 pub fn detect_binary(env: &AppEnvironment, binary_name: &str) -> HarnessDetection {
     for path in &env.path_entries {
         let binary_path = path.join(binary_name);
-        if binary_path.is_file() {
+        if is_executable_file(&binary_path) {
             return HarnessDetection::Detected { binary_path };
         }
     }
     HarnessDetection::NotDetected
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 pub fn symlink_points_to(link: &Path, source: &Path) -> bool {
@@ -64,6 +78,7 @@ pub fn read_json(path: &Path) -> Result<Map<String, Value>> {
     }
 }
 
+#[cfg(test)]
 pub fn normalize_json_text(text: &str) -> Value {
     if text.trim().is_empty() {
         serde_json::json!([])
@@ -77,5 +92,37 @@ pub fn read_optional_string(path: &Path) -> Result<Option<String>> {
         Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env_with_path(path: std::path::PathBuf) -> AppEnvironment {
+        AppEnvironment {
+            lazyagents_home: path.join("lazyagents"),
+            user_home: path.join("user"),
+            path_entries: vec![path],
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detect_binary_requires_executable_file_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("tool");
+        fs::write(&bin, "").unwrap();
+
+        let env = env_with_path(temp.path().to_path_buf());
+        assert_eq!(detect_binary(&env, "tool"), HarnessDetection::NotDetected);
+
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            detect_binary(&env, "tool"),
+            HarnessDetection::Detected { binary_path: bin }
+        );
     }
 }

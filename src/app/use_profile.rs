@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use crate::app::create_profile::{merge_shared_agent_skills, remove_imported_shared_skills};
 use crate::app::harness_registry::HarnessRegistry;
 use crate::app::state::LazyagentsState;
 use crate::harness::apply::{
@@ -10,6 +11,7 @@ use crate::harness::integration::{
     AppEnvironment, HarnessDetection, HarnessIntegration, ProfileRef,
 };
 use crate::harness::kind::HarnessKind;
+use crate::profile::mcp::read_mcp_definitions;
 use crate::profile::{ProfileName, ProfileStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,8 +40,13 @@ pub enum UseProfileOutcome {
         drift: DriftReport,
     },
     NeedsAllHarnessDriftDecision {
-        harnesses: Vec<HarnessKind>,
+        harnesses: Vec<HarnessDrift>,
     },
+}
+
+pub struct HarnessDrift {
+    pub harness: HarnessKind,
+    pub drift: DriftReport,
 }
 
 pub struct UseProfileAllResult {
@@ -101,7 +108,10 @@ pub fn use_profile_workflow(
                 for integration in &detected {
                     let drift = active_drift(integration.as_ref(), env, store)?;
                     if !drift.is_clean() {
-                        drifted.push(integration.kind());
+                        drifted.push(HarnessDrift {
+                            harness: integration.kind(),
+                            drift,
+                        });
                     }
                 }
                 if !drifted.is_empty() {
@@ -139,23 +149,16 @@ fn apply_one(
     profile: &ProfileName,
     decision: DriftDecision,
 ) -> Result<ProfileUseResult> {
-    store.normalize_optional_artifacts(profile)?;
+    ensure_target_profile_can_be_used(store, profile)?;
     let paths = integration.paths(env)?;
-    let target_profile = ProfileRef {
-        name: profile.clone(),
-        path: store.profile_dir(profile),
-    };
-    integration.preflight(&target_profile)?;
 
     let state_path = env.lazyagents_home.join("state.json");
     let mut state = LazyagentsState::load(&state_path)?;
     let active_profile = state
         .active_profiles
         .get(&integration.kind())
-        .map(|name| ProfileRef {
-            name: name.clone(),
-            path: store.profile_dir(name),
-        });
+        .map(|name| active_profile_for_drift(store, name))
+        .transpose()?;
     let drift = match active_profile.as_ref() {
         Some(active) => integration.detect_drift(active, &paths)?,
         None => DriftReport::clean(),
@@ -172,9 +175,11 @@ fn apply_one(
             }
             DriftDecision::DiscardChanges => {}
             DriftDecision::SaveChanges => {
-                let imported = integration.import_from_harness(&paths)?;
+                let mut imported = integration.import_from_harness(&paths)?;
+                let shared_skills = merge_shared_agent_skills(&mut imported.skills, env)?;
                 if let Some(active) = active_profile.as_ref() {
                     store.apply_import(&active.name, integration.kind(), imported)?;
+                    remove_imported_shared_skills(&shared_skills)?;
                 }
             }
         }
@@ -203,14 +208,48 @@ fn active_drift(
     let active_profile = state
         .active_profiles
         .get(&integration.kind())
-        .map(|name| ProfileRef {
-            name: name.clone(),
-            path: store.profile_dir(name),
-        });
+        .map(|name| active_profile_for_drift(store, name))
+        .transpose()?;
     match active_profile.as_ref() {
         Some(active) => integration.detect_drift(active, &paths),
         None => Ok(DriftReport::clean()),
     }
+}
+
+fn ensure_target_profile_can_be_used(store: &ProfileStore, profile: &ProfileName) -> Result<()> {
+    let profile_dir = store.profile_dir(profile);
+    if !profile_dir.is_dir() {
+        anyhow::bail!(
+            "profile {profile} does not exist at {}",
+            profile_dir.display()
+        );
+    }
+    store.load_config(profile)?;
+    Ok(())
+}
+
+fn active_profile_for_drift(store: &ProfileStore, name: &ProfileName) -> Result<ProfileRef> {
+    let path = store.profile_dir(name);
+    if !path.is_dir() {
+        anyhow::bail!("active profile {name} is missing at {}", path.display());
+    }
+
+    store.load_config(name)?;
+
+    let instruction_source = path.join("AGENTS.md");
+    if !instruction_source.is_file() {
+        anyhow::bail!(
+            "active profile {name} is missing instruction source at {}",
+            instruction_source.display()
+        );
+    }
+
+    read_mcp_definitions(&path)?;
+
+    Ok(ProfileRef {
+        name: name.clone(),
+        path,
+    })
 }
 
 fn detected_integrations(
@@ -430,6 +469,80 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn cancel_for_drift_does_not_normalize_target_profile() {
+        let fixture = Fixture::new();
+        fixture.profile("active");
+        fixture.profile("target");
+        fs::remove_file(fixture.profile_path("target").join("AGENTS.md")).unwrap();
+        fs::remove_file(fixture.profile_path("target").join("mcps.json")).unwrap();
+        fs::remove_dir_all(fixture.profile_path("target").join("skills")).unwrap();
+        fs::remove_dir_all(fixture.profile_path("target").join("commands")).unwrap();
+        fixture.write_state(r#"{"active_profiles":{"codex":"active"}}"#);
+        let registry = FakeCatalog {
+            integrations: vec![
+                FakeIntegration::new(HarnessKind::Codex, fixture.harness("codex")).with_drift(),
+            ],
+        };
+
+        let outcome = use_profile_workflow(
+            &registry,
+            &fixture.env,
+            &fixture.store,
+            UseProfileRequest {
+                profile: ProfileName::parse("target").unwrap(),
+                target: UseProfileTarget::Harness(HarnessKind::Codex),
+                drift_decision: Some(DriftDecision::Cancel),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome,
+            UseProfileOutcome::Applied(ProfileUseResult {
+                status: ProfileUseStatus::CancelledForDrift,
+                ..
+            })
+        ));
+        assert!(!fixture.profile_path("target").join("AGENTS.md").exists());
+        assert!(!fixture.profile_path("target").join("mcps.json").exists());
+        assert!(!fixture.profile_path("target").join("skills").exists());
+        assert!(!fixture.profile_path("target").join("commands").exists());
+    }
+
+    #[test]
+    fn active_profile_missing_instruction_fails_before_drift_decision() {
+        let fixture = Fixture::new();
+        fixture.profile("active");
+        fixture.profile("target");
+        fs::remove_file(fixture.profile_path("active").join("AGENTS.md")).unwrap();
+        fixture.write_state(r#"{"active_profiles":{"codex":"active"}}"#);
+        let registry = FakeCatalog {
+            integrations: vec![FakeIntegration::new(
+                HarnessKind::Codex,
+                fixture.harness("codex"),
+            )],
+        };
+
+        let error = match use_profile_workflow(
+            &registry,
+            &fixture.env,
+            &fixture.store,
+            UseProfileRequest {
+                profile: ProfileName::parse("target").unwrap(),
+                target: UseProfileTarget::Harness(HarnessKind::Codex),
+                drift_decision: None,
+            },
+        ) {
+            Ok(_) => panic!("expected missing active instruction to fail"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("active profile active is missing instruction source"));
     }
 
     #[test]

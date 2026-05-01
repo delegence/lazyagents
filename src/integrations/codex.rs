@@ -11,16 +11,16 @@ use crate::harness::artifacts::{
     link_flat_commands, link_skills, valid_skills,
 };
 use crate::harness::drift::{DriftItem, DriftReport};
-use crate::harness::fs::{
-    detect_binary, normalize_json_text, read_optional_string, symlink_file, symlink_points_to,
-};
+use crate::harness::fs::{detect_binary, read_optional_string, symlink_file, symlink_points_to};
 use crate::harness::integration::{
     AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedPreference,
     ProfileImport, ProfileRef,
 };
 use crate::harness::kind::HarnessKind;
 use crate::harness::managed::{write_text_atomic, ManagedSurface};
-use crate::profile::mcp::{read_mcp_definitions, McpDefinition, McpTransport};
+use crate::profile::mcp::{
+    canonical_mcp_json, parse_mcp_definitions, read_mcp_definitions, McpDefinition, McpTransport,
+};
 use crate::profile::ProfileConfig;
 
 pub struct CodexIntegration;
@@ -83,9 +83,10 @@ impl HarnessIntegration for CodexIntegration {
             &paths.commands_dir,
             &mut items,
         )?;
-        let native_mcps = import_codex_mcps(&read_config(&paths.settings_file)?)?;
-        let profile_mcps = fs::read_to_string(active.path.join("mcps.json")).unwrap_or_default();
-        if normalize_json_text(&native_mcps) != normalize_json_text(&profile_mcps) {
+        let native_mcps =
+            parse_mcp_definitions(&import_codex_mcps(&read_config(&paths.settings_file)?)?)?;
+        let profile_mcps = read_mcp_definitions(&active.path)?;
+        if canonical_mcp_json(&native_mcps)? != canonical_mcp_json(&profile_mcps)? {
             items.push(DriftItem {
                 surface: "mcp".to_string(),
                 detail: "Codex MCP list differs from active profile".to_string(),
@@ -102,14 +103,16 @@ impl HarnessIntegration for CodexIntegration {
             commands: import_flat_commands(&paths.commands_dir)?,
             mcp_definitions: Some(import_codex_mcps(&document)?),
             model_preference: ImportedPreference::new(
-                document["model"]
-                    .as_str()
+                document
+                    .get("model")
+                    .and_then(Item::as_str)
                     .map(|value| json!(value))
                     .unwrap_or_else(|| json!("default")),
             ),
             permission_preference: ImportedPreference::new(
-                document["approval_policy"]
-                    .as_str()
+                document
+                    .get("approval_policy")
+                    .and_then(Item::as_str)
                     .map(|value| json!(value))
                     .unwrap_or_else(|| json!("default")),
             ),
@@ -188,10 +191,7 @@ fn patch_codex_config(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Resul
     document.as_table_mut().remove("mcp_servers");
     if !mcp_definitions.is_empty() {
         let mut servers = Table::new();
-        for definition in mcp_definitions
-            .into_iter()
-            .filter(|definition| definition.enabled)
-        {
+        for definition in mcp_definitions {
             servers[&definition.name] = Item::Table(definition.to_codex_table()?);
         }
         document["mcp_servers"] = Item::Table(servers);
@@ -316,7 +316,7 @@ fn non_default_string(value: Value, label: &str) -> Result<Option<String>> {
 impl McpDefinition {
     fn to_codex_table(&self) -> Result<Table> {
         let mut table = Table::new();
-        table["enabled"] = value(true);
+        table["enabled"] = value(self.enabled);
         match &self.transport {
             McpTransport::Stdio(stdio) => {
                 table["command"] = value(stdio.command.as_str());
@@ -477,7 +477,8 @@ Authorization = "TOKEN"
             assert!(config.contains("approval_policy = \"on-request\""));
             assert!(config.contains("[mcp_servers.local]"));
             assert!(config.contains("command = \"server\""));
-            assert!(!config.contains("disabled"));
+            assert!(config.contains("[mcp_servers.disabled]"));
+            assert!(config.contains("enabled = false"));
         }
     }
 

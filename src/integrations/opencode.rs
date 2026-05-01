@@ -11,8 +11,7 @@ use crate::harness::artifacts::{
 };
 use crate::harness::drift::{DriftItem, DriftReport};
 use crate::harness::fs::{
-    detect_binary, normalize_json_text, read_json, read_optional_string, symlink_file,
-    symlink_points_to,
+    detect_binary, read_json, read_optional_string, symlink_file, symlink_points_to,
 };
 use crate::harness::integration::{
     AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedPreference,
@@ -20,7 +19,9 @@ use crate::harness::integration::{
 };
 use crate::harness::kind::HarnessKind;
 use crate::harness::managed::{write_text_atomic, ManagedSurface};
-use crate::profile::mcp::{read_mcp_definitions, McpDefinition, McpTransport};
+use crate::profile::mcp::{
+    canonical_mcp_json, parse_mcp_definitions, read_mcp_definitions, McpDefinition, McpTransport,
+};
 use crate::profile::ProfileConfig;
 
 pub struct OpenCodeIntegration;
@@ -84,9 +85,10 @@ impl HarnessIntegration for OpenCodeIntegration {
             &active.path.join("commands"),
             &mut items,
         )?;
-        let native_mcps = import_opencode_mcps(&read_json(&paths.mcp_file)?)?;
-        let profile_mcps = fs::read_to_string(active.path.join("mcps.json")).unwrap_or_default();
-        if normalize_json_text(&native_mcps) != normalize_json_text(&profile_mcps) {
+        let native_mcps =
+            parse_mcp_definitions(&import_opencode_mcps(&read_json(&paths.mcp_file)?)?)?;
+        let profile_mcps = read_mcp_definitions(&active.path)?;
+        if canonical_mcp_json(&native_mcps)? != canonical_mcp_json(&profile_mcps)? {
             items.push(DriftItem {
                 surface: "mcp".to_string(),
                 detail: "OpenCode MCP list differs from active profile".to_string(),
@@ -185,10 +187,7 @@ fn patch_opencode_config(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Re
     document.remove("mcp");
     if !mcp_definitions.is_empty() {
         let mut servers = Map::new();
-        for definition in mcp_definitions
-            .into_iter()
-            .filter(|definition| definition.enabled)
-        {
+        for definition in mcp_definitions {
             servers.insert(definition.name.clone(), definition.to_opencode_value()?);
         }
         document.insert("mcp".to_string(), Value::Object(servers));
@@ -321,7 +320,7 @@ fn non_default_value(value: Value) -> Option<Value> {
 impl McpDefinition {
     fn to_opencode_value(&self) -> Result<Value> {
         let mut map = Map::new();
-        map.insert("enabled".to_string(), json!(true));
+        map.insert("enabled".to_string(), json!(self.enabled));
         match &self.transport {
             McpTransport::Stdio(stdio) => {
                 map.insert("type".to_string(), json!("local"));
@@ -440,7 +439,8 @@ mod tests {
             let mcp = fs::read_to_string(&paths.mcp_file).unwrap();
             assert!(mcp.contains("local"));
             assert!(mcp.contains("server"));
-            assert!(!mcp.contains("disabled"));
+            assert!(mcp.contains("disabled"));
+            assert!(mcp.contains(r#""enabled": false"#));
         }
     }
 

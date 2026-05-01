@@ -176,6 +176,54 @@ fn e2e_drift_handling() {
 }
 
 #[test]
+fn e2e_create_from_imports_and_removes_shared_agent_skills() {
+    let ctx = TestContext::new();
+    let codex_dir = ctx.user_home.join(".codex");
+    let shared_dir = ctx.user_home.join(".agents/skills");
+
+    fs::create_dir_all(codex_dir.join("skills/native")).unwrap();
+    fs::write(codex_dir.join("skills/native/SKILL.md"), "native").unwrap();
+    fs::create_dir_all(codex_dir.join("skills/shared")).unwrap();
+    fs::write(codex_dir.join("skills/shared/SKILL.md"), "native wins").unwrap();
+
+    fs::create_dir_all(shared_dir.join("shared")).unwrap();
+    fs::write(shared_dir.join("shared/SKILL.md"), "shared shadowed").unwrap();
+    fs::create_dir_all(shared_dir.join("global")).unwrap();
+    fs::write(shared_dir.join("global/SKILL.md"), "global").unwrap();
+    fs::create_dir_all(shared_dir.join("broken")).unwrap();
+    fs::write(shared_dir.join(".DS_Store"), "").unwrap();
+
+    let out = ctx.run_cli(&["create", "imported", "--from", "codex"]);
+    assert!(
+        out.status.success(),
+        "create --from failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let profile = ctx.home.join("profiles/imported");
+    assert_eq!(
+        fs::read_to_string(profile.join("skills/native/SKILL.md")).unwrap(),
+        "native"
+    );
+    assert_eq!(
+        fs::read_to_string(profile.join("skills/shared/SKILL.md")).unwrap(),
+        "native wins"
+    );
+    assert_eq!(
+        fs::read_to_string(profile.join("skills/global/SKILL.md")).unwrap(),
+        "global"
+    );
+
+    assert!(!shared_dir.join("global").exists());
+    assert!(
+        shared_dir.join("shared").exists(),
+        "shadowed shared skill should be left alone"
+    );
+    assert!(shared_dir.join("broken").exists());
+    assert!(shared_dir.join(".DS_Store").exists());
+}
+
+#[test]
 fn e2e_rollback_on_failure() {
     let ctx = TestContext::new();
 

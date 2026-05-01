@@ -1,5 +1,6 @@
 use crate::profile::validation::{Severity, ValidationIssue};
 use crate::profile::{ArtifactStatus, McpSummary};
+use std::path::Path;
 
 pub fn render_artifact_status(status: &ArtifactStatus) -> &'static str {
     match status {
@@ -25,6 +26,35 @@ pub fn render_mcp_summary(summary: &McpSummary) -> String {
     }
 }
 
+pub fn mcp_summary_count(summary: &McpSummary) -> usize {
+    match summary {
+        McpSummary::Empty | McpSummary::Invalid(_) => 0,
+        McpSummary::Servers(names) => names.len(),
+    }
+}
+
+pub fn render_path(path: &Path) -> String {
+    for home in display_home_candidates() {
+        match path.strip_prefix(&home) {
+            Ok(relative) if relative.as_os_str().is_empty() => return "~".to_string(),
+            Ok(relative) => return format!("~/{}", relative.display()),
+            Err(_) => {}
+        }
+    }
+    path.display().to_string()
+}
+
+fn display_home_candidates() -> Vec<std::path::PathBuf> {
+    let mut homes = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+        homes.push(home.into());
+    }
+    if let Some(user) = std::env::var_os("USER").filter(|user| !user.is_empty()) {
+        homes.push(Path::new("/Users").join(user));
+    }
+    homes
+}
+
 pub fn render_json_value(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(value) => value.clone(),
@@ -38,8 +68,6 @@ pub fn render_validation_issues(issues: &[ValidationIssue]) -> String {
     }
 
     let mut out = String::new();
-    out.push_str(&format!("{} issues found:\n", issues.len()));
-
     for issue in issues {
         let sev = match issue.severity {
             Severity::Error => "ERROR",

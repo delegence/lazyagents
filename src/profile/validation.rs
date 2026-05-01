@@ -1,5 +1,5 @@
 use crate::profile::inspect::{scan_commands, scan_skills};
-use serde_json::Value;
+use crate::profile::mcp::collect_mcp_validation_errors;
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,100 +86,11 @@ pub fn validate_profile(path: &Path) -> Vec<ValidationIssue> {
     // mcps.json
     let mcps_path = path.join("mcps.json");
     if let Ok(text) = std::fs::read_to_string(&mcps_path) {
-        if text.trim().is_empty() {
-            // Empty is valid
-        } else {
-            match serde_json::from_str::<Vec<Value>>(&text) {
-                Ok(mcps) => {
-                    let mut seen_names = std::collections::HashSet::new();
-                    for (i, mcp) in mcps.iter().enumerate() {
-                        let name = mcp
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("<unnamed>");
-                        let path_str = format!("mcps.json[{}]", i);
-
-                        if !seen_names.insert(name.to_string()) {
-                            issues.push(
-                                ValidationIssue::error(
-                                    "MCP",
-                                    format!("duplicate MCP name '{}'", name),
-                                )
-                                .with_path(path_str.clone()),
-                            );
-                        }
-
-                        let transport = mcp.get("transport").and_then(|v| v.as_str());
-                        match transport {
-                            Some("stdio") => {
-                                if mcp
-                                    .get("command")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .trim()
-                                    .is_empty()
-                                {
-                                    issues.push(
-                                        ValidationIssue::error(
-                                            "MCP",
-                                            format!("MCP '{}' has empty command", name),
-                                        )
-                                        .with_path(path_str),
-                                    );
-                                }
-                            }
-                            Some("http") => {
-                                if let Some(url) = mcp.get("url").and_then(|v| v.as_str()) {
-                                    if !url.starts_with("http://") && !url.starts_with("https://") {
-                                        issues.push(
-                                            ValidationIssue::error(
-                                                "MCP",
-                                                format!("MCP '{}' has invalid URL", name),
-                                            )
-                                            .with_path(path_str),
-                                        );
-                                    }
-                                } else {
-                                    issues.push(
-                                        ValidationIssue::error(
-                                            "MCP",
-                                            format!("MCP '{}' is missing url", name),
-                                        )
-                                        .with_path(path_str),
-                                    );
-                                }
-                            }
-                            Some(other) => {
-                                issues.push(
-                                    ValidationIssue::error(
-                                        "MCP",
-                                        format!(
-                                            "MCP '{}' uses unsupported transport '{}'",
-                                            name, other
-                                        ),
-                                    )
-                                    .with_path(path_str),
-                                );
-                            }
-                            None => {
-                                issues.push(
-                                    ValidationIssue::error(
-                                        "MCP",
-                                        format!("MCP '{}' is missing transport", name),
-                                    )
-                                    .with_path(path_str),
-                                );
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    issues.push(
-                        ValidationIssue::error("MCP", format!("malformed mcps.json: {}", err))
-                            .with_path("mcps.json"),
-                    );
-                }
-            }
+        for error in collect_mcp_validation_errors(&text) {
+            issues.push(
+                ValidationIssue::error("MCP", format!("malformed mcps.json: {}", error.message))
+                    .with_path(error.path),
+            );
         }
     }
 
@@ -270,32 +181,14 @@ mod tests {
         .unwrap();
 
         let issues = validate_profile(path);
-        assert!(issues
-            .iter()
-            .any(|i| i.message.contains("empty command")
-                && i.path.as_deref() == Some("mcps.json[0]")));
-        assert!(issues.iter().any(
-            |i| i.message.contains("invalid URL") && i.path.as_deref() == Some("mcps.json[1]")
-        ));
-        assert!(issues
-            .iter()
-            .any(|i| i.message.contains("unsupported transport")
-                && i.path.as_deref() == Some("mcps.json[2]")));
-        assert!(issues
-            .iter()
-            .any(|i| i.message.contains("unsupported transport")
-                && i.path.as_deref() == Some("mcps.json[3]")));
-        assert!(issues
-            .iter()
-            .any(|i| i.message.contains("duplicate MCP name 'm1'")
-                && i.path.as_deref() == Some("mcps.json[4]")));
-        assert!(issues
-            .iter()
-            .any(|i| i.message.contains("duplicate MCP name 'm4'")
-                && i.path.as_deref() == Some("mcps.json[5]")));
-        assert!(issues
-            .iter()
-            .any(|i| i.message.contains("empty command")
-                && i.path.as_deref() == Some("mcps.json[6]")));
+        assert!(issues.iter().any(|i| i.category == "MCP"
+            && i.path.as_deref() == Some("mcps.json[0]")
+            && i.message.contains("stdio MCP m1 requires command")));
+        assert!(issues.iter().any(|i| i.category == "MCP"
+            && i.path.as_deref() == Some("mcps.json[1]")
+            && i.message.contains("http MCP m2 requires url")));
+        assert!(issues.iter().any(|i| i.category == "MCP"
+            && i.path.as_deref() == Some("mcps.json[2]")
+            && i.message.contains("unsupported MCP transport: fake")));
     }
 }

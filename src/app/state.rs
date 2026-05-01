@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::harness::kind::HarnessKind;
@@ -11,6 +12,40 @@ use crate::profile::ProfileName;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LazyagentsState {
     pub active_profiles: BTreeMap<HarnessKind, ProfileName>,
+}
+
+#[derive(Debug)]
+pub struct LazyagentsHomeLock {
+    file: File,
+}
+
+impl LazyagentsHomeLock {
+    pub fn acquire(home: &Path) -> Result<Self> {
+        fs::create_dir_all(home)
+            .with_context(|| format!("failed to create lazyagents home {}", home.display()))?;
+        let path = home.join(".lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&path)
+            .with_context(|| format!("failed to open lock file {}", path.display()))?;
+
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self { file }),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                anyhow::bail!("another lazyagents command is already running")
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to lock lazyagents home {}", home.display())),
+        }
+    }
+}
+
+impl Drop for LazyagentsHomeLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
 }
 
 impl LazyagentsState {
@@ -120,5 +155,27 @@ mod tests {
             fs::read_to_string(path).unwrap(),
             "{\n  \"active_profiles\": {\n    \"codex\": \"work\"\n  }\n}\n"
         );
+    }
+
+    #[test]
+    fn lock_prevents_second_mutating_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let _first = LazyagentsHomeLock::acquire(temp.path()).unwrap();
+
+        let error = LazyagentsHomeLock::acquire(temp.path()).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("another lazyagents command is already running"));
+    }
+
+    #[test]
+    fn lock_is_released_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let _first = LazyagentsHomeLock::acquire(temp.path()).unwrap();
+        }
+
+        let _second = LazyagentsHomeLock::acquire(temp.path()).unwrap();
     }
 }

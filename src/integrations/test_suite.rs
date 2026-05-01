@@ -7,7 +7,7 @@ pub mod template {
     use crate::harness::apply::ProfileUseResult;
     use crate::harness::fs::{symlink_dir, symlink_file};
     use crate::harness::integration::{
-        AppEnvironment, HarnessConfigPaths, HarnessIntegration, ProfileImport,
+        AppEnvironment, HarnessConfigPaths, HarnessIntegration, ProfileImport, ProfileRef,
     };
     use crate::harness::kind::HarnessKind;
     use crate::profile::{LazyagentsHome, ProfileConfig, ProfileName, ProfileStore};
@@ -459,6 +459,20 @@ pub mod template {
         );
 
         adapter.assert_applied_native_config(&paths);
+        let drift = integration
+            .detect_drift(
+                &ProfileRef {
+                    name: ProfileName::parse("work").unwrap(),
+                    path: profile.clone(),
+                },
+                &paths,
+            )
+            .unwrap();
+        assert!(
+            drift.is_clean(),
+            "profile should be clean immediately after apply, got {:?}",
+            drift.items
+        );
 
         let state_str = fs::read_to_string(fixture.home.join("state.json")).unwrap();
         assert!(state_str.contains(&format!("\"{}\": \"work\"", integration.kind().id())));

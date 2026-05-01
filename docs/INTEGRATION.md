@@ -25,9 +25,8 @@ src/harness/kind.rs
 src/integrations/example.rs
 src/integrations/mod.rs
 src/app/harness_registry.rs
-docs/SPEC.md
-docs/PRD.md
-docs/GLOSSARY.md
+docs/ARCHITECTURE.md
+README.md
 ```
 
 If the harness needs reusable filesystem or artifact logic, add it to `src/harness/artifacts.rs` or `src/harness/fs.rs` only when it is genuinely shared.
@@ -133,9 +132,9 @@ Use extra tests for behavior not covered by the shared suite, especially:
 
 Update:
 
-- `docs/SPEC.md` harness paths and native mappings
-- `docs/PRD.md` supported harness and implementation decision text
-- `docs/GLOSSARY.md` only if new domain terms are introduced
+- `docs/ARCHITECTURE.md` harness paths, native mappings, and architectural notes
+- `README.md` supported harness list
+- this file if the integration workflow changes
 
 Do not leave docs saying only Codex, Claude Code, and OpenCode are supported if the new harness is registered.
 
@@ -245,7 +244,7 @@ Current neutral transports:
 - `stdio`
 - `http`
 
-Disabled MCP entries are validated but not emitted to native config. If the harness cannot represent an enabled MCP definition, fail apply so rollback can restore the previous harness state.
+Disabled MCP entries are validated and emitted to native config as disabled entries. If the harness cannot represent an MCP definition, fail apply so rollback can restore the previous harness state.
 
 ## Native Config Rules
 
