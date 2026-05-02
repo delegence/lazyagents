@@ -4,6 +4,7 @@ use std::fmt;
 pub enum HarnessKind {
     Codex,
     Claude,
+    Gemini,
     OpenCode,
     Pi,
 }
@@ -13,6 +14,7 @@ impl HarnessKind {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Gemini => "gemini",
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
         }
@@ -22,6 +24,7 @@ impl HarnessKind {
         match self {
             Self::Codex => "Codex",
             Self::Claude => "Claude Code",
+            Self::Gemini => "Gemini",
             Self::OpenCode => "OpenCode",
             Self::Pi => "Pi",
         }
@@ -31,6 +34,7 @@ impl HarnessKind {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Gemini => "gemini",
             Self::OpenCode => "opencode",
             Self::Pi => "pi",
         }

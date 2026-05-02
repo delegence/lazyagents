@@ -1,8 +1,8 @@
 use crate::harness::integration::HarnessIntegration;
 use crate::harness::kind::HarnessKind;
 use crate::integrations::{
-    claude::ClaudeIntegration, codex::CodexIntegration, opencode::OpenCodeIntegration,
-    pi::PiIntegration,
+    claude::ClaudeIntegration, codex::CodexIntegration, gemini::GeminiIntegration,
+    opencode::OpenCodeIntegration, pi::PiIntegration,
 };
 
 pub trait HarnessRegistry {
@@ -46,6 +46,7 @@ impl HarnessRegistry for BuiltInHarnessRegistry {
         vec![
             Box::new(CodexIntegration),
             Box::new(ClaudeIntegration),
+            Box::new(GeminiIntegration),
             Box::new(OpenCodeIntegration),
             Box::new(PiIntegration),
         ]
@@ -69,6 +70,7 @@ mod tests {
             vec![
                 HarnessKind::Codex,
                 HarnessKind::Claude,
+                HarnessKind::Gemini,
                 HarnessKind::OpenCode,
                 HarnessKind::Pi
             ]

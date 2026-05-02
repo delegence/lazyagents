@@ -32,11 +32,11 @@ cargo run -- doctor
 lazyagents help
 lazyagents doctor
 lazyagents create <name>
-lazyagents create <name> --from <claude|codex|opencode|pi>
+lazyagents create <name> --from <claude|codex|gemini|opencode|pi>
 lazyagents show <name>
 lazyagents edit <name>
 lazyagents delete <name> [--yes]
-lazyagents use <name> --harness <claude|codex|opencode|pi>
+lazyagents use <name> --harness <claude|codex|gemini|opencode|pi>
 lazyagents use <name> --all
 ```
 
@@ -175,6 +175,7 @@ Missing model or permission entries behave like `"default"`, which means `lazyag
 
 - Claude Code
 - Codex
+- Gemini
 - OpenCode
 - Pi
 

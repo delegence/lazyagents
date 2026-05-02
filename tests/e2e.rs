@@ -284,7 +284,7 @@ fn e2e_doctor_replaces_list_and_status() {
     let out = ctx.run_cli(&["doctor"]);
     assert!(out.status.success(), "doctor failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("[✓] Harnesses (4 available: codex, claude, opencode, pi)"));
+    assert!(stdout.contains("[✓] Harnesses (5 available: codex, claude, gemini, opencode, pi)"));
     assert!(stdout.contains("[✓] Profiles"));
     assert!(stdout.contains("- work (used by codex)"));
     assert!(stdout.contains("- playground (unused)"));

@@ -112,6 +112,7 @@ fn parse_harness_kind(id: &str) -> Result<HarnessKind> {
     match id {
         "codex" => Ok(HarnessKind::Codex),
         "claude" => Ok(HarnessKind::Claude),
+        "gemini" => Ok(HarnessKind::Gemini),
         "opencode" => Ok(HarnessKind::OpenCode),
         "pi" => Ok(HarnessKind::Pi),
         other => anyhow::bail!("unknown harness id in state: {other}"),

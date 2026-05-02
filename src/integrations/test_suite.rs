@@ -100,12 +100,39 @@ pub mod template {
 
         fn setup_native_config_for_import(&self, paths: &HarnessConfigPaths);
         fn assert_imported_native_config(&self, import: &ProfileImport);
+        fn setup_native_command_for_import(&self, paths: &HarnessConfigPaths) {
+            fs::write(paths.commands_dir.join("cmd.md"), "command").unwrap();
+        }
+        fn assert_imported_command(&self, import: &ProfileImport) {
+            assert_eq!(import.commands[0].contents, b"command");
+        }
 
         fn setup_drift_native_config(&self, paths: &HarnessConfigPaths);
         fn assert_drift_saved(&self, config: &ProfileConfig);
+        fn setup_drift_command(&self, paths: &HarnessConfigPaths) {
+            fs::write(paths.commands_dir.join("new.md"), "new command").unwrap();
+        }
+        fn assert_drift_command_saved(&self, active: &Path) {
+            assert_eq!(
+                fs::read_to_string(active.join("commands").join("new.md")).unwrap(),
+                "new command"
+            );
+        }
 
         fn write_profile_config(&self, profile: &Path);
         fn assert_applied_native_config(&self, paths: &HarnessConfigPaths);
+
+        fn assert_command_applied(
+            &self,
+            paths: &HarnessConfigPaths,
+            profile: &Path,
+            relative: &str,
+        ) {
+            assert_symlink_to(
+                paths.commands_dir.join(relative),
+                profile.join("commands").join(relative),
+            );
+        }
     }
 
     struct SingleHarnessRegistry<'a, A: HarnessTestAdapter> {
@@ -341,7 +368,7 @@ pub mod template {
         }
 
         if adapter.supports_commands() {
-            fs::write(paths.commands_dir.join("cmd.md"), "command").unwrap();
+            adapter.setup_native_command_for_import(&paths);
         }
 
         adapter.setup_native_config_for_import(&paths);
@@ -359,7 +386,7 @@ pub mod template {
             assert!(imported.skills.is_empty());
         }
         if adapter.supports_commands() {
-            assert_eq!(imported.commands[0].contents, b"command");
+            adapter.assert_imported_command(&imported);
         } else {
             assert!(imported.commands.is_empty());
         }
@@ -425,7 +452,7 @@ pub mod template {
         }
         if adapter.supports_commands() {
             fs::create_dir_all(&paths.commands_dir).unwrap();
-            fs::write(paths.commands_dir.join("new.md"), "new command").unwrap();
+            adapter.setup_drift_command(&paths);
         }
         if let Some(parent) = paths.instruction_target.parent() {
             fs::create_dir_all(parent).unwrap();
@@ -448,10 +475,7 @@ pub mod template {
             );
         }
         if adapter.supports_commands() {
-            assert_eq!(
-                fs::read_to_string(active.join("commands").join("new.md")).unwrap(),
-                "new command"
-            );
+            adapter.assert_drift_command_saved(&active);
         }
 
         let active_config = fixture
@@ -529,10 +553,7 @@ pub mod template {
             );
         }
         if adapter.supports_commands() {
-            assert_symlink_to(
-                paths.commands_dir.join("plan.md"),
-                profile.join("commands").join("plan.md"),
-            );
+            adapter.assert_command_applied(&paths, &profile, "plan.md");
         }
 
         adapter.assert_applied_native_config(&paths);
@@ -571,10 +592,7 @@ pub mod template {
         if adapter.supports_nested_commands() {
             result.unwrap();
             let paths = integration.paths(&fixture.env).unwrap();
-            assert_symlink_to(
-                paths.commands_dir.join("nested").join("cmd.md"),
-                profile.join("commands").join("nested").join("cmd.md"),
-            );
+            adapter.assert_command_applied(&paths, &profile, "nested/cmd.md");
         } else {
             let error = result.unwrap_err();
             let err_str = error.to_string();

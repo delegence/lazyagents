@@ -15,7 +15,7 @@ A profile is a named bundle of:
 - model preferences
 - permission preferences
 
-A harness is an external coding-agent runtime whose global configuration can be managed by `lazyagents`. Current built-in harnesses are Claude Code, Codex, OpenCode, and Pi.
+A harness is an external coding-agent runtime whose global configuration can be managed by `lazyagents`. Current built-in harnesses are Claude Code, Codex, Gemini, OpenCode, and Pi.
 
 The tool is local-first:
 
@@ -43,7 +43,7 @@ Avoid using "agent" for both sides of the system. Use **Profile** for the saved 
 ```text
 src/profile/       profile names, config, MCP parsing, validation, inspection, storage
 src/harness/       generic harness mechanics, drift, backup, rollback, symlinks
-src/integrations/  concrete Claude Code, Codex, OpenCode, Pi implementations
+src/integrations/  concrete Claude Code, Codex, Gemini CLI, OpenCode, Pi implementations
 src/app/           UI-independent workflows and composition
 src/cli/           terminal parsing, prompts, rendering, editor launch
 ```
@@ -286,6 +286,18 @@ skills dir: ~/.config/opencode/skills
 commands dir: ~/.config/opencode/commands
 settings file: ~/.config/opencode/opencode.json
 MCP file: ~/.config/opencode/opencode.json
+nested commands: yes
+```
+
+Gemini CLI:
+
+```text
+config dir: ~/.gemini
+instruction target: ~/.gemini/GEMINI.md
+skills dir: ~/.gemini/skills
+commands dir: ~/.gemini/commands
+settings file: ~/.gemini/settings.json
+MCP file: ~/.gemini/settings.json
 nested commands: yes
 ```
 

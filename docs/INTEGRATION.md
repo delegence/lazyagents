@@ -76,6 +76,7 @@ Use existing integrations as models:
 - `src/integrations/codex.rs` for TOML config and flat command handling
 - `src/integrations/claude.rs` for JSON config and global MCP file handling
 - `src/integrations/opencode.rs` for JSON config and nested command handling
+- `src/integrations/gemini.rs` for JSON config and profile Markdown command conversion to native TOML commands
 
 4. Register the module.
 
