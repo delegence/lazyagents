@@ -6,7 +6,6 @@ use crate::harness::drift::DriftReport;
 use crate::harness::integration::{
     AppEnvironment, HarnessDetection, HarnessIntegration, ProfileRef,
 };
-use crate::harness::kind::HarnessKind;
 use crate::profile::{ProfileConfigStatus, ProfileName, ProfileStore};
 
 pub struct DoctorReport {
@@ -16,7 +15,12 @@ pub struct DoctorReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessStatus {
-    pub harness: HarnessKind,
+    pub harness: String,
+    pub display_name: String,
+    pub harness_type: String,
+    pub config_dir: std::path::PathBuf,
+    pub config_dir_exists: bool,
+    pub shared_config_with: Option<String>,
     pub profile: HarnessProfileStatus,
 }
 
@@ -48,7 +52,7 @@ pub fn doctor_report(
     env: &AppEnvironment,
     store: &ProfileStore,
 ) -> Result<DoctorReport> {
-    let harnesses = status_rows_for(env, store, registry.all())?;
+    let harnesses = status_rows_for(env, store, registry.all(env)?)?;
     let profiles = profile_doctor_report(store, &harnesses)?;
     Ok(DoctorReport {
         harnesses,
@@ -69,11 +73,12 @@ fn status_rows_for(
             continue;
         }
 
-        let profile = match state.active_profiles.get(&integration.kind()) {
+        let profile = match state.active_profiles.get(integration.instance_id()) {
             Some(name) => {
                 let loaded = ProfileRef {
                     name: name.clone(),
                     path: profile_store.profile_dir(name),
+                    harness_id: integration.instance_id().to_string(),
                 };
 
                 let has_validation_errors = if loaded.path.exists() {
@@ -108,13 +113,33 @@ fn status_rows_for(
             None => HarnessProfileStatus::Inactive,
         };
 
+        let config_dir = integration.paths(env)?.config_dir;
+        let config_dir_exists = config_dir.is_dir();
         rows.push(HarnessStatus {
-            harness: integration.kind(),
+            harness: integration.instance_id().to_string(),
+            display_name: integration.display_name().to_string(),
+            harness_type: integration.kind().id().to_string(),
+            config_dir,
+            config_dir_exists,
+            shared_config_with: None,
             profile,
         });
     }
 
-    rows.sort_by_key(|row| row.harness);
+    rows.sort_by(|left, right| left.harness.cmp(&right.harness));
+    let mut first_by_config: std::collections::BTreeMap<(String, String), String> =
+        std::collections::BTreeMap::new();
+    for row in &mut rows {
+        let key = (
+            row.harness_type.clone(),
+            row.config_dir.display().to_string(),
+        );
+        if let Some(first) = first_by_config.get(&key) {
+            row.shared_config_with = Some(first.clone());
+        } else {
+            first_by_config.insert(key, row.harness.clone());
+        }
+    }
     Ok(rows)
 }
 
@@ -164,12 +189,12 @@ fn profile_doctor_report(
             }
 
             match drift_state {
-                DriftStatus::Clean => clean.push(row.harness.id().to_string()),
-                DriftStatus::Drifted => drift.push(row.harness.id().to_string()),
-                DriftStatus::Error => error.push(row.harness.id().to_string()),
+                DriftStatus::Clean => clean.push(row.harness.clone()),
+                DriftStatus::Drifted => drift.push(row.harness.clone()),
+                DriftStatus::Error => error.push(row.harness.clone()),
             }
-            if *has_validation_errors && !error.contains(&row.harness.id().to_string()) {
-                error.push(row.harness.id().to_string());
+            if *has_validation_errors && !error.contains(&row.harness) {
+                error.push(row.harness.clone());
             }
         }
 
@@ -258,6 +283,7 @@ mod tests {
     use super::*;
     use crate::harness::drift::DriftItem;
     use crate::harness::integration::{HarnessConfigPaths, ImportedPreference, ProfileImport};
+    use crate::harness::kind::HarnessKind;
     use crate::harness::managed::ManagedSurface;
     use crate::profile::LazyagentsHome;
 
@@ -298,6 +324,21 @@ mod tests {
             self.kind
         }
 
+        fn default_config_dir(&self, env: &AppEnvironment) -> PathBuf {
+            env.user_home.join(self.kind.id())
+        }
+
+        fn paths_from_config_dir(&self, root: PathBuf) -> Result<HarnessConfigPaths> {
+            Ok(HarnessConfigPaths {
+                config_dir: root.clone(),
+                instruction_target: root.join("AGENTS.md"),
+                skills_dir: root.join("skills"),
+                commands_dir: root.join("commands"),
+                settings_file: root.join("settings.json"),
+                mcp_file: root.join("mcp.json"),
+            })
+        }
+
         fn detect(&self, _env: &AppEnvironment) -> Result<HarnessDetection> {
             if self.detected {
                 Ok(HarnessDetection::Detected {
@@ -309,15 +350,7 @@ mod tests {
         }
 
         fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-            let root = env.user_home.join(self.kind.id());
-            Ok(HarnessConfigPaths {
-                config_dir: root.clone(),
-                instruction_target: root.join("AGENTS.md"),
-                skills_dir: root.join("skills"),
-                commands_dir: root.join("commands"),
-                settings_file: root.join("settings.json"),
-                mcp_file: root.join("mcp.json"),
-            })
+            self.paths_from_config_dir(self.default_config_dir(env))
         }
 
         fn managed_surfaces(&self, _paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
@@ -525,8 +558,9 @@ mod tests {
     }
 
     impl HarnessRegistry for TestRegistry {
-        fn all(&self) -> Vec<Box<dyn HarnessIntegration>> {
-            self.integrations
+        fn all(&self, _env: &AppEnvironment) -> Result<Vec<Box<dyn HarnessIntegration>>> {
+            Ok(self
+                .integrations
                 .iter()
                 .map(|integration| {
                     Box::new(StatusIntegration::detected(
@@ -534,7 +568,7 @@ mod tests {
                         DriftReport::clean(),
                     )) as Box<dyn HarnessIntegration>
                 })
-                .collect()
+                .collect())
         }
     }
 }

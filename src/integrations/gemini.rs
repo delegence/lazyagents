@@ -36,8 +36,11 @@ impl HarnessIntegration for GeminiIntegration {
         Ok(detect_binary(env, self.kind().binary_name()))
     }
 
-    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-        let config_dir = env.user_home.join(".gemini");
+    fn default_config_dir(&self, env: &AppEnvironment) -> std::path::PathBuf {
+        env.user_home.join(".gemini")
+    }
+
+    fn paths_from_config_dir(&self, config_dir: std::path::PathBuf) -> Result<HarnessConfigPaths> {
         Ok(HarnessConfigPaths {
             instruction_target: config_dir.join("GEMINI.md"),
             skills_dir: config_dir.join("skills"),
@@ -46,6 +49,10 @@ impl HarnessIntegration for GeminiIntegration {
             mcp_file: config_dir.join("settings.json"),
             config_dir,
         })
+    }
+
+    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
+        self.paths_from_config_dir(self.default_config_dir(env))
     }
 
     fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
@@ -288,13 +295,13 @@ fn patch_gemini_settings(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Re
     let mut document = read_json(&paths.settings_file)?;
 
     if let Some(model) = non_default_string(
-        profile_config.model_preference(HarnessKind::Gemini),
+        profile_config.model_preference(&profile.harness_id),
         "model preference",
     )? {
         set_nested_value(&mut document, &["model", "name"], json!(model))?;
     }
     if let Some(permission) = non_default_string(
-        profile_config.permission_preference(HarnessKind::Gemini),
+        profile_config.permission_preference(&profile.harness_id),
         "permission preference",
     )? {
         set_nested_value(
@@ -607,14 +614,8 @@ mod tests {
             .unwrap();
         }
         fn assert_drift_saved(&self, config: &ProfileConfig) {
-            assert_eq!(
-                config.model_preference(crate::harness::kind::HarnessKind::Gemini),
-                "drift-model"
-            );
-            assert_eq!(
-                config.permission_preference(crate::harness::kind::HarnessKind::Gemini),
-                "plan"
-            );
+            assert_eq!(config.model_preference("gemini"), "drift-model");
+            assert_eq!(config.permission_preference("gemini"), "plan");
         }
         fn setup_drift_command(&self, paths: &HarnessConfigPaths) {
             fs::write(

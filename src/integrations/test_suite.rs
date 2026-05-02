@@ -9,7 +9,6 @@ pub mod template {
     use crate::harness::integration::{
         AppEnvironment, HarnessConfigPaths, HarnessIntegration, ProfileImport, ProfileRef,
     };
-    use crate::harness::kind::HarnessKind;
     use crate::profile::{LazyagentsHome, ProfileConfig, ProfileName, ProfileStore};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -140,17 +139,8 @@ pub mod template {
     }
 
     impl<A: HarnessTestAdapter> HarnessRegistry for SingleHarnessRegistry<'_, A> {
-        fn all(&self) -> Vec<Box<dyn HarnessIntegration>> {
-            vec![self.adapter.integration()]
-        }
-
-        fn get(&self, kind: HarnessKind) -> Option<Box<dyn HarnessIntegration>> {
-            let integration = self.adapter.integration();
-            if integration.kind() == kind {
-                Some(integration)
-            } else {
-                None
-            }
+        fn all(&self, _env: &AppEnvironment) -> anyhow::Result<Vec<Box<dyn HarnessIntegration>>> {
+            Ok(vec![self.adapter.integration()])
         }
     }
 
@@ -168,7 +158,7 @@ pub mod template {
             &fixture.store,
             UseProfileRequest {
                 profile: ProfileName::parse(profile).unwrap(),
-                target: UseProfileTarget::Harness(integration.kind()),
+                target: UseProfileTarget::Harness(integration.instance_id().to_string()),
                 drift_decision: Some(decision),
             },
         )? {
@@ -275,13 +265,16 @@ pub mod template {
                         || err.contains("missing")
                         || err.contains("invalid"))
             );
-            assert!(state.active_profiles.get(&integration.kind()).is_none());
+            assert!(state
+                .active_profiles
+                .get(integration.instance_id())
+                .is_none());
         } else {
             result.unwrap();
             assert_eq!(
                 state
                     .active_profiles
-                    .get(&integration.kind())
+                    .get(integration.instance_id())
                     .unwrap()
                     .as_str(),
                 "work"
@@ -435,7 +428,7 @@ pub mod template {
             fixture.home.join("state.json"),
             format!(
                 r#"{{"active_profiles":{{"{}":"active"}}}}"#,
-                integration.kind().id()
+                integration.instance_id()
             ),
         )
         .unwrap();
@@ -499,7 +492,7 @@ pub mod template {
             fixture.home.join("state.json"),
             format!(
                 r#"{{"active_profiles":{{"{}":"active"}}}}"#,
-                integration.kind().id()
+                integration.instance_id()
             ),
         )
         .unwrap();
@@ -562,6 +555,7 @@ pub mod template {
                 &ProfileRef {
                     name: ProfileName::parse("work").unwrap(),
                     path: profile.clone(),
+                    harness_id: integration.instance_id().to_string(),
                 },
                 &paths,
             )
@@ -573,7 +567,7 @@ pub mod template {
         );
 
         let state_str = fs::read_to_string(fixture.home.join("state.json")).unwrap();
-        assert!(state_str.contains(&format!("\"{}\": \"work\"", integration.kind().id())));
+        assert!(state_str.contains(&format!("\"{}\": \"work\"", integration.instance_id())));
     }
 
     pub fn test_nested_commands_behavior<A: HarnessTestAdapter>(adapter: &A) {

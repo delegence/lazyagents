@@ -23,7 +23,7 @@ impl TestContext {
         fs::create_dir_all(&bin_dir).unwrap();
 
         // Create dummies for supported harnesses
-        for bin in &["claude", "codex", "opencode", "pi"] {
+        for bin in &["claude", "codex", "gemini", "opencode", "pi"] {
             let bin_path = bin_dir.join(bin);
             fs::write(&bin_path, "#!/bin/sh\necho hi").unwrap();
             #[cfg(unix)]
@@ -284,7 +284,7 @@ fn e2e_doctor_replaces_list_and_status() {
     let out = ctx.run_cli(&["doctor"]);
     assert!(out.status.success(), "doctor failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("[✓] Harnesses (5 available: codex, claude, gemini, opencode, pi)"));
+    assert!(stdout.contains("[✓] Harnesses (5 available: claude, codex, gemini, opencode, pi)"));
     assert!(stdout.contains("[✓] Profiles"));
     assert!(stdout.contains("- work (used by codex)"));
     assert!(stdout.contains("- playground (unused)"));
@@ -295,4 +295,92 @@ fn e2e_doctor_replaces_list_and_status() {
     assert!(!list.status.success(), "list should be removed");
     let status = ctx.run_cli(&["status"]);
     assert!(!status.status.success(), "status should be removed");
+}
+
+#[test]
+fn e2e_shared_config_dir_instances_share_active_state() {
+    let ctx = TestContext::new();
+
+    assert!(ctx.run_cli(&["create", "work"]).status.success());
+    assert!(ctx.run_cli(&["doctor"]).status.success());
+
+    let settings_path = ctx.home.join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    settings["harnesses"]["codex-work"] = serde_json::json!({
+        "type": "codex",
+        "displayName": "Codex Work",
+        "binary": "codex",
+        "configDir": "~/.codex"
+    });
+    fs::write(
+        &settings_path,
+        format!("{}\n", serde_json::to_string_pretty(&settings).unwrap()),
+    )
+    .unwrap();
+
+    let out = ctx.run_cli(&["use", "work", "--harness", "codex"]);
+    assert!(
+        out.status.success(),
+        "use failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Also marked codex-work active"));
+
+    let state = fs::read_to_string(ctx.home.join("state.json")).unwrap();
+    assert!(state.contains(r#""codex": "work""#));
+    assert!(state.contains(r#""codex-work": "work""#));
+
+    let doctor = ctx.run_cli(&["doctor"]);
+    assert!(doctor.status.success());
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(stdout.contains("codex-work shares configDir with codex"));
+}
+
+#[test]
+fn e2e_settings_reset_requires_confirmation_and_restores_defaults() {
+    let ctx = TestContext::new();
+
+    assert!(ctx.run_cli(&["doctor"]).status.success());
+    let settings_path = ctx.home.join("settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    settings["harnesses"]["codex-work"] = serde_json::json!({
+        "type": "codex",
+        "displayName": "Codex Work",
+        "binary": "codex",
+        "configDir": "~/.codex-work"
+    });
+    fs::write(
+        &settings_path,
+        format!("{}\n", serde_json::to_string_pretty(&settings).unwrap()),
+    )
+    .unwrap();
+
+    let cancelled = ctx.run_cli(&["settings", "reset"]);
+    assert!(cancelled.status.success());
+    let stdout = String::from_utf8_lossy(&cancelled.stdout);
+    assert!(stdout.contains("Settings reset cancelled"));
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert!(settings["harnesses"].get("codex-work").is_some());
+
+    let reset = ctx.run_cli(&["settings", "reset", "--yes"]);
+    assert!(
+        reset.status.success(),
+        "settings reset failed: {}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&reset.stdout);
+    assert!(stdout.contains("Reset settings at"));
+
+    let settings: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert!(settings["harnesses"].get("codex-work").is_none());
+    assert_eq!(settings["harnesses"]["codex"]["configDir"], "~/.codex");
+    assert_eq!(
+        settings["harnesses"]["opencode"]["configDir"],
+        "~/.config/opencode"
+    );
 }

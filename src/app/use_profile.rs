@@ -10,7 +10,6 @@ use crate::harness::drift::DriftReport;
 use crate::harness::integration::{
     AppEnvironment, HarnessDetection, HarnessIntegration, ProfileRef,
 };
-use crate::harness::kind::HarnessKind;
 use crate::profile::mcp::read_mcp_definitions;
 use crate::profile::{ProfileName, ProfileStore};
 
@@ -22,7 +21,7 @@ pub enum DriftDecision {
 }
 
 pub enum UseProfileTarget {
-    Harness(HarnessKind),
+    Harness(String),
     All,
 }
 
@@ -36,7 +35,7 @@ pub enum UseProfileOutcome {
     Applied(ProfileUseResult),
     All(UseProfileAllResult),
     NeedsSingleHarnessDriftDecision {
-        harness: HarnessKind,
+        display_name: String,
         profile: ProfileName,
         drift: DriftReport,
     },
@@ -46,14 +45,14 @@ pub enum UseProfileOutcome {
 }
 
 pub struct HarnessDrift {
-    pub harness: HarnessKind,
+    pub display_name: String,
     pub profile: ProfileName,
     pub drift: DriftReport,
 }
 
 pub struct UseProfileAllResult {
     pub applied: Vec<ProfileUseResult>,
-    pub failures: Vec<(HarnessKind, anyhow::Error)>,
+    pub failures: Vec<(String, String, anyhow::Error)>,
 }
 
 pub fn use_profile_workflow(
@@ -63,13 +62,15 @@ pub fn use_profile_workflow(
     request: UseProfileRequest,
 ) -> Result<UseProfileOutcome> {
     match request.target {
-        UseProfileTarget::Harness(kind) => {
+        UseProfileTarget::Harness(id) => {
             let integration = registry
-                .get(kind)
-                .ok_or_else(|| anyhow::anyhow!("unsupported harness {kind}"))?;
+                .get(env, &id)?
+                .ok_or_else(|| anyhow::anyhow!("unsupported harness {id}"))?;
             match integration.detect(env)? {
                 HarnessDetection::Detected { .. } => {}
-                HarnessDetection::NotDetected => anyhow::bail!("{kind} was not detected on PATH"),
+                HarnessDetection::NotDetected => {
+                    anyhow::bail!("{} was not detected on PATH", integration.instance_id())
+                }
             }
 
             let decision = match request.drift_decision {
@@ -80,7 +81,7 @@ pub fn use_profile_workflow(
                         DriftDecision::DiscardChanges
                     } else {
                         return Ok(UseProfileOutcome::NeedsSingleHarnessDriftDecision {
-                            harness: kind,
+                            display_name: integration.display_name().to_string(),
                             profile: active.profile.ok_or_else(|| {
                                 anyhow::anyhow!("drift reported without an active profile")
                             })?,
@@ -91,6 +92,7 @@ pub fn use_profile_workflow(
             };
 
             Ok(UseProfileOutcome::Applied(apply_one(
+                registry,
                 integration.as_ref(),
                 env,
                 store,
@@ -114,7 +116,7 @@ pub fn use_profile_workflow(
                     let active = active_drift(integration.as_ref(), env, store)?;
                     if !active.drift.is_clean() {
                         drifted.push(HarnessDrift {
-                            harness: integration.kind(),
+                            display_name: integration.display_name().to_string(),
                             profile: active.profile.ok_or_else(|| {
                                 anyhow::anyhow!("drift reported without an active profile")
                             })?,
@@ -135,6 +137,7 @@ pub fn use_profile_workflow(
             };
             for integration in detected {
                 match apply_one(
+                    registry,
                     integration.as_ref(),
                     env,
                     store,
@@ -142,7 +145,11 @@ pub fn use_profile_workflow(
                     DriftDecision::DiscardChanges,
                 ) {
                     Ok(result) => results.applied.push(result),
-                    Err(error) => results.failures.push((integration.kind(), error)),
+                    Err(error) => results.failures.push((
+                        integration.instance_id().to_string(),
+                        integration.display_name().to_string(),
+                        error,
+                    )),
                 }
             }
             Ok(UseProfileOutcome::All(results))
@@ -151,6 +158,7 @@ pub fn use_profile_workflow(
 }
 
 fn apply_one(
+    registry: &dyn HarnessRegistry,
     integration: &dyn HarnessIntegration,
     env: &AppEnvironment,
     store: &ProfileStore,
@@ -164,7 +172,7 @@ fn apply_one(
     let mut state = LazyagentsState::load(&state_path)?;
     let active_profile = state
         .active_profiles
-        .get(&integration.kind())
+        .get(integration.instance_id())
         .map(|name| active_profile_for_drift(integration, store, name))
         .transpose()?;
     let drift = match active_profile.as_ref() {
@@ -176,7 +184,9 @@ fn apply_one(
         match decision {
             DriftDecision::Cancel => {
                 return Ok(ProfileUseResult {
-                    harness: integration.kind(),
+                    harness: integration.instance_id().to_string(),
+                    display_name: integration.display_name().to_string(),
+                    alias_updates: Vec::new(),
                     profile: profile.clone(),
                     status: ProfileUseStatus::CancelledForDrift,
                 });
@@ -186,7 +196,7 @@ fn apply_one(
                 let mut imported = integration.import_from_harness(&paths)?;
                 let shared_skills = merge_shared_agent_skills(&mut imported.skills, env)?;
                 if let Some(active) = active_profile.as_ref() {
-                    store.apply_import(&active.name, integration.kind(), imported)?;
+                    store.apply_import(&active.name, integration.instance_id(), imported)?;
                     remove_imported_shared_skills(&shared_skills)?;
                 }
             }
@@ -194,13 +204,20 @@ fn apply_one(
     }
 
     apply_profile_to_harness_with_commit(integration, env, store, profile, || {
-        state
-            .active_profiles
-            .insert(integration.kind(), profile.clone());
+        for alias in registry.aliases_for(env, integration)? {
+            state.active_profiles.insert(alias, profile.clone());
+        }
         state.save(&state_path)
     })?;
+    let alias_updates = registry
+        .aliases_for(env, integration)?
+        .into_iter()
+        .filter(|alias| alias != integration.instance_id())
+        .collect();
     Ok(ProfileUseResult {
-        harness: integration.kind(),
+        harness: integration.instance_id().to_string(),
+        display_name: integration.display_name().to_string(),
+        alias_updates,
         profile: profile.clone(),
         status: ProfileUseStatus::Applied,
     })
@@ -220,7 +237,7 @@ fn active_drift(
     let state = LazyagentsState::load(&env.lazyagents_home.join("state.json"))?;
     let active_profile = state
         .active_profiles
-        .get(&integration.kind())
+        .get(integration.instance_id())
         .map(|name| active_profile_for_drift(integration, store, name))
         .transpose()?;
     match active_profile.as_ref() {
@@ -274,6 +291,7 @@ fn active_profile_for_drift(
     Ok(ProfileRef {
         name: name.clone(),
         path,
+        harness_id: integration.instance_id().to_string(),
     })
 }
 
@@ -282,7 +300,7 @@ fn detected_integrations(
     env: &AppEnvironment,
 ) -> Result<Vec<Box<dyn HarnessIntegration>>> {
     let mut detected = Vec::new();
-    for integration in registry.all() {
+    for integration in registry.all(env)? {
         if matches!(integration.detect(env)?, HarnessDetection::Detected { .. }) {
             detected.push(integration);
         }
@@ -301,6 +319,7 @@ mod tests {
     use super::*;
     use crate::harness::drift::DriftItem;
     use crate::harness::integration::{HarnessConfigPaths, ImportedPreference, ProfileImport};
+    use crate::harness::kind::HarnessKind;
     use crate::harness::managed::ManagedSurface;
     use crate::profile::LazyagentsHome;
 
@@ -366,6 +385,21 @@ mod tests {
             self.kind
         }
 
+        fn default_config_dir(&self, _env: &AppEnvironment) -> PathBuf {
+            self.root.clone()
+        }
+
+        fn paths_from_config_dir(&self, config_dir: PathBuf) -> Result<HarnessConfigPaths> {
+            Ok(HarnessConfigPaths {
+                instruction_target: config_dir.join("AGENTS.md"),
+                skills_dir: config_dir.join("skills"),
+                commands_dir: config_dir.join("commands"),
+                settings_file: config_dir.join("settings.json"),
+                mcp_file: config_dir.join("mcp.json"),
+                config_dir,
+            })
+        }
+
         fn supports_mcp(&self) -> bool {
             self.supports_mcp
         }
@@ -381,14 +415,7 @@ mod tests {
         }
 
         fn paths(&self, _env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-            Ok(HarnessConfigPaths {
-                config_dir: self.root.clone(),
-                instruction_target: self.root.join("AGENTS.md"),
-                skills_dir: self.root.join("skills"),
-                commands_dir: self.root.join("commands"),
-                settings_file: self.root.join("settings.json"),
-                mcp_file: self.root.join("mcp.json"),
-            })
+            self.paths_from_config_dir(self.root.clone())
         }
 
         fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
@@ -457,20 +484,13 @@ mod tests {
     }
 
     impl HarnessRegistry for FakeCatalog {
-        fn all(&self) -> Vec<Box<dyn HarnessIntegration>> {
-            self.integrations
+        fn all(&self, _env: &AppEnvironment) -> Result<Vec<Box<dyn HarnessIntegration>>> {
+            Ok(self
+                .integrations
                 .iter()
                 .cloned()
                 .map(|integration| Box::new(integration) as Box<dyn HarnessIntegration>)
-                .collect()
-        }
-
-        fn get(&self, kind: HarnessKind) -> Option<Box<dyn HarnessIntegration>> {
-            self.integrations
-                .iter()
-                .find(|integration| integration.kind == kind)
-                .cloned()
-                .map(|integration| Box::new(integration) as Box<dyn HarnessIntegration>)
+                .collect())
         }
     }
 
@@ -492,7 +512,7 @@ mod tests {
             &fixture.store,
             UseProfileRequest {
                 profile: ProfileName::parse("target").unwrap(),
-                target: UseProfileTarget::Harness(HarnessKind::Codex),
+                target: UseProfileTarget::Harness("codex".to_string()),
                 drift_decision: None,
             },
         )
@@ -501,9 +521,9 @@ mod tests {
         assert!(matches!(
             outcome,
             UseProfileOutcome::NeedsSingleHarnessDriftDecision {
-                harness: HarnessKind::Codex,
+                display_name,
                 ..
-            }
+            } if display_name == "Codex"
         ));
     }
 
@@ -529,7 +549,7 @@ mod tests {
             &fixture.store,
             UseProfileRequest {
                 profile: ProfileName::parse("target").unwrap(),
-                target: UseProfileTarget::Harness(HarnessKind::Codex),
+                target: UseProfileTarget::Harness("codex".to_string()),
                 drift_decision: Some(DriftDecision::Cancel),
             },
         )
@@ -568,7 +588,7 @@ mod tests {
             &fixture.store,
             UseProfileRequest {
                 profile: ProfileName::parse("target").unwrap(),
-                target: UseProfileTarget::Harness(HarnessKind::Codex),
+                target: UseProfileTarget::Harness("codex".to_string()),
                 drift_decision: None,
             },
         ) {
@@ -600,7 +620,7 @@ mod tests {
             &fixture.store,
             UseProfileRequest {
                 profile: ProfileName::parse("target").unwrap(),
-                target: UseProfileTarget::Harness(HarnessKind::Codex),
+                target: UseProfileTarget::Harness("codex".to_string()),
                 drift_decision: None,
             },
         )
@@ -632,7 +652,7 @@ mod tests {
             &fixture.store,
             UseProfileRequest {
                 profile: ProfileName::parse("target").unwrap(),
-                target: UseProfileTarget::Harness(HarnessKind::Codex),
+                target: UseProfileTarget::Harness("codex".to_string()),
                 drift_decision: Some(DriftDecision::SaveChanges),
             },
         )
@@ -647,7 +667,7 @@ mod tests {
             .store
             .load_config(&ProfileName::parse("active").unwrap())
             .unwrap();
-        assert_eq!(config.model_preference(HarnessKind::Codex), "saved-model");
+        assert_eq!(config.model_preference("codex"), "saved-model");
     }
 
     #[test]
@@ -671,7 +691,7 @@ mod tests {
             &fixture.store,
             UseProfileRequest {
                 profile: ProfileName::parse("work").unwrap(),
-                target: UseProfileTarget::Harness(HarnessKind::Codex),
+                target: UseProfileTarget::Harness("codex".to_string()),
                 drift_decision: Some(DriftDecision::DiscardChanges),
             },
         ) {
@@ -734,19 +754,12 @@ mod tests {
             panic!("expected all result");
         };
         assert_eq!(results.applied.len(), 1);
-        assert_eq!(results.applied[0].harness, HarnessKind::Codex);
+        assert_eq!(results.applied[0].harness, "codex");
         assert_eq!(results.failures.len(), 1);
-        assert_eq!(results.failures[0].0, HarnessKind::Claude);
+        assert_eq!(results.failures[0].0, "claude");
         let state = LazyagentsState::load(&fixture.home.join("state.json")).unwrap();
-        assert_eq!(
-            state
-                .active_profiles
-                .get(&HarnessKind::Codex)
-                .unwrap()
-                .as_str(),
-            "work"
-        );
-        assert!(!state.active_profiles.contains_key(&HarnessKind::Claude));
+        assert_eq!(state.active_profiles.get("codex").unwrap().as_str(), "work");
+        assert!(!state.active_profiles.contains_key("claude"));
     }
 
     struct Fixture {

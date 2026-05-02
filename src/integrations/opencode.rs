@@ -35,8 +35,11 @@ impl HarnessIntegration for OpenCodeIntegration {
         Ok(detect_binary(env, self.kind().binary_name()))
     }
 
-    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-        let config_dir = env.user_home.join(".config").join("opencode");
+    fn default_config_dir(&self, env: &AppEnvironment) -> std::path::PathBuf {
+        env.user_home.join(".config").join("opencode")
+    }
+
+    fn paths_from_config_dir(&self, config_dir: std::path::PathBuf) -> Result<HarnessConfigPaths> {
         Ok(HarnessConfigPaths {
             instruction_target: config_dir.join("AGENTS.md"),
             skills_dir: config_dir.join("skills"),
@@ -45,6 +48,10 @@ impl HarnessIntegration for OpenCodeIntegration {
             mcp_file: config_dir.join("opencode.json"),
             config_dir,
         })
+    }
+
+    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
+        self.paths_from_config_dir(self.default_config_dir(env))
     }
 
     fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
@@ -172,14 +179,12 @@ fn patch_opencode_config(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Re
     let profile_config = read_profile_config(&profile.path)?;
     let mut document = read_json(&paths.settings_file)?;
 
-    if let Some(model) = non_default_value(
-        profile_config.model_preference(crate::harness::kind::HarnessKind::OpenCode),
-    ) {
+    if let Some(model) = non_default_value(profile_config.model_preference(&profile.harness_id)) {
         document.insert("model".to_string(), model);
     }
-    if let Some(permission) = non_default_value(
-        profile_config.permission_preference(crate::harness::kind::HarnessKind::OpenCode),
-    ) {
+    if let Some(permission) =
+        non_default_value(profile_config.permission_preference(&profile.harness_id))
+    {
         document.insert("permissions".to_string(), permission);
     }
 
@@ -412,14 +417,8 @@ mod tests {
             .unwrap();
         }
         fn assert_drift_saved(&self, config: &ProfileConfig) {
-            assert_eq!(
-                config.model_preference(crate::harness::kind::HarnessKind::OpenCode),
-                "drift-model"
-            );
-            assert_eq!(
-                config.permission_preference(crate::harness::kind::HarnessKind::OpenCode),
-                "drift-perm"
-            );
+            assert_eq!(config.model_preference("opencode"), "drift-model");
+            assert_eq!(config.permission_preference("opencode"), "drift-perm");
         }
         fn write_profile_config(&self, profile: &Path) {
             crate::integrations::test_suite::template::write_config(

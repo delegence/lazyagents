@@ -5,7 +5,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::harness::drift::DriftReport;
-use crate::harness::kind::HarnessKind;
+use crate::harness::kind::{HarnessInstance, HarnessKind};
 use crate::harness::managed::ManagedSurface;
 use crate::profile::ProfileName;
 
@@ -53,6 +53,7 @@ pub struct HarnessConfigPaths {
 pub struct ProfileRef {
     pub name: ProfileName,
     pub path: PathBuf,
+    pub harness_id: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -102,6 +103,22 @@ impl Default for ImportedPreference {
 
 pub trait HarnessIntegration {
     fn kind(&self) -> HarnessKind;
+    fn instance(&self) -> HarnessInstance {
+        let kind = self.kind();
+        HarnessInstance {
+            id: crate::harness::kind::HarnessInstanceId::parse(kind.id()).unwrap(),
+            kind,
+            display_name: kind.display_name().to_string(),
+            binary: kind.binary_name().to_string(),
+            config_dir: PathBuf::new(),
+        }
+    }
+    fn instance_id(&self) -> &str {
+        self.kind().id()
+    }
+    fn display_name(&self) -> &str {
+        self.kind().display_name()
+    }
     fn supports_skills(&self) -> bool {
         true
     }
@@ -111,6 +128,8 @@ pub trait HarnessIntegration {
     fn supports_mcp(&self) -> bool {
         true
     }
+    fn default_config_dir(&self, env: &AppEnvironment) -> PathBuf;
+    fn paths_from_config_dir(&self, config_dir: PathBuf) -> Result<HarnessConfigPaths>;
     fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection>;
     fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths>;
     fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface>;

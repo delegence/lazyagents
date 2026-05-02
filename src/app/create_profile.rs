@@ -6,7 +6,6 @@ use anyhow::{Context, Result};
 use crate::app::harness_registry::HarnessRegistry;
 use crate::harness::artifacts::import_skills;
 use crate::harness::integration::{AppEnvironment, HarnessDetection, ImportedDirectory};
-use crate::harness::kind::HarnessKind;
 use crate::profile::{ProfileName, ProfileStore};
 
 pub enum CreateProfileResult {
@@ -16,7 +15,7 @@ pub enum CreateProfileResult {
     },
     Imported {
         profile: ProfileName,
-        harness: HarnessKind,
+        harness: String,
         path: PathBuf,
     },
 }
@@ -26,32 +25,32 @@ pub fn create_profile(
     env: &AppEnvironment,
     store: &ProfileStore,
     profile: ProfileName,
-    from: Option<HarnessKind>,
+    from: Option<String>,
 ) -> Result<CreateProfileResult> {
     match from {
-        Some(kind) => {
+        Some(id) => {
             let integration = registry
-                .get(kind)
-                .ok_or_else(|| anyhow::anyhow!("unsupported harness {kind}"))?;
+                .get(env, &id)?
+                .ok_or_else(|| anyhow::anyhow!("unsupported harness {id}"))?;
             match integration.detect(env)? {
                 HarnessDetection::Detected { .. } => {}
-                HarnessDetection::NotDetected => anyhow::bail!("{kind} was not detected on PATH"),
+                HarnessDetection::NotDetected => anyhow::bail!("{id} was not detected on PATH"),
             }
             let paths = integration.paths(env)?;
             let path = store.create_skeleton(&profile)?;
             if let Err(error) = (|| {
                 let mut imported = integration.import_from_harness(&paths)?;
                 let shared_skills = merge_shared_agent_skills(&mut imported.skills, env)?;
-                store.apply_import(&profile, kind, imported)?;
+                store.apply_import(&profile, integration.instance_id(), imported)?;
                 remove_imported_shared_skills(&shared_skills)?;
                 Ok::<(), anyhow::Error>(())
             })() {
                 let _ = std::fs::remove_dir_all(&path);
-                return Err(error.context(format!("failed to import from {kind}")));
+                return Err(error.context(format!("failed to import from {id}")));
             }
             Ok(CreateProfileResult::Imported {
                 profile,
-                harness: kind,
+                harness: integration.instance_id().to_string(),
                 path,
             })
         }

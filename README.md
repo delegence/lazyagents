@@ -36,6 +36,7 @@ lazyagents create <name> --from <claude|codex|gemini|opencode|pi>
 lazyagents show <name>
 lazyagents edit <name>
 lazyagents delete <name> [--yes]
+lazyagents settings reset [--yes]
 lazyagents use <name> --harness <claude|codex|gemini|opencode|pi>
 lazyagents use <name> --all
 ```
@@ -69,6 +70,48 @@ config.json    model and permission preferences
 ```
 
 Profile names are CLI-safe identifiers: ASCII letters, numbers, and dashes only.
+
+## Harness Settings
+
+Harness instances are configured in:
+
+```text
+~/.lazyagents/settings.json
+```
+
+If the file is missing, `lazyagents` creates it with the default Claude, Codex, Gemini, OpenCode, and Pi instances. Each instance has an id, a harness `type`, an optional `displayName`, an optional `binary`, and a `configDir`.
+
+Example:
+
+```json
+{
+  "harnesses": {
+    "codex": {
+      "type": "codex",
+      "displayName": "Codex",
+      "binary": "codex",
+      "configDir": "~/.codex"
+    },
+    "codex-max": {
+      "type": "codex",
+      "displayName": "Codex Max",
+      "binary": "codex",
+      "configDir": "~/.codex-max"
+    }
+  }
+}
+```
+
+Use instance ids with `--harness`. Model and permission preferences in profile `config.json` are keyed by instance id. If two instances have the same type and `configDir`, applying a profile to one marks both active because they represent the same native harness state.
+
+Reset `settings.json` to the built-in defaults:
+
+```sh
+lazyagents settings reset
+lazyagents settings reset --yes
+```
+
+Reset asks for confirmation when the file already exists. `--yes` skips the prompt.
 
 ## How It Works
 
@@ -161,7 +204,8 @@ Disabled MCP entries are validated and emitted to harness configs as disabled en
   "name": "Work",
   "description": "",
   "models": {
-    "codex": "gpt-5.2"
+    "codex": "gpt-5.2",
+    "codex-max": "gpt-5.2-high"
   },
   "permissions": {
     "codex": "on-request"

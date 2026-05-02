@@ -42,11 +42,11 @@ fn profile_active_reasons(
     let state = LazyagentsState::load(&env.lazyagents_home.join("state.json"))?;
     for (harness, profile) in state.active_profiles {
         if profile.as_str() == name {
-            reasons.push(format!("state marks it active for {}", harness.id()));
+            reasons.push(format!("state marks it active for {harness}"));
         }
     }
 
-    for integration in registry.all() {
+    for integration in registry.all(env)? {
         let paths = integration.paths(env)?;
         let mut linked = Vec::new();
         for surface in integration.managed_surfaces(&paths) {
@@ -57,7 +57,7 @@ fn profile_active_reasons(
         if !linked.is_empty() {
             reasons.push(format!(
                 "{} config links to it at {}",
-                integration.kind().display_name(),
+                integration.display_name(),
                 linked.join(", ")
             ));
         }

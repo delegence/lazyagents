@@ -9,7 +9,9 @@ use std::process::Command as ProcessCommand;
 use crate::app::create_profile::{create_profile, CreateProfileResult};
 use crate::app::doctor::{doctor_report, DoctorReport, HarnessStatus};
 use crate::app::edit_profile::edit_profile_path;
-use crate::app::harness_registry::{BuiltInHarnessRegistry, HarnessRegistry};
+use crate::app::harness_registry::{
+    reset_settings, settings_path, BuiltInHarnessRegistry, HarnessRegistry,
+};
 use crate::app::inspect_profile::inspect_profile;
 use crate::app::state::{LazyagentsHomeLock, LazyagentsState};
 use crate::app::use_profile::{
@@ -41,12 +43,24 @@ pub fn run() -> Result<()> {
             println!();
         }
         Some(Command::Doctor) => print_doctor(&runtime_env, &store)?,
+        Some(Command::Settings(settings)) => match settings.command {
+            args::SettingsCommand::Reset(args) => {
+                let path = settings_path(&runtime_env);
+                if path.exists() && !args.yes && !confirm_settings_reset(&path)? {
+                    println!("Settings reset cancelled");
+                    return Ok(());
+                }
+                let _lock = LazyagentsHomeLock::acquire(&home_path)?;
+                let path = reset_settings(&runtime_env)?;
+                println!("Reset settings at {}", render_path(&path));
+            }
+        },
         Some(Command::Create(args)) => {
             let profile = ProfileName::parse(args.name)?;
             let from = args
                 .from
                 .as_deref()
-                .map(|id| registry.require_kind(id))
+                .map(|id| registry.require_id(&runtime_env, id))
                 .transpose()?;
             let _lock = LazyagentsHomeLock::acquire(&home_path)?;
             match create_profile(&registry, &runtime_env, &store, profile, from)? {
@@ -103,10 +117,13 @@ pub fn run() -> Result<()> {
             );
             println!();
             println!("Preferences:");
-            println!(" Model: {}", render_preferences(&registry, &summary.models));
+            println!(
+                " Model: {}",
+                render_preferences(&registry, &runtime_env, &summary.models)?
+            );
             println!(
                 " Permission: {}",
-                render_preferences(&registry, &summary.permissions)
+                render_preferences(&registry, &runtime_env, &summary.permissions)?
             );
             println!();
             println!(
@@ -155,7 +172,7 @@ pub fn run() -> Result<()> {
                     if index == 0 {
                         println!("Drift:");
                     }
-                    println!(" {}:", harness.display_name());
+                    println!(" {}:", harness);
                     print_drift_report(&drift, "  ");
                 }
             }
@@ -186,36 +203,33 @@ pub fn run() -> Result<()> {
             let _lock = LazyagentsHomeLock::acquire(&home_path)?;
             match args.target() {
                 UseTarget::Harness(harness_id) => {
-                    let kind = registry.require_kind(&harness_id)?;
+                    let id = registry.require_id(&runtime_env, &harness_id)?;
                     let outcome = use_profile_workflow(
                         &registry,
                         &runtime_env,
                         &store,
                         UseProfileRequest {
                             profile: profile.clone(),
-                            target: UseProfileTarget::Harness(kind),
+                            target: UseProfileTarget::Harness(id.clone()),
                             drift_decision: args.drift_decision(),
                         },
                     )?;
                     let result = match outcome {
                         UseProfileOutcome::Applied(result) => result,
                         UseProfileOutcome::NeedsSingleHarnessDriftDecision {
-                            harness,
+                            display_name,
                             profile,
                             drift,
                         } => {
-                            let decision = prompt_single_drift_decision(
-                                harness.display_name(),
-                                &profile,
-                                &drift,
-                            )?;
+                            let decision =
+                                prompt_single_drift_decision(&display_name, &profile, &drift)?;
                             match use_profile_workflow(
                                 &registry,
                                 &runtime_env,
                                 &store,
                                 UseProfileRequest {
                                     profile: profile.clone(),
-                                    target: UseProfileTarget::Harness(kind),
+                                    target: UseProfileTarget::Harness(id),
                                     drift_decision: Some(decision),
                                 },
                             )? {
@@ -231,15 +245,18 @@ pub fn run() -> Result<()> {
                         ProfileUseStatus::Applied => {
                             println!(
                                 "Used profile {} with {}",
-                                result.profile,
-                                result.harness.display_name()
+                                result.profile, result.display_name
                             );
+                            if !result.alias_updates.is_empty() {
+                                println!(
+                                    "Also marked {} active because they share configDir with {}",
+                                    result.alias_updates.join(", "),
+                                    result.harness
+                                );
+                            }
                         }
                         ProfileUseStatus::CancelledForDrift => {
-                            println!(
-                                "Use cancelled because {} has drift",
-                                result.harness.display_name()
-                            );
+                            println!("Use cancelled because {} has drift", result.display_name);
                         }
                     }
                 }
@@ -259,7 +276,7 @@ pub fn run() -> Result<()> {
                         UseProfileOutcome::NeedsAllHarnessDriftDecision { harnesses } => {
                             let names = harnesses
                                 .iter()
-                                .map(|drift| drift.harness.display_name())
+                                .map(|drift| drift.display_name.as_str())
                                 .collect::<Vec<_>>();
                             if !prompt_all_drift_discard(&harnesses)? {
                                 anyhow::bail!(
@@ -288,10 +305,10 @@ pub fn run() -> Result<()> {
 
                     let mut summary = Vec::new();
                     for res in results.applied {
-                        summary.push(format!("✅ {} applied", res.harness.display_name()));
+                        summary.push(format!("✅ {} applied", res.display_name));
                     }
-                    for (harness, e) in results.failures {
-                        summary.push(format!("❌ {} failed: {}", harness.display_name(), e));
+                    for (_harness, display_name, e) in results.failures {
+                        summary.push(format!("❌ {} failed: {}", display_name, e));
                     }
 
                     println!("\nSummary:");
@@ -324,13 +341,14 @@ fn render_mcp_resource_list(summary: &crate::profile::McpSummary) -> String {
 
 fn render_preferences(
     registry: &dyn HarnessRegistry,
+    runtime_env: &AppEnvironment,
     values: &std::collections::BTreeMap<String, serde_json::Value>,
-) -> String {
-    registry
-        .all()
+) -> Result<String> {
+    Ok(registry
+        .all(runtime_env)?
         .into_iter()
         .map(|integration| {
-            let id = integration.kind().id();
+            let id = integration.instance_id();
             let value = values
                 .get(id)
                 .map(render_json_value)
@@ -338,7 +356,7 @@ fn render_preferences(
             format!("{id}={value}")
         })
         .collect::<Vec<_>>()
-        .join(" | ")
+        .join(" | "))
 }
 
 fn profile_drift_reports(
@@ -346,11 +364,11 @@ fn profile_drift_reports(
     runtime_env: &AppEnvironment,
     store: &ProfileStore,
     profile: &ProfileName,
-) -> Result<Vec<(crate::harness::kind::HarnessKind, DriftReport)>> {
+) -> Result<Vec<(String, DriftReport)>> {
     let state = LazyagentsState::load(&runtime_env.lazyagents_home.join("state.json"))?;
     let mut reports = Vec::new();
-    for integration in registry.all() {
-        if state.active_profiles.get(&integration.kind()) != Some(profile) {
+    for integration in registry.all(runtime_env)? {
+        if state.active_profiles.get(integration.instance_id()) != Some(profile) {
             continue;
         }
         if !matches!(
@@ -363,7 +381,7 @@ fn profile_drift_reports(
         let paths = integration.paths(runtime_env)?;
         let drift = integration.detect_drift(&active, &paths)?;
         if !drift.is_clean() {
-            reports.push((integration.kind(), drift));
+            reports.push((integration.display_name().to_string(), drift));
         }
     }
     Ok(reports)
@@ -392,6 +410,7 @@ fn active_profile_for_show(
     Ok(ProfileRef {
         name: name.clone(),
         path,
+        harness_id: integration.instance_id().to_string(),
     })
 }
 
@@ -422,6 +441,17 @@ fn open_editor_or_print_path(path: &std::path::Path) -> Result<bool> {
 
 fn confirm_delete(name: &str) -> Result<bool> {
     print!("Delete profile {name}? [y/N] ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(matches!(input.trim(), "y" | "Y" | "yes" | "YES"))
+}
+
+fn confirm_settings_reset(path: &std::path::Path) -> Result<bool> {
+    print!(
+        "Reset settings at {} to defaults? This removes custom harness instances. [y/N] ",
+        render_path(path)
+    );
     io::stdout().flush()?;
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
@@ -462,7 +492,7 @@ fn prompt_all_drift_discard(harnesses: &[HarnessDrift]) -> Result<bool> {
 
     let joined = harnesses
         .iter()
-        .map(|drift| drift.harness.display_name())
+        .map(|drift| drift.display_name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
     if !io::stdin().is_terminal() {
@@ -474,8 +504,7 @@ fn prompt_all_drift_discard(harnesses: &[HarnessDrift]) -> Result<bool> {
         println!();
         println!(
             "  {} has drift in currently selected profile {}:",
-            harness.harness.display_name(),
-            harness.profile
+            harness.display_name, harness.profile
         );
         print_drift_report(&harness.drift, "    ");
     }
@@ -511,10 +540,27 @@ fn print_harness_doctor(rows: &[HarnessStatus]) {
 
     let names = rows
         .iter()
-        .map(|row| row.harness.id())
+        .map(|row| row.harness.as_str())
         .collect::<Vec<_>>()
         .join(", ");
     println!("[✓] Harnesses ({} available: {})", rows.len(), names);
+    for row in rows {
+        if !row.config_dir_exists {
+            println!(
+                "  - {} configDir missing ({})",
+                row.harness,
+                render_path(&row.config_dir)
+            );
+        }
+        if let Some(shared) = &row.shared_config_with {
+            println!(
+                "  - {} shares configDir with {} ({})",
+                row.harness,
+                shared,
+                render_path(&row.config_dir)
+            );
+        }
+    }
 }
 
 fn print_profile_doctor(report: &DoctorReport) {

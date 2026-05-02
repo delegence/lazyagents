@@ -28,7 +28,8 @@ The tool is local-first:
 ## Core Terms
 
 - **Profile**: reusable saved configuration stored under `~/.lazyagents/profiles/<name>`.
-- **Harness**: supported external runtime such as Codex, Claude Code, OpenCode, or Pi.
+- **Harness Type**: supported external runtime behavior such as Codex, Claude Code, Gemini CLI, OpenCode, or Pi.
+- **Harness Instance**: configured target in `settings.json` with an id, type, binary, and config directory.
 - **Profile Use**: applying a profile to one harness or all detected harnesses.
 - **Active Profile**: profile recorded in `state.json` as last successfully used for a harness.
 - **Managed Surface**: harness config path that `lazyagents` owns during profile use.
@@ -36,7 +37,7 @@ The tool is local-first:
 - **Backup**: latest copied snapshot of managed surfaces for one harness.
 - **Rollback**: internal restore from backup after failed profile use.
 
-Avoid using "agent" for both sides of the system. Use **Profile** for the saved bundle and **Harness** for the external tool.
+Avoid using "agent" for both sides of the system. Use **Profile** for the saved bundle and **Harness** for the external tool. Use **Harness Type** for behavior and **Harness Instance** for configured targets.
 
 ## Source Layers
 
@@ -90,6 +91,27 @@ profiles/<name>/
 - `commands/`
 
 Profile names are represented by `ProfileName` and must be validated at boundaries. Do not silently normalize profile names.
+
+## Harness Settings
+
+`~/.lazyagents/settings.json` is created automatically when missing and is the source of truth for harness instances:
+
+```json
+{
+  "harnesses": {
+    "codex": {
+      "type": "codex",
+      "displayName": "Codex",
+      "binary": "codex",
+      "configDir": "~/.codex"
+    }
+  }
+}
+```
+
+`type` selects integration behavior. `configDir` selects the native harness home. Integrations derive all managed paths from `configDir`; per-surface path overrides are intentionally unsupported. `displayName` and `binary` are optional and default from the harness type.
+
+State and profile preferences are keyed by harness instance id. If two instances have the same type and normalized `configDir`, they are aliases for the same native state; profile use updates active state for every alias in that group. Doctor reports shared config directories.
 
 ## Profile Config
 
@@ -335,7 +357,7 @@ Use focused harness-specific tests for native format quirks, config preservation
 ## Coding Choices
 
 - Keep changes simple and explicit.
-- Prefer typed domain values at boundaries, especially `ProfileName` and `HarnessKind`.
+- Prefer typed domain values at boundaries, especially `ProfileName`, harness type, and harness instance id.
 - Prefer standard library plus well-known crates.
 - Use structured parsers for JSON and TOML rather than string manipulation.
 - Patch native config files; preserve unrelated settings.

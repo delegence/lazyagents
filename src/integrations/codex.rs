@@ -34,8 +34,11 @@ impl HarnessIntegration for CodexIntegration {
         Ok(detect_binary(env, self.kind().binary_name()))
     }
 
-    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-        let config_dir = env.user_home.join(".codex");
+    fn default_config_dir(&self, env: &AppEnvironment) -> std::path::PathBuf {
+        env.user_home.join(".codex")
+    }
+
+    fn paths_from_config_dir(&self, config_dir: std::path::PathBuf) -> Result<HarnessConfigPaths> {
         Ok(HarnessConfigPaths {
             instruction_target: config_dir.join("AGENTS.md"),
             skills_dir: config_dir.join("skills"),
@@ -44,6 +47,10 @@ impl HarnessIntegration for CodexIntegration {
             mcp_file: config_dir.join("config.toml"),
             config_dir,
         })
+    }
+
+    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
+        self.paths_from_config_dir(self.default_config_dir(env))
     }
 
     fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
@@ -176,13 +183,13 @@ fn patch_codex_config(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Resul
     let mut document = read_config(&paths.settings_file)?;
 
     if let Some(model) = non_default_string(
-        profile_config.model_preference(crate::harness::kind::HarnessKind::Codex),
+        profile_config.model_preference(&profile.harness_id),
         "Model Preference",
     )? {
         document["model"] = value(model);
     }
     if let Some(permission) = non_default_string(
-        profile_config.permission_preference(crate::harness::kind::HarnessKind::Codex),
+        profile_config.permission_preference(&profile.harness_id),
         "Permission Preference",
     )? {
         document["approval_policy"] = value(permission);
@@ -451,14 +458,8 @@ Authorization = "TOKEN"
             .unwrap();
         }
         fn assert_drift_saved(&self, config: &ProfileConfig) {
-            assert_eq!(
-                config.model_preference(crate::harness::kind::HarnessKind::Codex),
-                "drift-model"
-            );
-            assert_eq!(
-                config.permission_preference(crate::harness::kind::HarnessKind::Codex),
-                "drift-perm"
-            );
+            assert_eq!(config.model_preference("codex"), "drift-model");
+            assert_eq!(config.permission_preference("codex"), "drift-perm");
         }
         fn write_profile_config(&self, profile: &Path) {
             crate::integrations::test_suite::template::write_config(

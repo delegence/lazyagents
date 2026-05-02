@@ -15,7 +15,7 @@ pub fn detect_binary(env: &AppEnvironment, binary_name: &str) -> HarnessDetectio
 }
 
 #[cfg(unix)]
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     fs::metadata(path)
@@ -24,7 +24,7 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     path.is_file()
 }
 

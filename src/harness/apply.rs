@@ -3,7 +3,6 @@ use anyhow::{Context, Result};
 use crate::harness::integration::{
     AppEnvironment, HarnessConfigPaths, HarnessIntegration, ProfileRef,
 };
-use crate::harness::kind::HarnessKind;
 use crate::harness::managed::{clear_surfaces, ManagedBackup};
 use crate::profile::{ProfileName, ProfileStore};
 
@@ -15,7 +14,9 @@ pub enum ProfileUseStatus {
 
 #[derive(Debug, Clone)]
 pub struct ProfileUseResult {
-    pub harness: HarnessKind,
+    pub harness: String,
+    pub display_name: String,
+    pub alias_updates: Vec<String>,
     pub profile: ProfileName,
     pub status: ProfileUseStatus,
 }
@@ -32,10 +33,11 @@ where
 {
     profile_store.normalize_optional_artifacts(profile)?;
     let paths = integration.paths(env)?;
-    let target_profile = load_profile(profile_store, profile);
+    let target_profile = load_profile(profile_store, profile, integration.instance_id());
     integration.preflight(&target_profile)?;
     let surfaces = integration.managed_surfaces(&paths);
-    let backup = ManagedBackup::capture(&env.lazyagents_home, integration.kind(), &surfaces)?;
+    let backup =
+        ManagedBackup::capture(&env.lazyagents_home, integration.instance_id(), &surfaces)?;
     if let Err(error) =
         apply_transaction(integration, &target_profile, &paths, &surfaces).and_then(|_| commit())
     {
@@ -59,10 +61,15 @@ fn apply_transaction(
     Ok(())
 }
 
-fn load_profile(profile_store: &ProfileStore, profile: &ProfileName) -> ProfileRef {
+fn load_profile(
+    profile_store: &ProfileStore,
+    profile: &ProfileName,
+    harness_id: &str,
+) -> ProfileRef {
     ProfileRef {
         name: profile.clone(),
         path: profile_store.profile_dir(profile),
+        harness_id: harness_id.to_string(),
     }
 }
 
@@ -79,6 +86,7 @@ mod tests {
     use crate::harness::drift::DriftItem;
     use crate::harness::drift::DriftReport;
     use crate::harness::integration::{HarnessDetection, ImportedPreference, ProfileImport};
+    use crate::harness::kind::HarnessKind;
     use crate::harness::managed::ManagedSurface;
     use crate::profile::LazyagentsHome;
 
@@ -102,8 +110,8 @@ mod tests {
         let mut state = LazyagentsState::load(&state_path)?;
         let active_profile = state
             .active_profiles
-            .get(&integration.kind())
-            .map(|name| load_profile(profile_store, name));
+            .get(integration.instance_id())
+            .map(|name| load_profile(profile_store, name, integration.instance_id()));
 
         let drift = match active_profile.as_ref() {
             Some(active) => integration.detect_drift(active, &paths)?,
@@ -114,7 +122,9 @@ mod tests {
             match policy {
                 DriftPolicy::Cancel => {
                     return Ok(ProfileUseResult {
-                        harness: integration.kind(),
+                        harness: integration.instance_id().to_string(),
+                        display_name: integration.display_name().to_string(),
+                        alias_updates: Vec::new(),
                         profile: profile.clone(),
                         status: ProfileUseStatus::CancelledForDrift,
                     });
@@ -123,7 +133,11 @@ mod tests {
                 DriftPolicy::SaveChanges => {
                     let imported = integration.import_from_harness(&paths)?;
                     if let Some(active) = active_profile.as_ref() {
-                        profile_store.apply_import(&active.name, integration.kind(), imported)?;
+                        profile_store.apply_import(
+                            &active.name,
+                            integration.instance_id(),
+                            imported,
+                        )?;
                     }
                 }
             }
@@ -132,12 +146,14 @@ mod tests {
         apply_profile_to_harness_with_commit(integration, env, profile_store, profile, || {
             state
                 .active_profiles
-                .insert(integration.kind(), profile.clone());
+                .insert(integration.instance_id().to_string(), profile.clone());
             state.save(&state_path)
         })?;
 
         Ok(ProfileUseResult {
-            harness: integration.kind(),
+            harness: integration.instance_id().to_string(),
+            display_name: integration.display_name().to_string(),
+            alias_updates: Vec::new(),
             profile: profile.clone(),
             status: ProfileUseStatus::Applied,
         })
@@ -145,7 +161,7 @@ mod tests {
 
     struct UseProfileAllResult {
         applied: Vec<ProfileUseResult>,
-        failures: Vec<(HarnessKind, anyhow::Error)>,
+        failures: Vec<(String, anyhow::Error)>,
     }
 
     fn use_profile_all<F>(
@@ -165,14 +181,14 @@ mod tests {
             let state = LazyagentsState::load(&env.lazyagents_home.join("state.json"))?;
             let active_profile = state
                 .active_profiles
-                .get(&integration.kind())
-                .map(|name| load_profile(profile_store, name));
+                .get(integration.instance_id())
+                .map(|name| load_profile(profile_store, name, integration.instance_id()));
             let drift = match active_profile.as_ref() {
                 Some(active) => integration.detect_drift(active, &paths)?,
                 None => DriftReport::clean(),
             };
             if !drift.is_clean() {
-                drifted_harnesses.push(integration.kind().display_name().to_string());
+                drifted_harnesses.push(integration.display_name().to_string());
             }
         }
 
@@ -203,7 +219,9 @@ mod tests {
                     ProfileUseStatus::Applied => results.applied.push(res),
                     ProfileUseStatus::CancelledForDrift => {}
                 },
-                Err(e) => results.failures.push((integration.kind(), e)),
+                Err(e) => results
+                    .failures
+                    .push((integration.instance_id().to_string(), e)),
             }
         }
 
@@ -248,6 +266,21 @@ mod tests {
             HarnessKind::Codex
         }
 
+        fn default_config_dir(&self, _env: &AppEnvironment) -> PathBuf {
+            self.root.clone()
+        }
+
+        fn paths_from_config_dir(&self, config_dir: PathBuf) -> Result<HarnessConfigPaths> {
+            Ok(HarnessConfigPaths {
+                instruction_target: config_dir.join("AGENTS.md"),
+                skills_dir: config_dir.join("skills"),
+                commands_dir: config_dir.join("commands"),
+                settings_file: config_dir.join("settings.json"),
+                mcp_file: config_dir.join("mcp.json"),
+                config_dir,
+            })
+        }
+
         fn detect(&self, _env: &AppEnvironment) -> Result<HarnessDetection> {
             Ok(HarnessDetection::Detected {
                 binary_path: self.root.join("bin").join("fake"),
@@ -255,14 +288,7 @@ mod tests {
         }
 
         fn paths(&self, _env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-            Ok(HarnessConfigPaths {
-                config_dir: self.root.clone(),
-                instruction_target: self.root.join("AGENTS.md"),
-                skills_dir: self.root.join("skills"),
-                commands_dir: self.root.join("commands"),
-                settings_file: self.root.join("settings.json"),
-                mcp_file: self.root.join("mcp.json"),
-            })
+            self.paths_from_config_dir(self.root.clone())
         }
 
         fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
@@ -447,22 +473,13 @@ mod tests {
 
         let active_config = store.load_config(&active).unwrap();
         let target_config = store.load_config(&target).unwrap();
+        assert_eq!(active_config.model_preference("codex"), "imported-model");
         assert_eq!(
-            active_config.model_preference(crate::harness::kind::HarnessKind::Codex),
-            "imported-model"
-        );
-        assert_eq!(
-            active_config.permission_preference(crate::harness::kind::HarnessKind::Codex),
+            active_config.permission_preference("codex"),
             serde_json::json!({"bash":"allow"})
         );
-        assert_eq!(
-            active_config.model_preference(crate::harness::kind::HarnessKind::Claude),
-            "default"
-        );
-        assert_eq!(
-            target_config.model_preference(crate::harness::kind::HarnessKind::Codex),
-            "default"
-        );
+        assert_eq!(active_config.model_preference("claude"), "default");
+        assert_eq!(target_config.model_preference("codex"), "default");
     }
 
     #[test]
@@ -521,18 +538,24 @@ mod tests {
             fn kind(&self) -> HarnessKind {
                 HarnessKind::Claude
             }
+            fn default_config_dir(&self, _e: &AppEnvironment) -> PathBuf {
+                self.root.clone()
+            }
+            fn paths_from_config_dir(&self, config_dir: PathBuf) -> Result<HarnessConfigPaths> {
+                Ok(HarnessConfigPaths {
+                    instruction_target: config_dir.join("CLAUDE.md"),
+                    skills_dir: config_dir.join("skills"),
+                    commands_dir: config_dir.join("commands"),
+                    settings_file: config_dir.join("settings.json"),
+                    mcp_file: config_dir.join("settings.json"),
+                    config_dir,
+                })
+            }
             fn detect(&self, _e: &AppEnvironment) -> Result<HarnessDetection> {
                 Ok(HarnessDetection::NotDetected)
             }
             fn paths(&self, _e: &AppEnvironment) -> Result<HarnessConfigPaths> {
-                Ok(HarnessConfigPaths {
-                    instruction_target: self.root.join("CLAUDE.md"),
-                    skills_dir: self.root.join("skills"),
-                    commands_dir: self.root.join("commands"),
-                    settings_file: self.root.join("settings.json"),
-                    mcp_file: self.root.join("settings.json"),
-                    config_dir: self.root.clone(),
-                })
+                self.paths_from_config_dir(self.root.clone())
             }
             fn managed_surfaces(&self, _p: &HarnessConfigPaths) -> Vec<ManagedSurface> {
                 vec![]
@@ -577,9 +600,9 @@ mod tests {
             use_profile_all(&integrations, &env, &store, &profile, true, |_| Ok(true)).unwrap();
 
         assert_eq!(results.applied.len(), 1);
-        assert_eq!(results.applied[0].harness, HarnessKind::Codex);
+        assert_eq!(results.applied[0].harness, "codex");
         assert_eq!(results.failures.len(), 1);
-        assert_eq!(results.failures[0].0, HarnessKind::Claude);
+        assert_eq!(results.failures[0].0, "claude");
         assert!(results.failures[0].1.to_string().contains("apply failure"));
     }
 }

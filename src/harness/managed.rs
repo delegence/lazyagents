@@ -51,15 +51,15 @@ pub struct ManagedBackup {
 impl ManagedBackup {
     pub fn capture(
         lazyagents_home: &Path,
-        harness_kind: crate::harness::kind::HarnessKind,
+        harness_id: &str,
         surfaces: &[ManagedSurface],
     ) -> Result<Self> {
         let backups_root = lazyagents_home.join("backups");
         fs::create_dir_all(&backups_root)
             .with_context(|| format!("failed to create backups dir {}", backups_root.display()))?;
 
-        let backup_dir = backups_root.join(harness_kind.id());
-        let temp_dir = backups_root.join(format!(".{}.tmp", harness_kind.id()));
+        let backup_dir = backups_root.join(harness_id);
+        let temp_dir = backups_root.join(format!(".{harness_id}.tmp"));
 
         if temp_dir.exists() {
             fs::remove_dir_all(&temp_dir)
@@ -424,7 +424,8 @@ mod tests {
         ];
 
         // Capture
-        let backup = ManagedBackup::capture(&lazyagents_home, harness_kind, &surfaces).unwrap();
+        let backup =
+            ManagedBackup::capture(&lazyagents_home, harness_kind.id(), &surfaces).unwrap();
 
         // Assert backup is on disk
         let backup_dir = lazyagents_home.join("backups").join(harness_kind.id());
@@ -501,7 +502,7 @@ mod tests {
 
         let surfaces = vec![ManagedSurface::file(&first), ManagedSurface::file(&second)];
 
-        ManagedBackup::capture(&lazyagents_home, harness_kind, &surfaces).unwrap();
+        ManagedBackup::capture(&lazyagents_home, harness_kind.id(), &surfaces).unwrap();
 
         let backup_dir = lazyagents_home.join("backups").join(harness_kind.id());
         assert_eq!(
@@ -543,7 +544,8 @@ mod tests {
         let surfaces = vec![ManagedSurface::directory(&dir_path)];
 
         // Capture backup
-        let backup = ManagedBackup::capture(&lazyagents_home, harness_kind, &surfaces).unwrap();
+        let backup =
+            ManagedBackup::capture(&lazyagents_home, harness_kind.id(), &surfaces).unwrap();
 
         // Check backup dir doesn't contain hidden files
         let backup_dir = lazyagents_home.join("backups").join(harness_kind.id());
@@ -586,7 +588,8 @@ mod tests {
         fs::write(&file_path, "before").unwrap();
         let surfaces = vec![ManagedSurface::file(&file_path)];
 
-        let backup = ManagedBackup::capture(&lazyagents_home, harness_kind, &surfaces).unwrap();
+        let backup =
+            ManagedBackup::capture(&lazyagents_home, harness_kind.id(), &surfaces).unwrap();
         fs::write(
             lazyagents_home
                 .join("backups")

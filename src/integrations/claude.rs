@@ -35,16 +35,32 @@ impl HarnessIntegration for ClaudeIntegration {
         Ok(detect_binary(env, self.kind().binary_name()))
     }
 
-    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-        let config_dir = env.user_home.join(".claude");
+    fn default_config_dir(&self, env: &AppEnvironment) -> std::path::PathBuf {
+        env.user_home.join(".claude")
+    }
+
+    fn paths_from_config_dir(&self, config_dir: std::path::PathBuf) -> Result<HarnessConfigPaths> {
+        let mcp_file_name = config_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| format!("{name}.json"))
+            .unwrap_or_else(|| ".claude.json".to_string());
+        let mcp_file = config_dir
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""))
+            .join(mcp_file_name);
         Ok(HarnessConfigPaths {
             instruction_target: config_dir.join("CLAUDE.md"),
             skills_dir: config_dir.join("skills"),
             commands_dir: config_dir.join("commands"),
             settings_file: config_dir.join("settings.json"),
-            mcp_file: env.user_home.join(".claude.json"),
+            mcp_file,
             config_dir,
         })
+    }
+
+    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
+        self.paths_from_config_dir(self.default_config_dir(env))
     }
 
     fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
@@ -176,14 +192,12 @@ fn patch_claude_config(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Resu
     let profile_config = read_profile_config(&profile.path)?;
     let mut document = read_json(&paths.settings_file)?;
 
-    if let Some(model) = non_default_value(
-        profile_config.model_preference(crate::harness::kind::HarnessKind::Claude),
-    ) {
+    if let Some(model) = non_default_value(profile_config.model_preference(&profile.harness_id)) {
         document.insert("primaryModel".to_string(), model);
     }
-    if let Some(permission) = non_default_value(
-        profile_config.permission_preference(crate::harness::kind::HarnessKind::Claude),
-    ) {
+    if let Some(permission) =
+        non_default_value(profile_config.permission_preference(&profile.harness_id))
+    {
         patch_claude_permissions(&mut document, permission)?;
     }
 
@@ -447,12 +461,9 @@ mod tests {
             .unwrap();
         }
         fn assert_drift_saved(&self, config: &ProfileConfig) {
+            assert_eq!(config.model_preference("claude"), "drift-model");
             assert_eq!(
-                config.model_preference(crate::harness::kind::HarnessKind::Claude),
-                "drift-model"
-            );
-            assert_eq!(
-                config.permission_preference(crate::harness::kind::HarnessKind::Claude),
+                config.permission_preference("claude"),
                 serde_json::json!({"defaultMode": "drift-perm"})
             );
         }

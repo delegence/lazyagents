@@ -35,8 +35,11 @@ impl HarnessIntegration for PiIntegration {
         Ok(detect_binary(env, self.kind().binary_name()))
     }
 
-    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-        let config_dir = env.user_home.join(".pi").join("agent");
+    fn default_config_dir(&self, env: &AppEnvironment) -> std::path::PathBuf {
+        env.user_home.join(".pi").join("agent")
+    }
+
+    fn paths_from_config_dir(&self, config_dir: std::path::PathBuf) -> Result<HarnessConfigPaths> {
         Ok(HarnessConfigPaths {
             instruction_target: config_dir.join("AGENTS.md"),
             skills_dir: config_dir.join("skills"),
@@ -45,6 +48,10 @@ impl HarnessIntegration for PiIntegration {
             mcp_file: config_dir.join("settings.json"),
             config_dir,
         })
+    }
+
+    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
+        self.paths_from_config_dir(self.default_config_dir(env))
     }
 
     fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
@@ -155,7 +162,7 @@ fn patch_pi_settings(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result
     let mut document = read_pi_settings(&paths.settings_file)?;
 
     if let Some(model) = non_default_string(
-        profile_config.model_preference(crate::harness::kind::HarnessKind::Pi),
+        profile_config.model_preference(&profile.harness_id),
         "Pi model preference",
     )? {
         patch_pi_model_preference(&mut document, &model);
@@ -270,14 +277,8 @@ mod tests {
             .unwrap();
         }
         fn assert_drift_saved(&self, config: &ProfileConfig) {
-            assert_eq!(
-                config.model_preference(crate::harness::kind::HarnessKind::Pi),
-                "openai/drift-model"
-            );
-            assert_eq!(
-                config.permission_preference(crate::harness::kind::HarnessKind::Pi),
-                "default"
-            );
+            assert_eq!(config.model_preference("pi"), "openai/drift-model");
+            assert_eq!(config.permission_preference("pi"), "default");
         }
         fn write_profile_config(&self, profile: &Path) {
             crate::integrations::test_suite::template::write_config(

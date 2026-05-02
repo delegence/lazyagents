@@ -21,16 +21,16 @@ impl ProfileConfig {
         }
     }
 
-    pub fn model_preference(&self, harness_kind: crate::harness::kind::HarnessKind) -> Value {
+    pub fn model_preference(&self, harness_id: &str) -> Value {
         self.models
-            .get(harness_kind.id())
+            .get(harness_id)
             .cloned()
             .unwrap_or_else(default_preference_value)
     }
 
-    pub fn permission_preference(&self, harness_kind: crate::harness::kind::HarnessKind) -> Value {
+    pub fn permission_preference(&self, harness_id: &str) -> Value {
         self.permissions
-            .get(harness_kind.id())
+            .get(harness_id)
             .cloned()
             .unwrap_or_else(default_preference_value)
     }
@@ -73,18 +73,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            config.model_preference(crate::harness::kind::HarnessKind::Codex),
-            "gpt-5"
-        );
-        assert_eq!(
-            config.model_preference(crate::harness::kind::HarnessKind::OpenCode),
-            "default"
-        );
-        assert_eq!(
-            config.permission_preference(crate::harness::kind::HarnessKind::OpenCode),
-            "default"
-        );
+        assert_eq!(config.model_preference("codex"), "gpt-5");
+        assert_eq!(config.model_preference("opencode"), "default");
+        assert_eq!(config.permission_preference("opencode"), "default");
     }
 
     #[test]
@@ -95,7 +86,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            config.permission_preference(crate::harness::kind::HarnessKind::OpenCode),
+            config.permission_preference("opencode"),
             serde_json::json!({"*":"ask","bash":"allow"})
         );
     }

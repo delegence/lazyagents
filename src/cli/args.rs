@@ -17,6 +17,8 @@ pub struct Cli {
 pub enum Command {
     /// Show harness and profile health
     Doctor,
+    /// Manage lazyagents settings
+    Settings(SettingsArgs),
     /// Create a new profile skeleton or import from a harness
     Create(CreateArgs),
     /// Show details and validation status of a specific profile
@@ -27,6 +29,24 @@ pub enum Command {
     Delete(DeleteArgs),
     /// Apply a profile to one or more harnesses
     Use(UseArgs),
+}
+
+#[derive(Subcommand)]
+pub enum SettingsCommand {
+    /// Reset settings.json to the built-in defaults
+    Reset(SettingsResetArgs),
+}
+
+#[derive(Args)]
+pub struct SettingsArgs {
+    #[command(subcommand)]
+    pub command: SettingsCommand,
+}
+
+#[derive(Args)]
+pub struct SettingsResetArgs {
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Args)]

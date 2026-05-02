@@ -9,7 +9,7 @@ The goal is that a new harness is added as one concrete integration file plus sm
 Keep the dependency direction intact:
 
 - `src/profile/` owns profile names, config, neutral MCP parsing, validation, summaries, and profile filesystem storage.
-- `src/harness/` owns generic harness primitives and mechanics: `HarnessKind`, `HarnessIntegration`, config paths, managed surfaces, drift report types, artifact helpers, transactional apply, backup/rollback, symlink helpers, and atomic writes.
+- `src/harness/` owns generic harness primitives and mechanics: harness type/instance values, `HarnessIntegration`, config paths, managed surfaces, drift report types, artifact helpers, transactional apply, backup/rollback, symlink helpers, and atomic writes.
 - `src/integrations/` owns concrete harness implementations. Put one harness per file.
 - `src/app/` owns product workflows and composition, including the built-in harness registry.
 - `src/cli/` owns terminal-specific parsing, prompts, rendering, and `$EDITOR` execution.
@@ -24,7 +24,6 @@ For a new harness named `Example`, expect to update:
 src/harness/kind.rs
 src/integrations/example.rs
 src/integrations/mod.rs
-src/app/harness_registry.rs
 docs/ARCHITECTURE.md
 README.md
 ```
@@ -33,7 +32,7 @@ If the harness needs reusable filesystem or artifact logic, add it to `src/harne
 
 ## Implementation Steps
 
-1. Add a `HarnessKind` variant.
+1. Add a harness type variant.
 
 Update `src/harness/kind.rs`:
 
@@ -42,7 +41,7 @@ Update `src/harness/kind.rs`:
 - add `display_name()`
 - add `binary_name()`
 
-The `id()` value is the stable lazyagents harness id used in profile config and state serialization. Keep it lowercase and CLI-friendly.
+The `id()` value is the stable harness type id used for behavior dispatch. User-facing profile config and state are keyed by harness instance id from `settings.json`.
 
 2. Do not add a CLI harness enum.
 
@@ -57,6 +56,8 @@ pub struct ExampleIntegration;
 
 impl HarnessIntegration for ExampleIntegration {
     fn kind(&self) -> HarnessKind { ... }
+    fn default_config_dir(&self, env: &AppEnvironment) -> PathBuf { ... }
+    fn paths_from_config_dir(&self, config_dir: PathBuf) -> Result<HarnessConfigPaths> { ... }
     fn supports_skills(&self) -> bool { ... } // optional; defaults to true
     fn supports_commands(&self) -> bool { ... } // optional; defaults to true
     fn supports_mcp(&self) -> bool { ... } // optional; defaults to true
@@ -86,15 +87,22 @@ Update `src/integrations/mod.rs`:
 pub mod example;
 ```
 
-5. Register the built-in integration.
+Then add the integration to the built-in list in the same file:
 
-Update `src/app/harness_registry.rs`:
+```rust
+pub fn built_in_integrations() -> Vec<Box<dyn HarnessIntegration>> {
+    vec![
+        Box::new(example::ExampleIntegration),
+        // existing harnesses...
+    ]
+}
+```
 
-- import `example::ExampleIntegration`
-- add `Box::new(ExampleIntegration)` to `BuiltInHarnessRegistry::all()`
-- update the registry test expected order
+5. Default settings are derived from the built-in integration.
 
-The built-in harness list lives in `app/` because it is product composition, not low-level harness mechanics.
+`src/app/harness_registry.rs` builds the default `settings.json` from `built_in_integrations()`, using each integration's `kind()`, `display_name()`, `binary_name()`, and `default_config_dir(env)`. Do not add another hardcoded default path table in `app/`.
+
+The type-to-adapter factory lives in `src/integrations/mod.rs` because it knows the concrete integration modules. User settings can add more instances of the same type with different `configDir`, `displayName`, or `binary` values.
 
 6. Add shared integration test coverage.
 
@@ -146,7 +154,7 @@ Do not leave docs saying only Codex, Claude Code, and OpenCode are supported if 
 
 ### `kind`
 
-Return the new `HarnessKind` variant.
+Return the new `HarnessKind` variant. This is the harness type, not necessarily the user-facing instance id.
 
 ### `supports_skills`, `supports_commands`, and `supports_mcp`
 
@@ -156,13 +164,13 @@ For MCP specifically, returning `false` also tells app-layer drift setup not to 
 
 ### `detect`
 
-Use `harness::fs::detect_binary(env, self.kind().binary_name())` unless the harness has a stronger detection rule.
+Use `harness::fs::detect_binary(env, self.kind().binary_name())` unless the harness has a stronger detection rule. Configured instances wrap this with their `binary` setting, so most integrations do not need custom instance-aware detection.
 
 Detection must use `AppEnvironment.path_entries`, not shell commands.
 
 ### `paths`
 
-Return all native paths derived from `env.user_home`. Do not read public path override env vars in v1.
+Return all native paths derived from `default_config_dir(env)` or `paths_from_config_dir(config_dir)`. Do not read public path override env vars or per-surface path overrides in v1.
 
 Use:
 

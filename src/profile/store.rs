@@ -130,7 +130,7 @@ impl ProfileStore {
     pub fn apply_import(
         &self,
         name: &ProfileName,
-        harness_kind: crate::harness::kind::HarnessKind,
+        harness_id: &str,
         imported: ProfileImport,
     ) -> Result<()> {
         self.normalize_optional_artifacts(name)?;
@@ -149,7 +149,7 @@ impl ProfileStore {
                 )
             })?;
         copy_dir_contents(&profile_dir, staged_dir.path())?;
-        apply_import_to_dir(staged_dir.path(), harness_kind, imported)?;
+        apply_import_to_dir(staged_dir.path(), harness_id, imported)?;
 
         let backup_dir = profiles_dir.join(format!(
             ".{}-rollback-{}",
@@ -274,7 +274,7 @@ impl ProfileStore {
 
 fn apply_import_to_dir(
     profile_dir: &Path,
-    harness_kind: crate::harness::kind::HarnessKind,
+    harness_id: &str,
     imported: ProfileImport,
 ) -> Result<()> {
     if let Some(instruction) = imported.instruction {
@@ -300,11 +300,11 @@ fn apply_import_to_dir(
 
     let mut config = load_config_from_dir(profile_dir)?;
     config.models.insert(
-        harness_kind.id().to_string(),
+        harness_id.to_string(),
         imported.model_preference.into_value(),
     );
     config.permissions.insert(
-        harness_kind.id().to_string(),
+        harness_id.to_string(),
         imported.permission_preference.into_value(),
     );
     write_config_to_dir(profile_dir, &config)
@@ -545,11 +545,7 @@ mod tests {
         let config = store.load_config(&profile_name).unwrap();
         assert_eq!(config.name.as_deref(), Some("Work"));
         assert_eq!(config.description.as_deref(), Some(""));
-        for harness in [
-            crate::harness::kind::HarnessKind::Codex,
-            crate::harness::kind::HarnessKind::Claude,
-            crate::harness::kind::HarnessKind::OpenCode,
-        ] {
+        for harness in ["codex", "claude", "opencode"] {
             assert_eq!(config.model_preference(harness), "default");
             assert_eq!(config.permission_preference(harness), "default");
         }

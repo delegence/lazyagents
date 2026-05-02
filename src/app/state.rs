@@ -6,12 +6,11 @@ use anyhow::{Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-use crate::harness::kind::HarnessKind;
 use crate::profile::ProfileName;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LazyagentsState {
-    pub active_profiles: BTreeMap<HarnessKind, ProfileName>,
+    pub active_profiles: BTreeMap<String, ProfileName>,
 }
 
 #[derive(Debug)]
@@ -91,9 +90,8 @@ impl RawState {
     fn into_state(self) -> Result<LazyagentsState> {
         let mut active_profiles = BTreeMap::new();
         for (harness, profile) in self.active_profiles {
-            let kind = parse_harness_kind(&harness)?;
             let profile = ProfileName::parse(profile)?;
-            active_profiles.insert(kind, profile);
+            active_profiles.insert(harness, profile);
         }
         Ok(LazyagentsState { active_profiles })
     }
@@ -102,20 +100,9 @@ impl RawState {
         let active_profiles = state
             .active_profiles
             .iter()
-            .map(|(harness, profile)| (harness.id().to_string(), profile.as_str().to_string()))
+            .map(|(harness, profile)| (harness.clone(), profile.as_str().to_string()))
             .collect();
         Self { active_profiles }
-    }
-}
-
-fn parse_harness_kind(id: &str) -> Result<HarnessKind> {
-    match id {
-        "codex" => Ok(HarnessKind::Codex),
-        "claude" => Ok(HarnessKind::Claude),
-        "gemini" => Ok(HarnessKind::Gemini),
-        "opencode" => Ok(HarnessKind::OpenCode),
-        "pi" => Ok(HarnessKind::Pi),
-        other => anyhow::bail!("unknown harness id in state: {other}"),
     }
 }
 
@@ -147,7 +134,7 @@ mod tests {
         let mut state = LazyagentsState::default();
         state
             .active_profiles
-            .insert(HarnessKind::Codex, ProfileName::parse("work").unwrap());
+            .insert("codex".to_string(), ProfileName::parse("work").unwrap());
 
         state.save(&path).unwrap();
         let loaded = LazyagentsState::load(&path).unwrap();
