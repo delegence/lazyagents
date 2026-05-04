@@ -224,6 +224,25 @@ fn e2e_create_from_imports_and_removes_shared_agent_skills() {
 }
 
 #[test]
+fn e2e_create_from_harness_keeps_default_instructions_when_harness_file_is_empty() {
+    let ctx = TestContext::new();
+    let codex_dir = ctx.user_home.join(".codex");
+    fs::create_dir_all(&codex_dir).unwrap();
+    fs::write(codex_dir.join("AGENTS.md"), "").unwrap();
+
+    let out = ctx.run_cli(&["create", "imported-empty", "-H", "codex"]);
+    assert!(
+        out.status.success(),
+        "create --harness failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let profile = ctx.home.join("profiles/imported-empty");
+    let text = fs::read_to_string(profile.join("PROFILE.md")).unwrap();
+    assert!(text.contains("# Imported-empty\n\nAdd profile instructions here.\n"));
+}
+
+#[test]
 fn e2e_rollback_on_failure() {
     let ctx = TestContext::new();
 
@@ -284,10 +303,14 @@ fn e2e_doctor_replaces_list_and_status() {
     let out = ctx.run_cli(&["doctor"]);
     assert!(out.status.success(), "doctor failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("[✓] Harnesses (5 available: claude, codex, gemini, opencode, pi)"));
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("Doctor summary:"));
+    assert_eq!(lines.next(), Some("[✓] LazyAgents (0.0.1)"));
+    assert!(stdout.contains("Harnesses ("));
+    assert!(stdout.contains("- codex (work)"));
     assert!(stdout.contains("[✓] Profiles"));
-    assert!(stdout.contains("- work (used by codex)"));
-    assert!(stdout.contains("- playground (unused)"));
+    assert!(stdout.contains("- work (ready)"));
+    assert!(stdout.contains("- playground (ready)"));
     assert!(!stdout.contains("HARNESS\tPROFILE"));
     assert!(!stdout.contains("PROFILE\tCONFIG"));
 
@@ -335,7 +358,7 @@ fn e2e_shared_config_dir_instances_share_active_state() {
     let doctor = ctx.run_cli(&["doctor"]);
     assert!(doctor.status.success());
     let stdout = String::from_utf8_lossy(&doctor.stdout);
-    assert!(stdout.contains("codex-work shares configDir with codex"));
+    assert!(stdout.contains("- codex-work (work, shares configDir with codex)"));
 }
 
 #[test]

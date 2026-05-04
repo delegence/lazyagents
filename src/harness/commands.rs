@@ -45,7 +45,7 @@ pub fn collect_directory_link_drift_recursive(
                 items.push(DriftItem {
                     surface: surface.to_string(),
                     detail: format!(
-                        "unexpected managed entry {}",
+                        "unexpected harness entry {}",
                         target_dir.join(&file.relative_path).display()
                     ),
                 });

@@ -6,7 +6,8 @@ use crate::app::use_profile::DriftDecision;
 #[command(
     name = "lazyagents",
     version,
-    about = "Manage reusable coding-agent profiles"
+    about = "LazyAgents - manage reusable coding-agent profiles",
+    disable_help_subcommand = true
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -17,18 +18,18 @@ pub struct Cli {
 pub enum Command {
     /// Show harness and profile health
     Doctor,
-    /// Manage lazyagents settings
-    Settings(SettingsArgs),
     /// Create a new profile skeleton or import from a harness
     Create(CreateArgs),
     /// Show details and validation status of a specific profile
     Show(ProfileArg),
+    /// Apply a profile to one or more harnesses
+    Use(UseArgs),
     /// Open a profile directory in the default editor
     Edit(ProfileArg),
     /// Delete an inactive profile
     Delete(DeleteArgs),
-    /// Apply a profile to one or more harnesses
-    Use(UseArgs),
+    /// Manage lazyagents settings
+    Settings(SettingsArgs),
 }
 
 #[derive(Subcommand)]

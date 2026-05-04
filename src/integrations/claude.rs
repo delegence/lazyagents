@@ -16,8 +16,9 @@ use crate::harness::commands::{
 };
 use crate::harness::drift::{DriftItem, DriftReport};
 use crate::harness::fs::{
-    collect_directory_link_drift, detect_binary, read_json, read_optional_string, symlink_file,
-    symlink_points_to,
+    collect_directory_link_drift, collect_instruction_content_drift, detect_binary, read_json,
+    read_optional_string, symlink_points_to, verify_profile_instructions,
+    write_profile_instructions,
 };
 use crate::harness::integration::{
     AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedFile,
@@ -29,7 +30,7 @@ use crate::harness::skills::{import_skills, link_skills, valid_skills};
 use crate::profile::mcp::{
     canonical_mcp_json, parse_mcp_definitions, read_mcp_definitions, McpDefinition, McpTransport,
 };
-use crate::profile::ProfileConfig;
+use crate::profile::{read_profile_config as read_profile_config_from_profile, ProfileConfig};
 
 pub struct ClaudeIntegration;
 
@@ -88,16 +89,7 @@ impl HarnessIntegration for ClaudeIntegration {
 
     fn detect_drift(&self, active: &ProfileRef, paths: &HarnessConfigPaths) -> Result<DriftReport> {
         let mut items = Vec::new();
-        let instruction_source = active.path.join("AGENTS.md");
-        if !symlink_points_to(&paths.instruction_target, &instruction_source) {
-            items.push(DriftItem {
-                surface: "instructions".to_string(),
-                detail: format!(
-                    "{} is not linked to active profile",
-                    paths.instruction_target.display()
-                ),
-            });
-        }
+        collect_instruction_content_drift(&active.path, &paths.instruction_target, &mut items)?;
         collect_directory_link_drift(
             "skills",
             valid_skills(&active.path)?,
@@ -162,7 +154,7 @@ impl HarnessIntegration for ClaudeIntegration {
         fs::create_dir_all(&paths.agents_dir)
             .with_context(|| format!("failed to create {}", paths.agents_dir.display()))?;
 
-        symlink_file(profile.path.join("AGENTS.md"), &paths.instruction_target)?;
+        write_profile_instructions(&profile.path, &paths.instruction_target)?;
         link_skills(profile, paths)?;
         link_commands(profile, paths)?;
         apply_rendered_agents(&render_claude_profile_agents(profile)?, &paths.agents_dir)?;
@@ -172,14 +164,7 @@ impl HarnessIntegration for ClaudeIntegration {
     }
 
     fn verify(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-        let instruction_source = profile.path.join("AGENTS.md");
-        if !symlink_points_to(&paths.instruction_target, &instruction_source) {
-            anyhow::bail!(
-                "Claude instruction target {} does not point to {}",
-                paths.instruction_target.display(),
-                instruction_source.display()
-            );
-        }
+        verify_profile_instructions("Claude", &profile.path, &paths.instruction_target)?;
 
         for skill in valid_skills(&profile.path)? {
             let target = paths.skills_dir.join(
@@ -436,11 +421,7 @@ fn patch_claude_mcps(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result
 }
 
 fn read_profile_config(profile_path: &Path) -> Result<ProfileConfig> {
-    let path = profile_path.join("config.json");
-    let text = fs::read_to_string(&path)
-        .with_context(|| format!("missing or unreadable profile config at {}", path.display()))?;
-    serde_json::from_str(&text)
-        .with_context(|| format!("invalid profile config at {}", path.display()))
+    read_profile_config_from_profile(profile_path)
 }
 
 fn import_claude_mcps(document: &Map<String, Value>) -> Result<String> {

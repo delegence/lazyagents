@@ -276,14 +276,6 @@ fn active_profile_for_drift(
 
     store.load_config(name)?;
 
-    let instruction_source = path.join("AGENTS.md");
-    if !instruction_source.is_file() {
-        anyhow::bail!(
-            "active profile {name} is missing instruction source at {}",
-            instruction_source.display()
-        );
-    }
-
     if integration.supports_mcp() {
         read_mcp_definitions(&path)?;
     }
@@ -548,7 +540,6 @@ mod tests {
         let fixture = Fixture::new();
         fixture.profile("active");
         fixture.profile("target");
-        fs::remove_file(fixture.profile_path("target").join("AGENTS.md")).unwrap();
         fs::remove_file(fixture.profile_path("target").join("mcps.json")).unwrap();
         fs::remove_dir_all(fixture.profile_path("target").join("skills")).unwrap();
         fs::remove_dir_all(fixture.profile_path("target").join("commands")).unwrap();
@@ -578,18 +569,22 @@ mod tests {
                 ..
             })
         ));
-        assert!(!fixture.profile_path("target").join("AGENTS.md").exists());
         assert!(!fixture.profile_path("target").join("mcps.json").exists());
         assert!(!fixture.profile_path("target").join("skills").exists());
         assert!(!fixture.profile_path("target").join("commands").exists());
     }
 
     #[test]
-    fn active_profile_missing_instruction_fails_before_drift_decision() {
+    fn active_profile_missing_profile_file_fails_before_drift_decision() {
         let fixture = Fixture::new();
         fixture.profile("active");
         fixture.profile("target");
-        fs::remove_file(fixture.profile_path("active").join("AGENTS.md")).unwrap();
+        fs::remove_file(
+            fixture
+                .profile_path("active")
+                .join(crate::profile::PROFILE_FILE_NAME),
+        )
+        .unwrap();
         fixture.write_state(r#"{"active_profiles":{"codex":"active"}}"#);
         let registry = FakeCatalog {
             integrations: vec![FakeIntegration::new(
@@ -608,13 +603,11 @@ mod tests {
                 drift_decision: None,
             },
         ) {
-            Ok(_) => panic!("expected missing active instruction to fail"),
+            Ok(_) => panic!("expected missing active profile file to fail"),
             Err(error) => error,
         };
 
-        assert!(error
-            .to_string()
-            .contains("active profile active is missing instruction source"));
+        assert!(error.to_string().contains("PROFILE.md"));
     }
 
     #[test]
@@ -711,7 +704,7 @@ mod tests {
 
         assert!(matches!(outcome, UseProfileOutcome::Applied(_)));
         assert_eq!(
-            fs::read_to_string(fixture.profile_path("active").join("AGENTS.md")).unwrap(),
+            crate::profile::read_profile_instructions(&fixture.profile_path("active")).unwrap(),
             "saved drift"
         );
         let config = fixture

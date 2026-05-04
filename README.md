@@ -4,8 +4,6 @@ Manage reusable Agent profiles across various coding agents.
 
 `lazyagents` lets you save a configured agent setup once, then apply it to one or more local coding harnesses. A profile can contain shared instructions, skills, saved prompts, MCP servers, model preferences, and permission preferences. Harnesses apply the parts they natively support.
 
-The tool is local-first. It manages files on your machine, does not install harnesses, and does not fetch remote skills or plugins.
-
 ## Install
 
 Build from source:
@@ -29,7 +27,6 @@ cargo run -- doctor
 ## Commands
 
 ```sh
-lazyagents help
 lazyagents doctor
 lazyagents create <name>
 lazyagents create <name> --harness <harness-id>
@@ -64,12 +61,11 @@ A profile is stored under:
 Profile layout:
 
 ```text
-AGENTS.md      shared agent instructions
+PROFILE.md     metadata/preferences in YAML frontmatter and instructions in Markdown body
 skills/        skill directories containing SKILL.md
 commands/      Markdown saved prompts
 agents/        neutral Markdown sub-agent definitions
 mcps.json      neutral MCP server definitions
-config.json    model and permission preferences
 ```
 
 Profile names are CLI-safe identifiers: ASCII letters, numbers, and dashes only. Names may be up to 64 characters, cannot start or end with a dash, and cannot contain consecutive dashes.
@@ -82,7 +78,7 @@ Harness instances are configured in:
 ~/.lazyagents/settings.json
 ```
 
-If the file is missing, `lazyagents` creates it with the default Claude, Codex, Gemini, OpenCode, and Pi instances. Each instance has an id, a harness `type`, an optional `displayName`, an optional `binary`, and a `configDir`. Instance ids use lowercase ASCII letters, numbers, and dashes. `configDir` must be absolute or begin with `~/`.
+If the file is missing, `lazyagents` creates it with the default Claude, Codex, Gemini, OpenCode, and Pi instances. Each instance has an id, a harness `type`, an optional `displayName`, an optional `binary`, and a `configDir`. Instance ids use lowercase ASCII letters, numbers, and dashes. `configDir` must be absolute, `~`, or begin with `~/`.
 
 Example:
 
@@ -105,7 +101,7 @@ Example:
 }
 ```
 
-Use instance ids with `--harness` or `-H`. Model and permission preferences in profile `config.json` are keyed by instance id. If two instances have the same type and `configDir`, applying a profile to one marks both active because they represent the same native harness state.
+Use instance ids with `--harness` or `-H`. Model and permission preferences in profile `PROFILE.md` frontmatter are keyed by instance id. If two instances have the same type and `configDir`, applying a profile to one marks both active because they represent the same native harness state.
 
 Doctor reports shared config directories using the same normalized type and `configDir` identity used for active-profile aliasing.
 
@@ -125,7 +121,7 @@ When you apply a profile, `lazyagents`:
 1. Checks the selected harness is available on `PATH`.
 2. Checks whether the currently active profile has unsaved drift.
 3. Creates a backup of the harness-managed files.
-4. Symlinks profile instructions, skills, and commands into the harness config.
+4. Writes profile instructions into the harness config and symlinks supported skills and commands.
 5. Renders neutral sub-agent definitions into native harness agent files when supported.
 6. Patches native model, permission, and MCP settings when supported by the harness.
 7. Verifies the result.
@@ -151,7 +147,7 @@ Drift means the current harness-managed files no longer match the active profile
 
 Drift checks include:
 
-- instruction links
+- instruction content
 - skills
 - commands
 - sub-agents, for harnesses with native sub-agent support
@@ -234,22 +230,24 @@ Disabled MCP entries are validated and emitted to harness configs as disabled en
 
 HTTP MCP `url` values must start with `http://` or `https://`. Environment variable references are preserved; for Codex HTTP headers, values like `"$TOKEN"` are rendered into Codex `env_http_headers`.
 
-## Configuration
+## Profile File
 
-`config.json` stores opaque per-harness preferences:
+`PROFILE.md` stores opaque per-harness preferences in YAML frontmatter. Its Markdown body stores the shared agent instructions:
 
-```json
-{
-  "name": "Work",
-  "description": "",
-  "models": {
-    "codex": "gpt-5.2",
-    "codex-max": "gpt-5.2-high"
-  },
-  "permissions": {
-    "codex": "on-request"
-  }
-}
+```md
+---
+name: Work
+description: ""
+models:
+  codex: gpt-5.2
+  codex-max: gpt-5.2-high
+permissions:
+  codex: on-request
+---
+
+# Shared instructions
+
+Work carefully and explain important tradeoffs.
 ```
 
 Missing model or permission entries behave like `"default"`, which means `lazyagents` leaves that native harness setting unchanged.

@@ -137,7 +137,7 @@ pub fn collect_rendered_agent_drift(
                 items.push(DriftItem {
                     surface: "agents".to_string(),
                     detail: format!(
-                        "unexpected managed entry {}",
+                        "unexpected harness entry {}",
                         target_dir.join(file.relative_path).display()
                     ),
                 });

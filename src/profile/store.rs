@@ -6,7 +6,10 @@ use anyhow::{Context, Result};
 
 use crate::harness::integration::{ImportedDirectory, ImportedFile, ProfileImport};
 
-use crate::profile::config::{ProfileConfig, ProfileConfigStatus};
+use crate::profile::config::{
+    default_profile_document, read_profile_config, read_profile_document, write_profile_document,
+    ProfileConfig, ProfileConfigStatus, ProfileDocument, PROFILE_FILE_NAME,
+};
 use crate::profile::inspect::{
     artifact_status, scan_commands, scan_skills, summarize_mcps, ProfileSummary,
 };
@@ -95,12 +98,7 @@ impl ProfileStore {
     }
 
     pub fn load_config(&self, name: &ProfileName) -> Result<ProfileConfig> {
-        let path = self.profile_dir(name).join("config.json");
-        let text = std::fs::read_to_string(&path).with_context(|| {
-            format!("missing or unreadable profile config at {}", path.display())
-        })?;
-        serde_json::from_str(&text)
-            .with_context(|| format!("invalid profile config at {}", path.display()))
+        read_profile_config(&self.profile_dir(name))
     }
 
     pub fn normalize_optional_artifacts(&self, name: &ProfileName) -> Result<()> {
@@ -120,7 +118,10 @@ impl ProfileStore {
         std::fs::create_dir_all(profile_dir.join("agents")).with_context(|| {
             format!("failed to create {}", profile_dir.join("agents").display())
         })?;
-        create_file_if_missing(&profile_dir.join("AGENTS.md"), "")?;
+        create_file_if_missing(
+            &profile_dir.join(PROFILE_FILE_NAME),
+            &profile_document_text(&default_profile_document(name))?,
+        )?;
         create_file_if_missing(&profile_dir.join("mcps.json"), "")?;
         Ok(())
     }
@@ -206,16 +207,16 @@ impl ProfileStore {
                 continue;
             };
 
-            let config_path = entry.path().join("config.json");
-            let config_status = match std::fs::read_to_string(&config_path) {
-                Ok(text) => match serde_json::from_str::<ProfileConfig>(&text) {
-                    Ok(_) => ProfileConfigStatus::Valid,
-                    Err(error) => ProfileConfigStatus::Invalid(error.to_string()),
-                },
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    ProfileConfigStatus::Missing
+            let config_status = match read_profile_config(&entry.path()) {
+                Ok(_) => ProfileConfigStatus::Valid,
+                Err(error) => {
+                    let profile_path = entry.path().join(PROFILE_FILE_NAME);
+                    if !profile_path.exists() {
+                        ProfileConfigStatus::Missing
+                    } else {
+                        ProfileConfigStatus::Invalid(error.to_string())
+                    }
                 }
-                Err(error) => ProfileConfigStatus::Invalid(error.to_string()),
             };
 
             items.push(ProfileListItem {
@@ -237,7 +238,7 @@ impl ProfileStore {
         let config = self
             .load_config(name)
             .unwrap_or_else(|_| crate::profile::ProfileConfig::default_for(name));
-        let instruction_source = artifact_status(path.join("AGENTS.md"));
+        let instruction_source = artifact_status(path.join(PROFILE_FILE_NAME));
         let (valid_skills, ignored_skills) = scan_skills(&path.join("skills"))?;
         let (commands, ignored_command_files) = scan_commands(&path.join("commands"))?;
         let (agents, ignored_agent_files) =
@@ -271,13 +272,9 @@ fn apply_import_to_dir(
     harness_id: &str,
     imported: ProfileImport,
 ) -> Result<()> {
+    let mut document = load_document_from_dir(profile_dir)?;
     if let Some(instruction) = imported.instruction {
-        std::fs::write(profile_dir.join("AGENTS.md"), instruction).with_context(|| {
-            format!(
-                "failed to write {}",
-                profile_dir.join("AGENTS.md").display()
-            )
-        })?;
+        document.instructions = instruction;
     }
 
     replace_imported_directories(&profile_dir.join("skills"), imported.skills)?;
@@ -295,31 +292,23 @@ fn apply_import_to_dir(
         })?;
     }
 
-    let mut config = load_config_from_dir(profile_dir)?;
-    config.models.insert(
+    document.config.models.insert(
         harness_id.to_string(),
         imported.model_preference.into_value(),
     );
-    config.permissions.insert(
+    document.config.permissions.insert(
         harness_id.to_string(),
         imported.permission_preference.into_value(),
     );
-    write_config_to_dir(profile_dir, &config)
+    write_document_to_dir(profile_dir, &document)
 }
 
-fn load_config_from_dir(profile_dir: &Path) -> Result<ProfileConfig> {
-    let path = profile_dir.join("config.json");
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("missing or unreadable profile config at {}", path.display()))?;
-    serde_json::from_str(&text)
-        .with_context(|| format!("invalid profile config at {}", path.display()))
+fn load_document_from_dir(profile_dir: &Path) -> Result<ProfileDocument> {
+    read_profile_document(profile_dir)
 }
 
-fn write_config_to_dir(profile_dir: &Path, config: &ProfileConfig) -> Result<()> {
-    let path = profile_dir.join("config.json");
-    let text = serde_json::to_string_pretty(config)?;
-    std::fs::write(&path, format!("{text}\n"))
-        .with_context(|| format!("failed to write profile config at {}", path.display()))
+fn write_document_to_dir(profile_dir: &Path, document: &ProfileDocument) -> Result<()> {
+    write_profile_document(profile_dir, document)
 }
 
 fn replace_imported_directories(root: &Path, directories: Vec<ImportedDirectory>) -> Result<()> {
@@ -439,21 +428,17 @@ fn write_default_skeleton(path: &Path, name: &ProfileName) -> Result<()> {
     std::fs::create_dir(path.join("agents"))
         .with_context(|| format!("failed to create {}", path.join("agents").display()))?;
 
-    std::fs::write(
-        path.join("AGENTS.md"),
-        format!("# {}\n\nAdd profile instructions here.\n", name),
-    )
-    .with_context(|| format!("failed to write {}", path.join("AGENTS.md").display()))?;
-
-    let config = ProfileConfig::default_for(name);
-    let config_text = serde_json::to_string_pretty(&config)?;
-    std::fs::write(path.join("config.json"), format!("{config_text}\n"))
-        .with_context(|| format!("failed to write {}", path.join("config.json").display()))?;
+    let document = default_profile_document(name);
+    write_profile_document(path, &document)?;
 
     std::fs::write(path.join("mcps.json"), "")
         .with_context(|| format!("failed to write {}", path.join("mcps.json").display()))?;
 
     Ok(())
+}
+
+fn profile_document_text(document: &ProfileDocument) -> Result<String> {
+    crate::profile::config::profile_document_to_markdown(document)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -506,8 +491,8 @@ mod tests {
         let profile_dir = temp.path().join("profiles").join(profile_name.as_str());
         std::fs::create_dir_all(&profile_dir).unwrap();
         std::fs::write(
-            profile_dir.join("config.json"),
-            r#"{"name":"Work","models":{"codex":"default"},"permissions":{"codex":"default"}}"#,
+            profile_dir.join(PROFILE_FILE_NAME),
+            "---\nname: Work\nmodels:\n  codex: default\npermissions:\n  codex: default\n---\nInstructions\n",
         )
         .unwrap();
 
@@ -537,13 +522,17 @@ mod tests {
         let profile_dir = store.create_skeleton(&profile_name).unwrap();
 
         assert_eq!(profile_dir, temp.path().join("profiles").join("work"));
-        assert!(profile_dir.join("AGENTS.md").is_file());
+        assert!(profile_dir.join(PROFILE_FILE_NAME).is_file());
         assert!(profile_dir.join("skills").is_dir());
         assert!(profile_dir.join("commands").is_dir());
 
         let config = store.load_config(&profile_name).unwrap();
         assert_eq!(config.name.as_deref(), Some("Work"));
         assert_eq!(config.description.as_deref(), Some(""));
+        assert_eq!(
+            crate::profile::read_profile_instructions(&profile_dir).unwrap(),
+            "# Work\n\nAdd profile instructions here.\n"
+        );
         for harness in ["codex", "claude", "opencode"] {
             assert_eq!(config.model_preference(harness), "default");
             assert_eq!(config.permission_preference(harness), "default");
@@ -559,13 +548,13 @@ mod tests {
         let store = ProfileStore::new(LazyagentsHome::from_path(temp.path()));
         let profile_name = ProfileName::parse("work").unwrap();
         let profile_dir = store.create_skeleton(&profile_name).unwrap();
-        std::fs::write(profile_dir.join("AGENTS.md"), "existing").unwrap();
+        std::fs::write(profile_dir.join(PROFILE_FILE_NAME), "existing").unwrap();
 
         let error = store.create_skeleton(&profile_name).unwrap_err();
 
         assert!(error.to_string().contains("already exists"));
         assert_eq!(
-            std::fs::read_to_string(profile_dir.join("AGENTS.md")).unwrap(),
+            std::fs::read_to_string(profile_dir.join(PROFILE_FILE_NAME)).unwrap(),
             "existing"
         );
     }
@@ -585,7 +574,7 @@ mod tests {
         std::fs::create_dir_all(profiles_dir.join("bad_name")).unwrap();
         std::fs::create_dir_all(profiles_dir.join("missing")).unwrap();
         std::fs::create_dir_all(profiles_dir.join("invalid")).unwrap();
-        std::fs::write(profiles_dir.join("invalid").join("config.json"), "{").unwrap();
+        std::fs::write(profiles_dir.join("invalid").join(PROFILE_FILE_NAME), "{").unwrap();
         let items = store.list_profiles().unwrap();
 
         assert_eq!(
@@ -742,7 +731,11 @@ mod tests {
         let profile_dir = store.create_skeleton(&profile).unwrap();
         let codex_dir = user_home.join(".codex");
         std::fs::create_dir_all(&codex_dir).unwrap();
-        create_symlink(profile_dir.join("AGENTS.md"), codex_dir.join("AGENTS.md"));
+        let skill_dir = profile_dir.join("skills").join("writer");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "").unwrap();
+        std::fs::create_dir_all(codex_dir.join("skills")).unwrap();
+        create_symlink(&skill_dir, codex_dir.join("skills").join("writer"));
         let env = AppEnvironment {
             lazyagents_home: home,
             user_home,

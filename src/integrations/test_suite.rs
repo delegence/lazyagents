@@ -9,7 +9,10 @@ pub mod template {
     use crate::harness::integration::{
         AppEnvironment, HarnessConfigPaths, HarnessIntegration, ProfileImport, ProfileRef,
     };
-    use crate::profile::{LazyagentsHome, ProfileConfig, ProfileName, ProfileStore};
+    use crate::profile::config::{read_profile_document, write_profile_document, ProfileDocument};
+    use crate::profile::{
+        LazyagentsHome, ProfileConfig, ProfileName, ProfileStore, PROFILE_FILE_NAME,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -68,12 +71,36 @@ pub mod template {
     }
 
     pub fn write_config(profile: &Path, content: &str) {
-        fs::write(profile.join("config.json"), content).unwrap();
+        let config: ProfileConfig = serde_json::from_str(content).unwrap();
+        let instructions = read_profile_document(profile)
+            .map(|document| document.instructions)
+            .unwrap_or_default();
+        write_profile_document(
+            profile,
+            &ProfileDocument {
+                config,
+                instructions,
+            },
+        )
+        .unwrap();
     }
 
     pub fn assert_symlink_to(link: PathBuf, target: PathBuf) {
         assert!(link.is_symlink(), "not a symlink: {}", link.display());
         assert_eq!(fs::read_link(&link).unwrap(), target);
+    }
+
+    pub fn assert_instructions_applied(target: PathBuf, profile: &Path) {
+        let expected = crate::profile::read_profile_instructions(profile).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), expected);
+        assert!(
+            !fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "instruction target should be a regular rendered file: {}",
+            target.display()
+        );
     }
 
     pub trait HarnessTestAdapter {
@@ -170,7 +197,6 @@ pub mod template {
     pub fn test_use_normalizes_missing_optional_artifacts<A: HarnessTestAdapter>(adapter: &A) {
         let fixture = HarnessTestFixture::new(adapter.bin_name());
         let profile = fixture.profile("work");
-        fs::remove_file(profile.join("AGENTS.md")).unwrap();
         fs::remove_file(profile.join("mcps.json")).unwrap();
         fs::remove_dir_all(profile.join("skills")).unwrap();
         fs::remove_dir_all(profile.join("commands")).unwrap();
@@ -178,12 +204,12 @@ pub mod template {
         let integration = adapter.integration();
         use_profile_for_test(adapter, &fixture, "work", DriftDecision::DiscardChanges).unwrap();
 
-        assert!(profile.join("AGENTS.md").is_file());
+        assert!(profile.join(PROFILE_FILE_NAME).is_file());
         assert!(profile.join("mcps.json").is_file());
         assert!(profile.join("skills").is_dir());
         assert!(profile.join("commands").is_dir());
         let paths = integration.paths(&fixture.env).unwrap();
-        assert_symlink_to(paths.instruction_target.clone(), profile.join("AGENTS.md"));
+        assert_instructions_applied(paths.instruction_target.clone(), &profile);
     }
 
     pub fn test_use_removes_stale_surfaces_and_optionally_clears_mcp_list<A: HarnessTestAdapter>(
@@ -457,7 +483,7 @@ pub mod template {
         use_profile_for_test(adapter, &fixture, "target", DriftDecision::SaveChanges).unwrap();
 
         assert_eq!(
-            fs::read_to_string(active.join("AGENTS.md")).unwrap(),
+            crate::profile::read_profile_instructions(&active).unwrap(),
             "drifted"
         );
         if adapter.supports_skills() {
@@ -477,7 +503,7 @@ pub mod template {
             .unwrap();
         adapter.assert_drift_saved(&active_config);
 
-        assert_symlink_to(paths.instruction_target, target.join("AGENTS.md"));
+        assert_instructions_applied(paths.instruction_target, &target);
     }
 
     pub fn test_discard_changes_switches_without_updating_active_profile<A: HarnessTestAdapter>(
@@ -509,7 +535,7 @@ pub mod template {
         if adapter.supports_skills() {
             assert!(!active.join("skills").join("newskill").exists());
         }
-        assert_symlink_to(paths.instruction_target, target.join("AGENTS.md"));
+        assert_instructions_applied(paths.instruction_target, &target);
     }
 
     pub fn test_use_applies_profile_artifacts_preferences_mcp_and_state<A: HarnessTestAdapter>(
@@ -538,7 +564,7 @@ pub mod template {
 
         use_profile_for_test(adapter, &fixture, "work", DriftDecision::DiscardChanges).unwrap();
 
-        assert_symlink_to(paths.instruction_target.clone(), profile.join("AGENTS.md"));
+        assert_instructions_applied(paths.instruction_target.clone(), &profile);
         if adapter.supports_skills() {
             assert_symlink_to(
                 paths.skills_dir.join("writer"),

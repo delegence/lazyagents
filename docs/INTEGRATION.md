@@ -242,7 +242,7 @@ Apply a profile to the harness after shared transaction code has captured backup
 Rules:
 
 - create missing config directories
-- symlink profile-owned instructions and supported valid skills/command files with absolute symlinks
+- write profile instructions directly and symlink supported valid skills/command files with absolute symlinks
 - patch native config files, preserving unrelated keys
 - translate neutral MCP definitions into native format, when the harness supports native MCP
 - honor `"default"` model/permission values by not mutating those native keys

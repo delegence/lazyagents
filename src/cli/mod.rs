@@ -7,7 +7,10 @@ use std::io::{self, Write};
 use std::process::Command as ProcessCommand;
 
 use crate::app::create_profile::{create_profile, CreateProfileResult};
-use crate::app::doctor::{doctor_report, DoctorReport, HarnessStatus};
+use crate::app::doctor::{
+    doctor_report, DoctorReport, HarnessAvailability, HarnessProfileStatus, HarnessStatus,
+    LazyagentsDoctorReport,
+};
 use crate::app::edit_profile::edit_profile_path;
 use crate::app::harness_registry::{
     reset_settings, settings_path, BuiltInHarnessRegistry, HarnessRegistry,
@@ -184,10 +187,10 @@ pub fn run() -> Result<()> {
                         println!();
                     }
                     if index == 0 {
-                        println!("Drift:");
+                        println!("Changes:");
                     }
                     println!(" {}:", harness);
-                    print_drift_report(&drift, "  ");
+                    print_drift_report(&drift, "  ", None);
                 }
             }
         }
@@ -274,7 +277,7 @@ pub fn run() -> Result<()> {
                             }
                         }
                         ProfileUseStatus::CancelledForDrift => {
-                            println!("Use cancelled because {} has drift", result.display_name);
+                            println!("Profile switch for {} cancelled", result.display_name);
                         }
                     }
                 }
@@ -297,10 +300,7 @@ pub fn run() -> Result<()> {
                                 .map(|drift| drift.display_name.as_str())
                                 .collect::<Vec<_>>();
                             if !prompt_all_drift_discard(&harnesses)? {
-                                anyhow::bail!(
-                                    "operation cancelled due to drift in {}",
-                                    names.join(", ")
-                                );
+                                anyhow::bail!("Profile switch for {} cancelled", names.join(", "));
                             }
                             match use_profile_workflow(
                                 &registry,
@@ -415,13 +415,6 @@ fn active_profile_for_show(
         anyhow::bail!("active profile {name} is missing at {}", path.display());
     }
     store.load_config(name)?;
-    let instruction_source = path.join("AGENTS.md");
-    if !instruction_source.is_file() {
-        anyhow::bail!(
-            "active profile {name} is missing instruction source at {}",
-            instruction_source.display()
-        );
-    }
     if integration.supports_mcp() {
         crate::profile::mcp::read_mcp_definitions(&path)?;
     }
@@ -438,6 +431,8 @@ fn active_profile_for_show(
 fn print_doctor(runtime_env: &AppEnvironment, store: &ProfileStore) -> Result<()> {
     let registry = BuiltInHarnessRegistry;
     let report = doctor_report(&registry, runtime_env, store)?;
+    println!("Doctor summary:");
+    print_lazyagents_doctor(&report.lazyagents);
     print_harness_doctor(&report.harnesses);
     print_profile_doctor(&report);
     Ok(())
@@ -488,12 +483,13 @@ fn prompt_single_drift_decision(
 
     if !io::stdin().is_terminal() {
         anyhow::bail!(
-            "{harness} has drift in currently selected profile {profile}; pass --save-changes or --discard-changes to proceed"
+            "{harness} has changes in current profile {profile}; pass --save-changes or --discard-changes to proceed"
         );
     }
 
-    println!("{harness} has drift in currently selected profile {profile}:");
-    print_drift_report(drift, "  ");
+    println!("{harness} has changes in current profile {profile}:");
+    print_drift_report(drift, "  ", Some(10));
+    println!();
     loop {
         print!("Save changes [s], discard [d], or cancel [c]? ");
         io::stdout().flush()?;
@@ -517,18 +513,21 @@ fn prompt_all_drift_discard(harnesses: &[HarnessDrift]) -> Result<bool> {
         .collect::<Vec<_>>()
         .join(", ");
     if !io::stdin().is_terminal() {
-        anyhow::bail!("drift detected in {joined}; pass --discard-changes to proceed");
+        anyhow::bail!(
+            "Changes in current profiles detected in {joined}; pass --discard-changes to proceed"
+        );
     }
 
-    println!("Drift detected before applying profile:");
+    println!("Resolve changes in current profiles:");
     for harness in harnesses {
         println!();
         println!(
-            "  {} has drift in currently selected profile {}:",
+            "  {} has changes for profile {}:",
             harness.display_name, harness.profile
         );
-        print_drift_report(&harness.drift, "    ");
+        print_drift_report(&harness.drift, "    ", Some(10));
     }
+    println!();
     print!("Proceed and discard changes? [y/N] ");
     io::stdout().flush()?;
     let mut input = String::new();
@@ -536,20 +535,65 @@ fn prompt_all_drift_discard(harnesses: &[HarnessDrift]) -> Result<bool> {
     Ok(matches!(input.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
-fn print_drift_report(drift: &DriftReport, indent: &str) {
-    const MAX_DRIFT_ITEMS: usize = 5;
+fn print_drift_report(drift: &DriftReport, indent: &str, limit: Option<usize>) {
+    let visible = limit.unwrap_or(drift.items.len());
 
-    for item in drift.items.iter().take(MAX_DRIFT_ITEMS) {
+    for item in drift.items.iter().take(visible) {
         println!(
-            "{indent}- {}: {}",
+            "{indent}{} {}: {}",
+            drift_marker(&item.detail),
             item.surface,
             render_path_in_text(&item.detail)
         );
     }
 
-    let remaining = drift.items.len().saturating_sub(MAX_DRIFT_ITEMS);
+    let remaining = drift.items.len().saturating_sub(visible);
     if remaining > 0 {
-        println!("{indent}- ... and {remaining} more");
+        println!(
+            "{indent}... and {remaining} more ({})",
+            drift_marker_counts(&drift.items[visible..])
+        );
+    }
+}
+
+fn drift_marker_counts(items: &[crate::harness::drift::DriftItem]) -> String {
+    let mut additions = 0usize;
+    let mut removals = 0usize;
+    let mut changes = 0usize;
+    for item in items {
+        match drift_marker(&item.detail) {
+            '+' => additions += 1,
+            '-' => removals += 1,
+            _ => changes += 1,
+        }
+    }
+    format!("+{additions}, -{removals}, ~{changes}")
+}
+
+fn drift_marker(detail: &str) -> char {
+    if detail.contains("unexpected harness entry") {
+        '+'
+    } else if detail.contains(" is missing") {
+        '-'
+    } else {
+        '~'
+    }
+}
+
+fn print_lazyagents_doctor(report: &LazyagentsDoctorReport) {
+    let suffix = if report.summary.is_empty() {
+        "".to_string()
+    } else {
+        format!(" ({}):", report.summary.join(", "))
+    };
+
+    println!(
+        "{} LazyAgents ({}){suffix}",
+        report.marker,
+        env!("CARGO_PKG_VERSION")
+    );
+    for line in &report.lines {
+        println!("{line}");
     }
 }
 
@@ -559,27 +603,44 @@ fn print_harness_doctor(rows: &[HarnessStatus]) {
         return;
     }
 
-    let names = rows
+    let available = rows
         .iter()
-        .map(|row| row.harness.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    println!("[✓] Harnesses ({} available: {})", rows.len(), names);
+        .filter(|row| matches!(row.availability, HarnessAvailability::Available))
+        .count();
+    let unavailable = rows.len() - available;
+    let marker = if unavailable == 0 { "[✓]" } else { "[!]" };
+    if unavailable == 0 {
+        println!("{marker} Harnesses ({available} available):");
+    } else {
+        println!("{marker} Harnesses ({available} available, {unavailable} unavailable):");
+    }
+
     for row in rows {
-        if !row.config_dir_exists {
-            println!(
-                "  - {} configDir missing ({})",
-                row.harness,
-                render_path(&row.config_dir)
-            );
+        println!("  - {} ({})", row.harness, render_harness_status(row));
+    }
+}
+
+fn render_harness_status(row: &HarnessStatus) -> String {
+    match row.availability {
+        HarnessAvailability::BinaryMissing => {
+            format!("unavailable: binary not found: {}", row.binary)
         }
-        if let Some(shared) = &row.shared_config_with {
-            println!(
-                "  - {} shares configDir with {} ({})",
-                row.harness,
-                shared,
+        HarnessAvailability::ConfigDirMissing => {
+            format!(
+                "unavailable: configDir missing {}",
                 render_path(&row.config_dir)
-            );
+            )
+        }
+        HarnessAvailability::Available => {
+            let mut parts = Vec::new();
+            match &row.profile {
+                HarnessProfileStatus::Inactive => parts.push("no active profile".to_string()),
+                HarnessProfileStatus::Active { name, .. } => parts.push(name.to_string()),
+            }
+            if let Some(shared) = &row.shared_config_with {
+                parts.push(format!("shares configDir with {shared}"));
+            }
+            parts.join(", ")
         }
     }
 }

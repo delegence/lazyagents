@@ -1,6 +1,7 @@
 use crate::harness::agents::{profile_agents, scan_agents};
 use crate::profile::inspect::{scan_commands, scan_skills};
 use crate::profile::mcp::collect_mcp_validation_errors;
+use crate::profile::{read_profile_document, PROFILE_FILE_NAME};
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,18 +46,19 @@ impl ValidationIssue {
 pub fn validate_profile(path: &Path) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
 
-    // config.json
-    let config_path = path.join("config.json");
-    if let Ok(text) = std::fs::read_to_string(&config_path) {
-        if let Err(err) = serde_json::from_str::<crate::profile::ProfileConfig>(&text) {
+    // PROFILE.md
+    let profile_path = path.join(PROFILE_FILE_NAME);
+    if profile_path.exists() {
+        if let Err(err) = read_profile_document(path) {
             issues.push(
-                ValidationIssue::error("Config", format!("malformed config.json: {}", err))
-                    .with_path("config.json"),
+                ValidationIssue::error("Config", format!("malformed PROFILE.md: {}", err))
+                    .with_path(PROFILE_FILE_NAME),
             );
         }
     } else {
-        issues
-            .push(ValidationIssue::error("Config", "missing config.json").with_path("config.json"));
+        issues.push(
+            ValidationIssue::error("Config", "missing PROFILE.md").with_path(PROFILE_FILE_NAME),
+        );
     }
 
     // skills
@@ -125,26 +127,26 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path();
 
-        // create missing config profile
+        // create missing profile file
         std::fs::create_dir_all(path.join("skills")).unwrap();
         std::fs::create_dir_all(path.join("commands")).unwrap();
 
         let issues = validate_profile(path);
         assert!(issues
             .iter()
-            .any(|i| i.category == "Config" && i.message == "missing config.json"));
+            .any(|i| i.category == "Config" && i.message == "missing PROFILE.md"));
 
-        // malformed config
-        std::fs::write(path.join("config.json"), "invalid").unwrap();
+        // malformed profile frontmatter
+        std::fs::write(path.join(PROFILE_FILE_NAME), "invalid").unwrap();
         let issues = validate_profile(path);
         assert!(issues
             .iter()
-            .any(|i| i.category == "Config" && i.message.contains("malformed config.json")));
+            .any(|i| i.category == "Config" && i.message.contains("malformed PROFILE.md")));
 
-        // good config
+        // good profile file
         std::fs::write(
-            path.join("config.json"),
-            r#"{"name":"test","models":{},"permissions":{}}"#,
+            path.join(PROFILE_FILE_NAME),
+            "---\nname: test\nmodels: {}\npermissions: {}\n---\nInstructions\n",
         )
         .unwrap();
 

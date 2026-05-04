@@ -1,14 +1,28 @@
 use crate::profile::name::ProfileName;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::path::Path;
+
+pub const PROFILE_FILE_NAME: &str = "PROFILE.md";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ProfileConfig {
+    #[serde(default)]
     pub name: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
+    #[serde(default)]
     pub models: BTreeMap<String, Value>,
+    #[serde(default)]
     pub permissions: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProfileDocument {
+    pub config: ProfileConfig,
+    pub instructions: String,
 }
 
 impl ProfileConfig {
@@ -46,6 +60,69 @@ fn default_display_name(name: &ProfileName) -> String {
 
 pub fn default_preference_value() -> Value {
     json!("default")
+}
+
+pub fn default_profile_document(name: &ProfileName) -> ProfileDocument {
+    let display_name = default_display_name(name);
+    ProfileDocument {
+        config: ProfileConfig::default_for(name),
+        instructions: format!("# {display_name}\n\nAdd profile instructions here.\n"),
+    }
+}
+
+pub fn read_profile_document(profile_path: &Path) -> Result<ProfileDocument> {
+    let path = profile_path.join(PROFILE_FILE_NAME);
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("missing or unreadable profile file at {}", path.display()))?;
+    parse_profile_document(&text)
+        .with_context(|| format!("invalid profile file at {}", path.display()))
+}
+
+pub fn read_profile_config(profile_path: &Path) -> Result<ProfileConfig> {
+    Ok(read_profile_document(profile_path)?.config)
+}
+
+pub fn read_profile_instructions(profile_path: &Path) -> Result<String> {
+    Ok(read_profile_document(profile_path)?.instructions)
+}
+
+pub fn write_profile_document(profile_path: &Path, document: &ProfileDocument) -> Result<()> {
+    let path = profile_path.join(PROFILE_FILE_NAME);
+    let text = profile_document_to_markdown(document)?;
+    std::fs::write(&path, text)
+        .with_context(|| format!("failed to write profile file at {}", path.display()))
+}
+
+pub fn parse_profile_document(text: &str) -> Result<ProfileDocument> {
+    let (frontmatter, body) = split_markdown_frontmatter(text)?;
+    let config: ProfileConfig = serde_yaml::from_str(frontmatter)?;
+    Ok(ProfileDocument {
+        config,
+        instructions: body.to_string(),
+    })
+}
+
+pub fn profile_document_to_markdown(document: &ProfileDocument) -> Result<String> {
+    let yaml = serde_yaml::to_string(&document.config)?;
+    Ok(format!(
+        "---\n{}---\n{}",
+        trim_yaml_header(&yaml),
+        document.instructions
+    ))
+}
+
+fn split_markdown_frontmatter(text: &str) -> Result<(&str, &str)> {
+    let rest = text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))
+        .ok_or_else(|| anyhow::anyhow!("{PROFILE_FILE_NAME} must start with YAML frontmatter"))?;
+    rest.split_once("\n---\n")
+        .or_else(|| rest.split_once("\r\n---\r\n"))
+        .ok_or_else(|| anyhow::anyhow!("{PROFILE_FILE_NAME} must close YAML frontmatter with ---"))
+}
+
+fn trim_yaml_header(yaml: &str) -> String {
+    yaml.strip_prefix("---\n").unwrap_or(yaml).to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,5 +166,25 @@ mod tests {
             config.permission_preference("opencode"),
             serde_json::json!({"*":"ask","bash":"allow"})
         );
+    }
+
+    #[test]
+    fn profile_document_round_trips_frontmatter_and_instructions() {
+        let document = ProfileDocument {
+            config: ProfileConfig {
+                name: Some("Work".to_string()),
+                description: Some("Daily profile".to_string()),
+                models: BTreeMap::from([("codex".to_string(), json!("gpt-5"))]),
+                permissions: BTreeMap::from([("codex".to_string(), json!("on-request"))]),
+            },
+            instructions: "# Instructions\n\nDo careful work.\n".to_string(),
+        };
+
+        let text = profile_document_to_markdown(&document).unwrap();
+        let parsed = parse_profile_document(&text).unwrap();
+
+        assert_eq!(parsed.config.name.as_deref(), Some("Work"));
+        assert_eq!(parsed.config.model_preference("codex"), "gpt-5");
+        assert_eq!(parsed.instructions, "# Instructions\n\nDo careful work.\n");
     }
 }

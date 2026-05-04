@@ -40,6 +40,10 @@ pub fn create_profile(
             let path = store.create_skeleton(&profile)?;
             if let Err(error) = (|| {
                 let mut imported = integration.import_from_harness(&paths)?;
+                if matches!(imported.instruction.as_deref(), Some(instruction) if instruction.trim().is_empty())
+                {
+                    imported.instruction = None;
+                }
                 let shared_skills = merge_shared_agent_skills(&mut imported.skills, env)?;
                 store.apply_import(&profile, integration.instance_id(), imported)?;
                 remove_imported_shared_skills(&shared_skills)?;

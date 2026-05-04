@@ -76,17 +76,15 @@ Profile skeleton:
 
 ```text
 profiles/<name>/
-  AGENTS.md
-  config.json
+  PROFILE.md
   mcps.json
   skills/
   commands/
   agents/
 ```
 
-`config.json` is required. Missing optional artifacts are normalized during profile use:
+`PROFILE.md` is required. Missing optional artifacts are normalized during profile use:
 
-- `AGENTS.md`
 - `mcps.json`
 - `skills/`
 - `commands/`
@@ -111,25 +109,25 @@ Profile names are represented by `ProfileName` and must be validated at boundari
 }
 ```
 
-`type` selects integration behavior. `configDir` selects the native harness home and must be absolute or begin with `~/`. Integrations derive all managed paths from `configDir`; per-surface path overrides are intentionally unsupported. `displayName` and `binary` are optional and default from the harness type. Harness instance ids may contain only lowercase ASCII letters, numbers, and dashes.
+`type` selects integration behavior. `configDir` selects the native harness home and must be absolute, `~`, or begin with `~/`. Integrations derive all managed paths from `configDir`; per-surface path overrides are intentionally unsupported. `displayName` and `binary` are optional and default from the harness type. Harness instance ids may contain only lowercase ASCII letters, numbers, and dashes.
 
 State and profile preferences are keyed by harness instance id. If two instances have the same type and lexically normalized `configDir`, they are aliases for the same native state; profile use updates active state for every alias in that group. Doctor reports shared config directories using the same normalized alias identity.
 
-## Profile Config
+## Profile File
 
-`config.json` stores optional display metadata and opaque per-harness preferences:
+`PROFILE.md` stores optional display metadata and opaque per-harness preferences in YAML frontmatter. The Markdown body stores shared profile instructions:
 
-```json
-{
-  "name": "Work",
-  "description": "",
-  "models": {
-    "codex": "gpt-5.2"
-  },
-  "permissions": {
-    "codex": "on-request"
-  }
-}
+```md
+---
+name: Work
+description: ""
+models:
+  codex: gpt-5.2
+permissions:
+  codex: on-request
+---
+
+# Shared instructions
 ```
 
 Rules:
@@ -233,7 +231,7 @@ Drift is checked before switching away from an active profile.
 
 Drift includes:
 
-- instruction link mismatch
+- instruction content mismatch
 - skill set mismatch
 - command set mismatch
 - MCP differences for harnesses with native MCP support
@@ -244,12 +242,12 @@ Model and permission differences do not trigger drift prompts.
 
 Saving drift imports current harness managed state into the active profile:
 
-- instruction target into `AGENTS.md`
+- instruction target into the Markdown body of `PROFILE.md`
 - valid skills into `skills/`
 - Markdown commands into `commands/`
 - native sub-agents into neutral `agents/`, when the harness supports native sub-agents
 - native MCP list into `mcps.json`, when the harness supports native MCP
-- native model/permission values into `config.json`
+- native model/permission values into `PROFILE.md` frontmatter
 
 Saving drift updates only the relevant harness model and permission entries.
 
@@ -404,7 +402,7 @@ Use focused harness-specific tests for native format quirks, config preservation
 - Prefer standard library plus well-known crates.
 - Use structured parsers for JSON and TOML rather than string manipulation.
 - Patch native config files; preserve unrelated settings.
-- Use absolute symlinks for profile-owned artifacts.
+- Use direct file writes for profile instructions and absolute symlinks for profile-owned skills and commands.
 - Keep CLI output user-facing and clear.
 - Keep validation accumulated where possible so `show` and `doctor` can report multiple issues.
 - Avoid async until there is a clear need.

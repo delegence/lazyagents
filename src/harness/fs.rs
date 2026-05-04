@@ -1,5 +1,6 @@
 use crate::harness::drift::DriftItem;
 use crate::harness::integration::{AppEnvironment, HarnessDetection, ImportedFile};
+use crate::harness::managed::write_text_atomic;
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
@@ -72,7 +73,7 @@ pub fn collect_directory_link_drift(
             if !expected_names.contains(&name) {
                 items.push(DriftItem {
                     surface: surface.to_string(),
-                    detail: format!("unexpected managed entry {}", entry.path().display()),
+                    detail: format!("unexpected harness entry {}", entry.path().display()),
                 });
             }
         }
@@ -139,6 +140,52 @@ pub fn read_optional_string(path: &Path) -> Result<Option<String>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
     }
+}
+
+pub fn write_profile_instructions(profile_path: &Path, target: &Path) -> Result<()> {
+    let instructions = crate::profile::read_profile_instructions(profile_path)?;
+    write_text_atomic(target, &instructions)
+        .with_context(|| format!("failed to write {}", target.display()))
+}
+
+pub fn verify_profile_instructions(
+    harness_name: &str,
+    profile_path: &Path,
+    target: &Path,
+) -> Result<()> {
+    let expected = crate::profile::read_profile_instructions(profile_path)?;
+    let actual = fs::read_to_string(target)
+        .with_context(|| format!("failed to read instruction target {}", target.display()))?;
+    if actual != expected {
+        anyhow::bail!(
+            "{harness_name} instruction target {} does not match profile instructions",
+            target.display()
+        );
+    }
+    Ok(())
+}
+
+pub fn collect_instruction_content_drift(
+    profile_path: &Path,
+    target: &Path,
+    items: &mut Vec<DriftItem>,
+) -> Result<()> {
+    let expected = crate::profile::read_profile_instructions(profile_path)?;
+    match fs::read_to_string(target) {
+        Ok(actual) if actual == expected => {}
+        Ok(_) => items.push(DriftItem {
+            surface: "instructions".to_string(),
+            detail: format!("{} differs from active profile", target.display()),
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => items.push(DriftItem {
+            surface: "instructions".to_string(),
+            detail: format!("{} is missing", target.display()),
+        }),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", target.display()))
+        }
+    }
+    Ok(())
 }
 
 pub fn import_files_recursive(root: &Path, path: &Path) -> Result<Vec<ImportedFile>> {
