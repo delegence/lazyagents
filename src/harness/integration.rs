@@ -45,6 +45,7 @@ pub struct HarnessConfigPaths {
     pub instruction_target: PathBuf,
     pub skills_dir: PathBuf,
     pub commands_dir: PathBuf,
+    pub agents_dir: PathBuf,
     pub settings_file: PathBuf,
     pub mcp_file: PathBuf,
 }
@@ -61,6 +62,7 @@ pub struct ProfileImport {
     pub instruction: Option<String>,
     pub skills: Vec<ImportedDirectory>,
     pub commands: Vec<ImportedFile>,
+    pub agents: Option<Vec<ImportedFile>>,
     pub mcp_definitions: Option<String>,
     pub model_preference: ImportedPreference,
     pub permission_preference: ImportedPreference,
@@ -126,6 +128,9 @@ pub trait HarnessIntegration {
         true
     }
     fn supports_mcp(&self) -> bool {
+        true
+    }
+    fn supports_subagents(&self) -> bool {
         true
     }
     fn default_config_dir(&self, env: &AppEnvironment) -> PathBuf;

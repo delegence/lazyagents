@@ -32,12 +32,14 @@ cargo run -- doctor
 lazyagents help
 lazyagents doctor
 lazyagents create <name>
-lazyagents create <name> --from <claude|codex|gemini|opencode|pi>
+lazyagents create <name> --harness <harness-id>
+lazyagents create <name> -H <harness-id>
 lazyagents show <name>
 lazyagents edit <name>
 lazyagents delete <name> [--yes]
 lazyagents settings reset [--yes]
-lazyagents use <name> --harness <claude|codex|gemini|opencode|pi>
+lazyagents use <name> --harness <harness-id>
+lazyagents use <name> -H <harness-id>
 lazyagents use <name> --all
 ```
 
@@ -49,7 +51,7 @@ lazyagents use <name> --harness codex --discard-changes
 lazyagents use <name> --all --discard-changes
 ```
 
-`use` always requires an explicit target: either `--harness <id>` or `--all`.
+`use` always requires an explicit target: either `--harness <harness-id>` (`-H <harness-id>`) or `--all`. Harness ids come from `settings.json`, so they can be built-in ids such as `codex` or custom instance ids such as `codex-max`.
 
 ## What Is A Profile?
 
@@ -65,11 +67,12 @@ Profile layout:
 AGENTS.md      shared agent instructions
 skills/        skill directories containing SKILL.md
 commands/      Markdown saved prompts
+agents/        neutral Markdown sub-agent definitions
 mcps.json      neutral MCP server definitions
 config.json    model and permission preferences
 ```
 
-Profile names are CLI-safe identifiers: ASCII letters, numbers, and dashes only.
+Profile names are CLI-safe identifiers: ASCII letters, numbers, and dashes only. Names may be up to 64 characters, cannot start or end with a dash, and cannot contain consecutive dashes.
 
 ## Harness Settings
 
@@ -79,7 +82,7 @@ Harness instances are configured in:
 ~/.lazyagents/settings.json
 ```
 
-If the file is missing, `lazyagents` creates it with the default Claude, Codex, Gemini, OpenCode, and Pi instances. Each instance has an id, a harness `type`, an optional `displayName`, an optional `binary`, and a `configDir`.
+If the file is missing, `lazyagents` creates it with the default Claude, Codex, Gemini, OpenCode, and Pi instances. Each instance has an id, a harness `type`, an optional `displayName`, an optional `binary`, and a `configDir`. Instance ids use lowercase ASCII letters, numbers, and dashes. `configDir` must be absolute or begin with `~/`.
 
 Example:
 
@@ -102,7 +105,9 @@ Example:
 }
 ```
 
-Use instance ids with `--harness`. Model and permission preferences in profile `config.json` are keyed by instance id. If two instances have the same type and `configDir`, applying a profile to one marks both active because they represent the same native harness state.
+Use instance ids with `--harness` or `-H`. Model and permission preferences in profile `config.json` are keyed by instance id. If two instances have the same type and `configDir`, applying a profile to one marks both active because they represent the same native harness state.
+
+Doctor reports shared config directories using the same normalized type and `configDir` identity used for active-profile aliasing.
 
 Reset `settings.json` to the built-in defaults:
 
@@ -121,9 +126,10 @@ When you apply a profile, `lazyagents`:
 2. Checks whether the currently active profile has unsaved drift.
 3. Creates a backup of the harness-managed files.
 4. Symlinks profile instructions, skills, and commands into the harness config.
-5. Patches native model, permission, and MCP settings when supported by the harness.
-6. Verifies the result.
-7. Updates `~/.lazyagents/state.json` only after success.
+5. Renders neutral sub-agent definitions into native harness agent files when supported.
+6. Patches native model, permission, and MCP settings when supported by the harness.
+7. Verifies the result.
+8. Updates `~/.lazyagents/state.json` only after success.
 
 If apply, verification, or state saving fails, the harness is rolled back from the latest backup.
 
@@ -132,7 +138,7 @@ If apply, verification, or state saving fails, the harness is rolled back from t
 Create a profile from an existing harness:
 
 ```sh
-lazyagents create work --from codex
+lazyagents create work -H codex
 ```
 
 Import copies the current managed harness state into a self-contained profile. Symlinks are dereferenced. Valid shared skills from `~/.agents/skills` are also imported unless a harness-native skill with the same name already exists.
@@ -148,6 +154,7 @@ Drift checks include:
 - instruction links
 - skills
 - commands
+- sub-agents, for harnesses with native sub-agent support
 - MCP definitions, for harnesses with native MCP support
 - managed directory damage
 
@@ -159,6 +166,8 @@ For one harness, you can save drift back into the active profile:
 lazyagents use home --harness claude --save-changes
 ```
 
+Saving drift imports the same shared skills as `create --harness`: valid skills from `~/.agents/skills` are copied into the active profile unless a harness-native skill with the same name already exists, then the imported shared skill is removed from `~/.agents/skills`.
+
 Or discard it:
 
 ```sh
@@ -168,6 +177,34 @@ lazyagents use home --harness claude --discard-changes
 For `--all`, drift can only be discarded or cancelled.
 
 Hidden files and directories starting with `.` inside managed folders are ignored. They do not trigger drift, are not backed up, and are not cleared during profile use.
+
+## Sub-agent Format
+
+`agents/*.md` uses neutral Markdown with YAML frontmatter. The Markdown body is the sub-agent prompt/instructions. Empty bodies are allowed for harness-native agents that intentionally carry all behavior in frontmatter:
+
+```md
+---
+name: reviewer
+description: Reviews changes for correctness, security, regressions, and missing tests.
+model:
+  default: inherit
+  codex: gpt-5.4
+  claude: sonnet
+tools:
+  read: allow
+  write: deny
+permission:
+  codex: on-request
+maxTurns: 10
+harness:
+  claude:
+    isolation: worktree
+---
+
+You are a careful code reviewer.
+```
+
+Supported harnesses render this neutral format into native sub-agent files. Pi core does not natively support sub-agents, so Pi ignores profile sub-agents unless a future integration explicitly targets a Pi sub-agent extension.
 
 ## MCP Format
 
@@ -195,6 +232,8 @@ Supported transports:
 
 Disabled MCP entries are validated and emitted to harness configs as disabled entries for harnesses with native MCP support. Harnesses without native MCP support ignore `mcps.json` and preserve it during imports/save-changes.
 
+HTTP MCP `url` values must start with `http://` or `https://`. Environment variable references are preserved; for Codex HTTP headers, values like `"$TOKEN"` are rendered into Codex `env_http_headers`.
+
 ## Configuration
 
 `config.json` stores opaque per-harness preferences:
@@ -214,6 +253,18 @@ Disabled MCP entries are validated and emitted to harness configs as disabled en
 ```
 
 Missing model or permission entries behave like `"default"`, which means `lazyagents` leaves that native harness setting unchanged.
+
+Some harnesses can only serialize string model or permission preferences. Pi model preferences may be written as `provider/model`; lazyagents maps that to Pi's provider and model settings while a plain model value updates only the model.
+
+## Operational Notes
+
+Mutating commands take an exclusive lock in `~/.lazyagents/.lock`, so a second mutating command fails while another one is running.
+
+`edit` opens the profile directory with `$EDITOR` when it is set; otherwise it prints the path.
+
+`delete` refuses to remove an active profile, including profiles still referenced by lazyagents state or by symlinks in managed harness config.
+
+In non-interactive shells, drift prompts fail with instructions to pass `--save-changes` or `--discard-changes`. For `--all`, drift can only be discarded with `--discard-changes`.
 
 ## Supported harnesses:
 

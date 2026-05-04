@@ -193,10 +193,10 @@ fn e2e_create_from_imports_and_removes_shared_agent_skills() {
     fs::create_dir_all(shared_dir.join("broken")).unwrap();
     fs::write(shared_dir.join(".DS_Store"), "").unwrap();
 
-    let out = ctx.run_cli(&["create", "imported", "--from", "codex"]);
+    let out = ctx.run_cli(&["create", "imported", "-H", "codex"]);
     assert!(
         out.status.success(),
-        "create --from failed: {}",
+        "create --harness failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 

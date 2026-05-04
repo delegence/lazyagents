@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::app::harness_registry::HarnessRegistry;
-use crate::harness::artifacts::import_skills;
 use crate::harness::integration::{AppEnvironment, HarnessDetection, ImportedDirectory};
+use crate::harness::skills::import_skills;
 use crate::profile::{ProfileName, ProfileStore};
 
 pub enum CreateProfileResult {

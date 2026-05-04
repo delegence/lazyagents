@@ -52,8 +52,8 @@ pub struct SettingsResetArgs {
 #[derive(Args)]
 pub struct CreateArgs {
     pub name: String,
-    #[arg(long, value_name = "HARNESS")]
-    pub from: Option<String>,
+    #[arg(long, short = 'H', value_name = "HARNESS")]
+    pub harness: Option<String>,
 }
 
 #[derive(Args)]
@@ -71,7 +71,7 @@ pub struct DeleteArgs {
 #[derive(Args)]
 pub struct UseArgs {
     pub profile: String,
-    #[arg(long, value_name = "HARNESS", conflicts_with = "all")]
+    #[arg(long, short = 'H', value_name = "HARNESS", conflicts_with = "all")]
     pub harness: Option<String>,
     #[arg(long, conflicts_with = "harness")]
     pub all: bool,

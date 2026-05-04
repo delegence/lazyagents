@@ -6,13 +6,16 @@ use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use toml_edit::{value, DocumentMut, Item};
 
-use crate::harness::artifacts::{
-    collect_directory_link_drift, import_files_recursive, import_skills, link_skills,
-    profile_commands_recursive, valid_skills,
+use crate::harness::agents::{
+    apply_rendered_agents, collect_rendered_agent_drift, harness_scoped_value, profile_agents,
+    remove_string, remove_value, select_harness_value, split_markdown_frontmatter,
+    sub_agent_import_file, verify_rendered_agents, RenderedAgent, SubAgent,
 };
+use crate::harness::commands::profile_commands_recursive;
 use crate::harness::drift::{DriftItem, DriftReport};
 use crate::harness::fs::{
-    detect_binary, read_json, read_optional_string, symlink_file, symlink_points_to,
+    collect_directory_link_drift, detect_binary, import_files_recursive, read_json,
+    read_optional_string, symlink_file, symlink_points_to,
 };
 use crate::harness::integration::{
     AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedFile,
@@ -20,6 +23,7 @@ use crate::harness::integration::{
 };
 use crate::harness::kind::HarnessKind;
 use crate::harness::managed::{write_text_atomic, ManagedSurface};
+use crate::harness::skills::{import_skills, link_skills, valid_skills};
 use crate::profile::mcp::{
     canonical_mcp_json, parse_mcp_definitions, read_mcp_definitions, McpDefinition, McpTransport,
 };
@@ -45,6 +49,7 @@ impl HarnessIntegration for GeminiIntegration {
             instruction_target: config_dir.join("GEMINI.md"),
             skills_dir: config_dir.join("skills"),
             commands_dir: config_dir.join("commands"),
+            agents_dir: config_dir.join("agents"),
             settings_file: config_dir.join("settings.json"),
             mcp_file: config_dir.join("settings.json"),
             config_dir,
@@ -60,6 +65,7 @@ impl HarnessIntegration for GeminiIntegration {
             ManagedSurface::file(&paths.instruction_target),
             ManagedSurface::directory(&paths.skills_dir),
             ManagedSurface::directory(&paths.commands_dir),
+            ManagedSurface::directory(&paths.agents_dir),
             ManagedSurface::preserved_file(&paths.settings_file),
         ]
     }
@@ -87,6 +93,11 @@ impl HarnessIntegration for GeminiIntegration {
             &mut items,
         )?;
         collect_gemini_command_drift(active, paths, &mut items)?;
+        collect_rendered_agent_drift(
+            &render_gemini_profile_agents(active)?,
+            &paths.agents_dir,
+            &mut items,
+        )?;
 
         let native_mcps =
             parse_mcp_definitions(&import_gemini_mcps(&read_json(&paths.mcp_file)?)?)?;
@@ -106,6 +117,7 @@ impl HarnessIntegration for GeminiIntegration {
             instruction: read_optional_string(&paths.instruction_target)?,
             skills: import_skills(&paths.skills_dir)?,
             commands: import_gemini_commands(&paths.commands_dir)?,
+            agents: import_gemini_agents(&paths.agents_dir)?,
             mcp_definitions: Some(import_gemini_mcps(&settings)?),
             model_preference: ImportedPreference::new(import_nested_setting(
                 &settings,
@@ -125,10 +137,13 @@ impl HarnessIntegration for GeminiIntegration {
             .with_context(|| format!("failed to create {}", paths.skills_dir.display()))?;
         fs::create_dir_all(&paths.commands_dir)
             .with_context(|| format!("failed to create {}", paths.commands_dir.display()))?;
+        fs::create_dir_all(&paths.agents_dir)
+            .with_context(|| format!("failed to create {}", paths.agents_dir.display()))?;
 
         symlink_file(profile.path.join("AGENTS.md"), &paths.instruction_target)?;
         link_skills(profile, paths)?;
         write_gemini_commands(profile, paths)?;
+        apply_rendered_agents(&render_gemini_profile_agents(profile)?, &paths.agents_dir)?;
         patch_gemini_settings(profile, paths)?;
         Ok(())
     }
@@ -164,8 +179,14 @@ impl HarnessIntegration for GeminiIntegration {
                 anyhow::bail!("Gemini command {} was not applied", target.display());
             }
         }
+        verify_rendered_agents(&render_gemini_profile_agents(profile)?, &paths.agents_dir)?;
 
-        let _ = read_json(&paths.settings_file)?;
+        let settings = read_json(&paths.settings_file)?;
+        let native_mcps = parse_mcp_definitions(&import_gemini_mcps(&settings)?)?;
+        let profile_mcps = read_mcp_definitions(&profile.path)?;
+        if canonical_mcp_json(&native_mcps)? != canonical_mcp_json(&profile_mcps)? {
+            anyhow::bail!("Gemini MCP config does not match profile MCP definitions");
+        }
         Ok(())
     }
 }
@@ -287,6 +308,203 @@ fn toml_command_to_markdown(relative: &Path) -> PathBuf {
     let mut path = relative.to_path_buf();
     path.set_extension("md");
     path
+}
+
+fn render_gemini_profile_agents(profile: &ProfileRef) -> Result<Vec<RenderedAgent>> {
+    profile_agents(&profile.path)?
+        .into_iter()
+        .map(|agent| render_gemini_agent(&agent))
+        .collect()
+}
+
+fn render_gemini_agent(agent: &SubAgent) -> Result<RenderedAgent> {
+    let mut map = serde_yaml::Mapping::new();
+    map.insert(yaml_key("name"), agent.name.clone().into());
+    map.insert(yaml_key("description"), agent.description.clone().into());
+    map.insert(yaml_key("kind"), "local".into());
+    if let Some(model) = select_harness_value(agent.model.as_ref(), "gemini") {
+        map.insert(yaml_key("model"), model.clone());
+    }
+    if let Some(tools) = agent.tools.as_ref() {
+        map.insert(yaml_key("tools"), tools_to_allow_list(tools));
+    }
+    if let Some(permission) = select_harness_value(agent.permission.as_ref(), "gemini") {
+        map.insert(yaml_key("permission"), permission.clone());
+    }
+    if let Some(max_turns) = agent.max_turns {
+        map.insert(
+            yaml_key("maxTurns"),
+            serde_yaml::Value::Number(max_turns.into()),
+        );
+    }
+    merge_harness_override(&mut map, agent, "gemini")?;
+    Ok(RenderedAgent {
+        relative_path: PathBuf::from(format!("{}.md", agent.name)),
+        contents: render_native_markdown(map, &agent.body)?,
+    })
+}
+
+fn import_gemini_agents(path: &Path) -> Result<Option<Vec<ImportedFile>>> {
+    import_markdown_agents_as_neutral(path, "gemini")
+}
+
+fn import_markdown_agents_as_neutral(
+    path: &Path,
+    harness_id: &str,
+) -> Result<Option<Vec<ImportedFile>>> {
+    if !path.exists() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut imported = Vec::new();
+    for file in crate::harness::fs::import_files_recursive(path, path)? {
+        if !file
+            .relative_path
+            .extension()
+            .is_some_and(|ext| ext == "md")
+        {
+            continue;
+        }
+        let text = String::from_utf8(file.contents).with_context(|| {
+            format!("Gemini agent {} is not UTF-8", file.relative_path.display())
+        })?;
+        let fallback_name = file
+            .relative_path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("invalid agent path {}", file.relative_path.display())
+            })?;
+        let neutral = native_markdown_to_neutral(&text, fallback_name, harness_id)?;
+        imported.push(sub_agent_import_file(&neutral));
+    }
+    imported.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(Some(imported))
+}
+
+fn native_markdown_to_neutral(
+    text: &str,
+    fallback_name: &str,
+    harness_id: &str,
+) -> Result<SubAgent> {
+    let (frontmatter, body) = split_markdown_frontmatter(text)?;
+    let mut map = serde_yaml::from_str::<serde_yaml::Mapping>(frontmatter)?;
+    let name = remove_string(&mut map, "name")?.unwrap_or_else(|| fallback_name.to_string());
+    let description = remove_string(&mut map, "description")?
+        .ok_or_else(|| anyhow::anyhow!("native agent is missing description"))?;
+    let body = body.trim().to_string();
+    let model = harness_scoped_value(harness_id, remove_value(&mut map, "model"));
+    let tools = remove_value(&mut map, "tools").map(normalize_tools_for_profile);
+    let permission = harness_scoped_value(
+        harness_id,
+        remove_value(&mut map, "permission").or_else(|| remove_value(&mut map, "permissionMode")),
+    );
+    let max_turns = remove_value(&mut map, "maxTurns")
+        .or_else(|| remove_value(&mut map, "max_turns"))
+        .and_then(|value| value.as_u64());
+    remove_value(&mut map, "kind");
+    remove_value(&mut map, "mode");
+    let mut harness = BTreeMap::new();
+    if !map.is_empty() {
+        harness.insert(harness_id.to_string(), serde_yaml::Value::Mapping(map));
+    }
+    Ok(SubAgent {
+        name,
+        description,
+        model,
+        tools,
+        permission,
+        max_turns,
+        harness,
+        body,
+    })
+}
+
+fn render_native_markdown(map: serde_yaml::Mapping, body: &str) -> Result<String> {
+    let yaml = serde_yaml::to_string(&map)?;
+    Ok(format!(
+        "---\n{}---\n{}\n",
+        yaml.strip_prefix("---\n").unwrap_or(&yaml),
+        body
+    ))
+}
+
+fn merge_harness_override(
+    map: &mut serde_yaml::Mapping,
+    agent: &SubAgent,
+    harness_id: &str,
+) -> Result<()> {
+    let Some(serde_yaml::Value::Mapping(override_map)) = agent.harness.get(harness_id) else {
+        return Ok(());
+    };
+    for (key, value) in override_map {
+        if !matches!(key, serde_yaml::Value::String(_)) {
+            anyhow::bail!("{harness_id} harness override keys must be strings");
+        }
+        map.insert(key.clone(), value.clone());
+    }
+    Ok(())
+}
+
+fn tools_to_allow_list(value: &serde_yaml::Value) -> serde_yaml::Value {
+    match value {
+        serde_yaml::Value::Mapping(map) => serde_yaml::Value::Sequence(
+            map.iter()
+                .filter_map(|(key, val)| {
+                    let key = key.as_str()?;
+                    if tool_is_allowed(val) {
+                        Some(serde_yaml::Value::String(key.to_string()))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn normalize_tools_for_profile(value: serde_yaml::Value) -> serde_yaml::Value {
+    match value {
+        serde_yaml::Value::Mapping(map) => {
+            let mut out = serde_yaml::Mapping::new();
+            for (key, value) in map {
+                let normalized = match value {
+                    serde_yaml::Value::Bool(true) => serde_yaml::Value::String("allow".to_string()),
+                    serde_yaml::Value::Bool(false) => serde_yaml::Value::String("deny".to_string()),
+                    other => other,
+                };
+                out.insert(key, normalized);
+            }
+            serde_yaml::Value::Mapping(out)
+        }
+        serde_yaml::Value::Sequence(items) => {
+            let mut out = serde_yaml::Mapping::new();
+            for item in items {
+                if let Some(tool) = item.as_str() {
+                    out.insert(
+                        yaml_key(tool),
+                        serde_yaml::Value::String("allow".to_string()),
+                    );
+                }
+            }
+            serde_yaml::Value::Mapping(out)
+        }
+        other => other,
+    }
+}
+
+fn tool_is_allowed(value: &serde_yaml::Value) -> bool {
+    match value {
+        serde_yaml::Value::Bool(value) => *value,
+        serde_yaml::Value::String(value) => {
+            matches!(value.as_str(), "allow" | "allowed" | "true" | "yes")
+        }
+        _ => false,
+    }
+}
+
+fn yaml_key(key: &str) -> serde_yaml::Value {
+    serde_yaml::Value::String(key.to_string())
 }
 
 fn patch_gemini_settings(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {

@@ -6,18 +6,24 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
-use crate::harness::artifacts::{
-    collect_directory_link_drift, flat_profile_commands, import_flat_commands, import_skills,
-    link_flat_commands, link_skills, valid_skills,
+use crate::harness::agents::{
+    apply_rendered_agents, collect_rendered_agent_drift, harness_scoped_value, profile_agents,
+    select_harness_value, sub_agent_import_file, verify_rendered_agents, yaml_scalar_string,
+    RenderedAgent, SubAgent,
 };
+use crate::harness::commands::{flat_profile_commands, import_flat_commands, link_flat_commands};
 use crate::harness::drift::{DriftItem, DriftReport};
-use crate::harness::fs::{detect_binary, read_optional_string, symlink_file, symlink_points_to};
+use crate::harness::fs::{
+    collect_directory_link_drift, detect_binary, read_optional_string, symlink_file,
+    symlink_points_to,
+};
 use crate::harness::integration::{
-    AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedPreference,
-    ProfileImport, ProfileRef,
+    AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedFile,
+    ImportedPreference, ProfileImport, ProfileRef,
 };
 use crate::harness::kind::HarnessKind;
 use crate::harness::managed::{write_text_atomic, ManagedSurface};
+use crate::harness::skills::{import_skills, link_skills, valid_skills};
 use crate::profile::mcp::{
     canonical_mcp_json, parse_mcp_definitions, read_mcp_definitions, McpDefinition, McpTransport,
 };
@@ -43,6 +49,7 @@ impl HarnessIntegration for CodexIntegration {
             instruction_target: config_dir.join("AGENTS.md"),
             skills_dir: config_dir.join("skills"),
             commands_dir: config_dir.join("prompts"),
+            agents_dir: config_dir.join("agents"),
             settings_file: config_dir.join("config.toml"),
             mcp_file: config_dir.join("config.toml"),
             config_dir,
@@ -58,12 +65,15 @@ impl HarnessIntegration for CodexIntegration {
             ManagedSurface::file(&paths.instruction_target),
             ManagedSurface::directory(&paths.skills_dir),
             ManagedSurface::directory(&paths.commands_dir),
+            ManagedSurface::directory(&paths.agents_dir),
             ManagedSurface::preserved_file(&paths.settings_file),
         ]
     }
 
     fn preflight(&self, profile: &ProfileRef) -> Result<()> {
-        flat_profile_commands(&profile.path).map(|_| ())
+        flat_profile_commands(&profile.path)?;
+        profile_agents(&profile.path)?;
+        Ok(())
     }
 
     fn detect_drift(&self, active: &ProfileRef, paths: &HarnessConfigPaths) -> Result<DriftReport> {
@@ -90,6 +100,11 @@ impl HarnessIntegration for CodexIntegration {
             &paths.commands_dir,
             &mut items,
         )?;
+        collect_rendered_agent_drift(
+            &render_codex_profile_agents(active)?,
+            &paths.agents_dir,
+            &mut items,
+        )?;
         let native_mcps =
             parse_mcp_definitions(&import_codex_mcps(&read_config(&paths.settings_file)?)?)?;
         let profile_mcps = read_mcp_definitions(&active.path)?;
@@ -108,6 +123,7 @@ impl HarnessIntegration for CodexIntegration {
             instruction: read_optional_string(&paths.instruction_target)?,
             skills: import_skills(&paths.skills_dir)?,
             commands: import_flat_commands(&paths.commands_dir)?,
+            agents: import_codex_agents(&paths.agents_dir)?,
             mcp_definitions: Some(import_codex_mcps(&document)?),
             model_preference: ImportedPreference::new(
                 document
@@ -133,10 +149,13 @@ impl HarnessIntegration for CodexIntegration {
             .with_context(|| format!("failed to create {}", paths.skills_dir.display()))?;
         fs::create_dir_all(&paths.commands_dir)
             .with_context(|| format!("failed to create {}", paths.commands_dir.display()))?;
+        fs::create_dir_all(&paths.agents_dir)
+            .with_context(|| format!("failed to create {}", paths.agents_dir.display()))?;
 
         symlink_file(profile.path.join("AGENTS.md"), &paths.instruction_target)?;
         link_skills(profile, paths)?;
         link_flat_commands(profile, paths)?;
+        apply_rendered_agents(&render_codex_profile_agents(profile)?, &paths.agents_dir)?;
         patch_codex_config(profile, paths)?;
         Ok(())
     }
@@ -171,10 +190,252 @@ impl HarnessIntegration for CodexIntegration {
                 anyhow::bail!("Codex command link {} was not applied", target.display());
             }
         }
+        verify_rendered_agents(&render_codex_profile_agents(profile)?, &paths.agents_dir)?;
 
-        let _ = read_config(&paths.settings_file)?;
+        let document = read_config(&paths.settings_file)?;
+        let native_mcps = parse_mcp_definitions(&import_codex_mcps(&document)?)?;
+        let profile_mcps = read_mcp_definitions(&profile.path)?;
+        if canonical_mcp_json(&native_mcps)? != canonical_mcp_json(&profile_mcps)? {
+            anyhow::bail!("Codex MCP config does not match profile MCP definitions");
+        }
         Ok(())
     }
+}
+
+fn render_codex_profile_agents(profile: &ProfileRef) -> Result<Vec<RenderedAgent>> {
+    profile_agents(&profile.path)?
+        .into_iter()
+        .map(|agent| render_codex_agent(&agent))
+        .collect()
+}
+
+fn render_codex_agent(agent: &SubAgent) -> Result<RenderedAgent> {
+    let mut document = DocumentMut::new();
+    document["name"] = value(agent.name.clone());
+    document["description"] = value(agent.description.clone());
+    document["developer_instructions"] = value(agent.body.clone());
+    if let Some(model) =
+        select_harness_value(agent.model.as_ref(), "codex").and_then(yaml_scalar_string)
+    {
+        document["model"] = value(model);
+    }
+    if let Some(permission) =
+        select_harness_value(agent.permission.as_ref(), "codex").and_then(yaml_scalar_string)
+    {
+        document["approval_policy"] = value(permission);
+    }
+    if let Some(max_turns) = agent.max_turns {
+        document["max_turns"] = value(max_turns as i64);
+    }
+    if let Some(serde_yaml::Value::Mapping(map)) = agent.harness.get("codex") {
+        for (key, val) in map {
+            let Some(key) = key.as_str() else {
+                anyhow::bail!("Codex harness override keys must be strings");
+            };
+            document[key] = yaml_to_toml_item(val)?;
+        }
+    }
+    Ok(RenderedAgent {
+        relative_path: std::path::PathBuf::from(format!("{}.toml", agent.name)),
+        contents: document.to_string(),
+    })
+}
+
+fn import_codex_agents(path: &Path) -> Result<Option<Vec<ImportedFile>>> {
+    if !path.exists() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut imported = Vec::new();
+    for file in crate::harness::fs::import_files_recursive(path, path)? {
+        if !file
+            .relative_path
+            .extension()
+            .is_some_and(|ext| ext == "toml")
+        {
+            continue;
+        }
+        let text = String::from_utf8(file.contents).with_context(|| {
+            format!("Codex agent {} is not UTF-8", file.relative_path.display())
+        })?;
+        let neutral = codex_toml_to_neutral(&text).with_context(|| {
+            format!(
+                "failed to import Codex agent {}",
+                file.relative_path.display()
+            )
+        })?;
+        imported.push(sub_agent_import_file(&neutral));
+    }
+    imported.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(Some(imported))
+}
+
+fn codex_toml_to_neutral(text: &str) -> Result<SubAgent> {
+    let document = text.parse::<DocumentMut>()?;
+    let name = document
+        .get("name")
+        .and_then(Item::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Codex agent is missing name"))?
+        .to_string();
+    let description = document
+        .get("description")
+        .and_then(Item::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Codex agent is missing description"))?
+        .to_string();
+    let body = document
+        .get("developer_instructions")
+        .and_then(Item::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Codex agent is missing developer_instructions"))?
+        .to_string();
+    let model = harness_scoped_value(
+        "codex",
+        document
+            .get("model")
+            .and_then(Item::as_str)
+            .map(|model| serde_yaml::Value::String(model.to_string())),
+    );
+    let permission = harness_scoped_value(
+        "codex",
+        document
+            .get("approval_policy")
+            .and_then(Item::as_str)
+            .map(|permission| serde_yaml::Value::String(permission.to_string())),
+    );
+    let max_turns = document
+        .get("max_turns")
+        .and_then(Item::as_integer)
+        .and_then(|turns| turns.try_into().ok());
+    let mut codex_overrides = serde_yaml::Mapping::new();
+    for (key, item) in document.as_table().iter() {
+        if matches!(
+            key,
+            "name"
+                | "description"
+                | "developer_instructions"
+                | "model"
+                | "approval_policy"
+                | "max_turns"
+        ) {
+            continue;
+        }
+        codex_overrides.insert(
+            serde_yaml::Value::String(key.to_string()),
+            toml_item_to_yaml(item)
+                .with_context(|| format!("failed to import Codex agent field {key}"))?,
+        );
+    }
+    let mut harness = BTreeMap::new();
+    if !codex_overrides.is_empty() {
+        harness.insert(
+            "codex".to_string(),
+            serde_yaml::Value::Mapping(codex_overrides),
+        );
+    }
+    Ok(SubAgent {
+        name,
+        description,
+        model,
+        tools: None,
+        permission,
+        max_turns,
+        harness,
+        body,
+    })
+}
+
+fn toml_item_to_yaml(item: &Item) -> Result<serde_yaml::Value> {
+    if item.is_none() {
+        return Ok(serde_yaml::Value::Null);
+    }
+    if let Some(value) = item.as_value() {
+        return toml_value_to_yaml(value);
+    }
+    if let Some(table) = item.as_table() {
+        let mut map = serde_yaml::Mapping::new();
+        for (key, value) in table.iter() {
+            map.insert(
+                serde_yaml::Value::String(key.to_string()),
+                toml_item_to_yaml(value)?,
+            );
+        }
+        return Ok(serde_yaml::Value::Mapping(map));
+    }
+    anyhow::bail!("unsupported TOML value {}", item.to_string().trim())
+}
+
+fn toml_value_to_yaml(value: &toml_edit::Value) -> Result<serde_yaml::Value> {
+    if let Some(value) = value.as_str() {
+        return Ok(serde_yaml::Value::String(value.to_string()));
+    }
+    if let Some(value) = value.as_bool() {
+        return Ok(serde_yaml::Value::Bool(value));
+    }
+    if let Some(value) = value.as_integer() {
+        return Ok(serde_yaml::Value::Number(value.into()));
+    }
+    if let Some(value) = value.as_float() {
+        return Ok(serde_yaml::to_value(value)?);
+    }
+    if let Some(array) = value.as_array() {
+        return array
+            .iter()
+            .map(toml_value_to_yaml)
+            .collect::<Result<Vec<_>>>()
+            .map(serde_yaml::Value::Sequence);
+    }
+    if let Some(table) = value.as_inline_table() {
+        let mut map = serde_yaml::Mapping::new();
+        for (key, value) in table.iter() {
+            map.insert(
+                serde_yaml::Value::String(key.to_string()),
+                toml_value_to_yaml(value)?,
+            );
+        }
+        return Ok(serde_yaml::Value::Mapping(map));
+    }
+    if let Some(value) = value.as_datetime() {
+        return Ok(serde_yaml::Value::String(value.to_string()));
+    }
+    anyhow::bail!("unsupported TOML value {}", value)
+}
+
+fn yaml_to_toml_item(yaml: &serde_yaml::Value) -> Result<Item> {
+    Ok(match yaml {
+        serde_yaml::Value::Null => Item::None,
+        serde_yaml::Value::Bool(v) => value(*v),
+        serde_yaml::Value::Number(v) => {
+            if let Some(i) = v.as_i64() {
+                value(i)
+            } else if let Some(f) = v.as_f64() {
+                value(f)
+            } else {
+                anyhow::bail!("unsupported numeric TOML value");
+            }
+        }
+        serde_yaml::Value::String(v) => value(v.clone()),
+        serde_yaml::Value::Sequence(values) => {
+            let mut array = Array::default();
+            for value in values {
+                match yaml_to_toml_item(value)? {
+                    Item::Value(value) => array.push_formatted(value),
+                    _ => anyhow::bail!("TOML arrays only support scalar values"),
+                }
+            }
+            Item::Value(array.into())
+        }
+        serde_yaml::Value::Mapping(values) => {
+            let mut table = Table::new();
+            for (key, value) in values {
+                let Some(key) = key.as_str() else {
+                    anyhow::bail!("TOML table keys must be strings");
+                };
+                table[key] = yaml_to_toml_item(value)?;
+            }
+            Item::Table(table)
+        }
+        serde_yaml::Value::Tagged(_) => {
+            anyhow::bail!("YAML tags are not supported in agent overrides")
+        }
+    })
 }
 
 fn patch_codex_config(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
@@ -484,4 +745,81 @@ Authorization = "TOKEN"
     }
 
     crate::define_standard_harness_tests!(CodexAdapter);
+
+    #[test]
+    fn codex_render_ignores_other_harness_model_values() {
+        let agent = SubAgent {
+            name: "coder".to_string(),
+            description: "Writes code".to_string(),
+            model: Some(serde_yaml::from_str("opencode: gpt-5.2").unwrap()),
+            tools: None,
+            permission: Some(serde_yaml::from_str("opencode: ask").unwrap()),
+            max_turns: None,
+            harness: BTreeMap::new(),
+            body: "Implement carefully.".to_string(),
+        };
+
+        let rendered = render_codex_agent(&agent).unwrap();
+
+        assert!(!rendered.contents.contains("model ="));
+        assert!(!rendered.contents.contains("approval_policy ="));
+        assert!(rendered
+            .contents
+            .contains("developer_instructions = \"Implement carefully.\""));
+    }
+
+    #[test]
+    fn codex_import_preserves_native_only_fields_under_harness_override() {
+        let agent = codex_toml_to_neutral(
+            r#"
+name = "reviewer"
+description = "Reviews code"
+developer_instructions = "Review carefully."
+model = "gpt-5.4"
+approval_policy = "on-request"
+model_reasoning_effort = "high"
+sandbox_mode = "workspace-write"
+
+[env]
+RUST_LOG = "debug"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            agent
+                .model
+                .as_ref()
+                .and_then(|model| model.get("codex"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("gpt-5.4")
+        );
+        assert_eq!(
+            agent
+                .harness
+                .get("codex")
+                .and_then(|value| value.get("model_reasoning_effort"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            agent
+                .harness
+                .get("codex")
+                .and_then(|value| value.get("env"))
+                .and_then(|env| env.get("RUST_LOG"))
+                .and_then(serde_yaml::Value::as_str),
+            Some("debug")
+        );
+
+        let rendered = render_codex_agent(&agent).unwrap();
+        assert!(rendered
+            .contents
+            .contains("model_reasoning_effort = \"high\""));
+        assert!(rendered
+            .contents
+            .contains("sandbox_mode = \"workspace-write\""));
+        assert!(rendered.contents.contains("[env]"));
+        assert!(rendered.contents.contains("RUST_LOG = \"debug\""));
+    }
 }

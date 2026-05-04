@@ -4,13 +4,11 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 
-use crate::harness::artifacts::{
-    collect_directory_link_drift, flat_profile_commands, import_flat_commands, import_skills,
-    link_flat_commands, link_skills, valid_skills,
-};
+use crate::harness::commands::{flat_profile_commands, import_flat_commands, link_flat_commands};
 use crate::harness::drift::{DriftItem, DriftReport};
 use crate::harness::fs::{
-    detect_binary, read_json, read_optional_string, symlink_file, symlink_points_to,
+    collect_directory_link_drift, detect_binary, read_json, read_optional_string, symlink_file,
+    symlink_points_to,
 };
 use crate::harness::integration::{
     AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedPreference,
@@ -18,6 +16,7 @@ use crate::harness::integration::{
 };
 use crate::harness::kind::HarnessKind;
 use crate::harness::managed::{write_text_atomic, ManagedSurface};
+use crate::harness::skills::{import_skills, link_skills, valid_skills};
 use crate::profile::ProfileConfig;
 
 pub struct PiIntegration;
@@ -28,6 +27,10 @@ impl HarnessIntegration for PiIntegration {
     }
 
     fn supports_mcp(&self) -> bool {
+        false
+    }
+
+    fn supports_subagents(&self) -> bool {
         false
     }
 
@@ -44,6 +47,7 @@ impl HarnessIntegration for PiIntegration {
             instruction_target: config_dir.join("AGENTS.md"),
             skills_dir: config_dir.join("skills"),
             commands_dir: config_dir.join("prompts"),
+            agents_dir: config_dir.join("agents"),
             settings_file: config_dir.join("settings.json"),
             mcp_file: config_dir.join("settings.json"),
             config_dir,
@@ -100,6 +104,7 @@ impl HarnessIntegration for PiIntegration {
             instruction: read_optional_string(&paths.instruction_target)?,
             skills: import_skills(&paths.skills_dir)?,
             commands: import_flat_commands(&paths.commands_dir)?,
+            agents: None,
             mcp_definitions: None,
             model_preference: ImportedPreference::new(import_pi_model_preference(&settings)),
             permission_preference: ImportedPreference::default_value(),

@@ -1,7 +1,9 @@
+pub mod agents;
 pub mod apply;
-pub mod artifacts;
+pub mod commands;
 pub mod drift;
 pub mod fs;
 pub mod integration;
 pub mod kind;
 pub mod managed;
+pub mod skills;

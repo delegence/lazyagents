@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use crate::app::harness_registry::HarnessRegistry;
 use crate::app::state::LazyagentsState;
 use crate::harness::integration::AppEnvironment;
-use crate::profile::ProfileStore;
+use crate::profile::{ProfileName, ProfileStore};
 
 pub fn delete_profile(
     registry: &dyn HarnessRegistry,
@@ -13,12 +13,13 @@ pub fn delete_profile(
     store: &ProfileStore,
     name: &str,
 ) -> Result<PathBuf> {
-    let path = store.profile_dir_for_raw_name(name)?;
+    let name = ProfileName::parse(name)?;
+    let path = store.profile_dir(&name);
     if !path.exists() {
         anyhow::bail!("profile {name} does not exist at {}", path.display());
     }
 
-    let active_reasons = profile_active_reasons(registry, env, store, name, &path)?;
+    let active_reasons = profile_active_reasons(registry, env, store, &name, &path)?;
     if !active_reasons.is_empty() {
         anyhow::bail!(
             "cannot delete active profile {name}: {}",
@@ -35,13 +36,13 @@ fn profile_active_reasons(
     registry: &dyn HarnessRegistry,
     env: &AppEnvironment,
     store: &ProfileStore,
-    name: &str,
+    name: &ProfileName,
     profile_dir: &Path,
 ) -> Result<Vec<String>> {
     let mut reasons = Vec::new();
     let state = LazyagentsState::load(&env.lazyagents_home.join("state.json"))?;
     for (harness, profile) in state.active_profiles {
-        if profile.as_str() == name {
+        if &profile == name {
             reasons.push(format!("state marks it active for {harness}"));
         }
     }

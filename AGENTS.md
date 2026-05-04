@@ -5,7 +5,7 @@ study docs/* for product contract, specifications and etc.
 
 ## How to run
 - `cargo run` shows CLI help.
-- `cargo run -- <command>` runs CLI commands (e.g. `cargo run -- profiles`).
+- `cargo run -- <command>` runs CLI commands (e.g. `cargo run -- doctor`).
 
 ## How to test
 - `cargo test` to run tests

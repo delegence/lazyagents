@@ -6,6 +6,7 @@ use crate::harness::drift::DriftReport;
 use crate::harness::integration::{
     AppEnvironment, HarnessDetection, HarnessIntegration, ProfileRef,
 };
+use crate::harness::kind::normalize_path_lexically;
 use crate::profile::{ProfileConfigStatus, ProfileName, ProfileStore};
 
 pub struct DoctorReport {
@@ -127,12 +128,12 @@ fn status_rows_for(
     }
 
     rows.sort_by(|left, right| left.harness.cmp(&right.harness));
-    let mut first_by_config: std::collections::BTreeMap<(String, String), String> =
+    let mut first_by_config: std::collections::BTreeMap<(String, std::path::PathBuf), String> =
         std::collections::BTreeMap::new();
     for row in &mut rows {
         let key = (
             row.harness_type.clone(),
-            row.config_dir.display().to_string(),
+            normalize_path_lexically(&row.config_dir),
         );
         if let Some(first) = first_by_config.get(&key) {
             row.shared_config_with = Some(first.clone());
@@ -291,6 +292,7 @@ mod tests {
         kind: HarnessKind,
         detected: bool,
         drift: Result<DriftReport, &'static str>,
+        config_dir: Option<PathBuf>,
     }
 
     impl StatusIntegration {
@@ -299,6 +301,7 @@ mod tests {
                 kind,
                 detected: true,
                 drift: Ok(drift),
+                config_dir: None,
             }
         }
 
@@ -307,6 +310,7 @@ mod tests {
                 kind,
                 detected: false,
                 drift: Ok(DriftReport::clean()),
+                config_dir: None,
             }
         }
 
@@ -315,7 +319,13 @@ mod tests {
                 kind,
                 detected: true,
                 drift: Err("drift failed"),
+                config_dir: None,
             }
+        }
+
+        fn with_config_dir(mut self, config_dir: PathBuf) -> Self {
+            self.config_dir = Some(config_dir);
+            self
         }
     }
 
@@ -325,7 +335,9 @@ mod tests {
         }
 
         fn default_config_dir(&self, env: &AppEnvironment) -> PathBuf {
-            env.user_home.join(self.kind.id())
+            self.config_dir
+                .clone()
+                .unwrap_or_else(|| env.user_home.join(self.kind.id()))
         }
 
         fn paths_from_config_dir(&self, root: PathBuf) -> Result<HarnessConfigPaths> {
@@ -334,6 +346,7 @@ mod tests {
                 instruction_target: root.join("AGENTS.md"),
                 skills_dir: root.join("skills"),
                 commands_dir: root.join("commands"),
+                agents_dir: root.join("agents"),
                 settings_file: root.join("settings.json"),
                 mcp_file: root.join("mcp.json"),
             })
@@ -377,6 +390,7 @@ mod tests {
                 instruction: None,
                 skills: Vec::new(),
                 commands: Vec::new(),
+                agents: Some(Vec::new()),
                 mcp_definitions: None,
                 model_preference: ImportedPreference::default_value(),
                 permission_preference: ImportedPreference::default_value(),
@@ -520,6 +534,39 @@ mod tests {
                 has_validation_errors: true,
             }
         );
+    }
+
+    #[test]
+    fn status_reports_shared_config_dirs_after_lexical_normalization() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("lazyagents");
+        let store = ProfileStore::new(LazyagentsHome::from_path(&home));
+        let env = AppEnvironment {
+            lazyagents_home: home,
+            user_home: temp.path().join("user"),
+            path_entries: Vec::new(),
+        };
+        let config_dir = env.user_home.join("codex");
+
+        let rows = status_rows_for(
+            &env,
+            &store,
+            vec![
+                Box::new(
+                    StatusIntegration::detected(HarnessKind::Codex, DriftReport::clean())
+                        .with_config_dir(config_dir.clone()),
+                ),
+                Box::new(
+                    StatusIntegration::detected(HarnessKind::Codex, DriftReport::clean())
+                        .with_config_dir(config_dir.join("..").join("codex")),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].shared_config_with, None);
+        assert_eq!(rows[1].shared_config_with.as_deref(), Some("codex"));
     }
 
     #[test]

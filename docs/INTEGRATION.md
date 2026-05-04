@@ -9,7 +9,7 @@ The goal is that a new harness is added as one concrete integration file plus sm
 Keep the dependency direction intact:
 
 - `src/profile/` owns profile names, config, neutral MCP parsing, validation, summaries, and profile filesystem storage.
-- `src/harness/` owns generic harness primitives and mechanics: harness type/instance values, `HarnessIntegration`, config paths, managed surfaces, drift report types, artifact helpers, transactional apply, backup/rollback, symlink helpers, and atomic writes.
+- `src/harness/` owns generic harness primitives and mechanics: harness type/instance values, `HarnessIntegration`, config paths, managed surfaces, drift report types, skill and command helpers, transactional apply, backup/rollback, symlink helpers, and atomic writes.
 - `src/integrations/` owns concrete harness implementations. Put one harness per file.
 - `src/app/` owns product workflows and composition, including the built-in harness registry.
 - `src/cli/` owns terminal-specific parsing, prompts, rendering, and `$EDITOR` execution.
@@ -28,7 +28,7 @@ docs/ARCHITECTURE.md
 README.md
 ```
 
-If the harness needs reusable filesystem or artifact logic, add it to `src/harness/artifacts.rs` or `src/harness/fs.rs` only when it is genuinely shared.
+If the harness needs reusable artifact or filesystem logic, put skill-specific helpers in `src/harness/skills.rs`, command-specific helpers in `src/harness/commands.rs`, and generic filesystem helpers in `src/harness/fs.rs` only when they are genuinely shared.
 
 ## Implementation Steps
 
@@ -61,6 +61,7 @@ impl HarnessIntegration for ExampleIntegration {
     fn supports_skills(&self) -> bool { ... } // optional; defaults to true
     fn supports_commands(&self) -> bool { ... } // optional; defaults to true
     fn supports_mcp(&self) -> bool { ... } // optional; defaults to true
+    fn supports_subagents(&self) -> bool { ... } // optional; defaults to true
     fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection> { ... }
     fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> { ... }
     fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> { ... }
@@ -156,11 +157,13 @@ Do not leave docs saying only Codex, Claude Code, and OpenCode are supported if 
 
 Return the new `HarnessKind` variant. This is the harness type, not necessarily the user-facing instance id.
 
-### `supports_skills`, `supports_commands`, and `supports_mcp`
+### `supports_skills`, `supports_commands`, `supports_mcp`, and `supports_subagents`
 
 Return `false` for any profile artifact type the harness cannot represent. Unsupported artifact types are ignored by the integration: do not apply, verify, drift-check, import, or clear them. The defaults are `true` for existing harnesses.
 
 For MCP specifically, returning `false` also tells app-layer drift setup not to validate the active profile's `mcps.json` for this harness.
+
+For sub-agents specifically, returning `false` tells app-layer drift setup not to validate active profile sub-agent definitions for this harness.
 
 ### `detect`
 
@@ -215,7 +218,7 @@ Drift should include:
 
 Model and permission differences should not trigger drift prompts.
 
-Use shared helpers from `src/harness/artifacts.rs` when possible.
+Use shared helpers from `src/harness/skills.rs`, `src/harness/commands.rs`, and `src/harness/fs.rs` when possible.
 
 ### `import_from_harness`
 
@@ -255,7 +258,7 @@ Verification failures trigger rollback. Keep errors clear and path-specific.
 
 ## Artifact Support And MCP Rules
 
-Skill, command, and MCP support are optional per harness. If the harness has no native support for one of these artifact types, the integration should not apply, verify, drift-check, import, or clear it. Returning `mcp_definitions: None` from `import_from_harness` preserves existing profile MCPs during `--save-changes` and `create --from`.
+Skill, command, and MCP support are optional per harness. If the harness has no native support for one of these artifact types, the integration should not apply, verify, drift-check, import, or clear it. Returning `mcp_definitions: None` from `import_from_harness` preserves existing profile MCPs during `--save-changes` and `create --harness`.
 
 For harnesses with native MCP support, use `crate::profile::mcp::read_mcp_definitions` to parse profile MCP definitions.
 
@@ -264,7 +267,9 @@ Current neutral transports:
 - `stdio`
 - `http`
 
-Disabled MCP entries are validated and emitted to native config as disabled entries. If a harness supports native MCP but cannot represent a specific MCP definition, apply must fail so rollback can restore the previous harness state.
+HTTP MCP URLs must start with `http://` or `https://`. Disabled MCP entries are validated and emitted to native config as disabled entries. If a harness supports native MCP but cannot represent a specific MCP definition, apply must fail so rollback can restore the previous harness state.
+
+When a native MCP format separates literal HTTP headers from environment-backed headers, preserve the neutral contract by round-tripping values like `"$TOKEN"` as environment references.
 
 ## Native Config Rules
 
@@ -274,9 +279,13 @@ Model and permission values are opaque profile values. Do not validate model nam
 
 The string `"default"` means lazyagents leaves that setting untouched and must not create the native key.
 
+When a harness uses compound native settings for a single profile preference, document the accepted shape in `docs/ARCHITECTURE.md` and cover it with focused tests. Pi is the current example: `provider/model` updates both native provider and model settings, while a plain model preserves the existing provider.
+
 ## Transaction And State Rules
 
 Do not implement backup, rollback, or active state updates inside integrations.
+
+Do not implement locking inside integrations. Mutating product workflows acquire the lazyagents home lock before they call integration code.
 
 The flow is:
 
@@ -308,7 +317,7 @@ Before considering the integration done, confirm:
 
 - explicit `use --harness <new>` fails when the binary is not detected
 - `use --all` applies only when the harness is detected
-- `create --from <new>` imports without mutating harness state
+- `create --harness <new>` imports without mutating harness state
 - applying an empty profile clears stale skills, commands, and supported MCPs
 - applying invalid MCP config fails without updating state for harnesses that support MCP, and is ignored by harnesses that do not
 - apply failure rolls back managed files and native config

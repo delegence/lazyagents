@@ -81,6 +81,7 @@ profiles/<name>/
   mcps.json
   skills/
   commands/
+  agents/
 ```
 
 `config.json` is required. Missing optional artifacts are normalized during profile use:
@@ -89,8 +90,9 @@ profiles/<name>/
 - `mcps.json`
 - `skills/`
 - `commands/`
+- `agents/`
 
-Profile names are represented by `ProfileName` and must be validated at boundaries. Do not silently normalize profile names.
+Profile names are represented by `ProfileName` and must be validated at boundaries. They may contain only ASCII letters, numbers, and dashes; may be up to 64 characters; cannot start or end with a dash; and cannot contain consecutive dashes. Do not silently normalize profile names.
 
 ## Harness Settings
 
@@ -109,9 +111,9 @@ Profile names are represented by `ProfileName` and must be validated at boundari
 }
 ```
 
-`type` selects integration behavior. `configDir` selects the native harness home. Integrations derive all managed paths from `configDir`; per-surface path overrides are intentionally unsupported. `displayName` and `binary` are optional and default from the harness type.
+`type` selects integration behavior. `configDir` selects the native harness home and must be absolute or begin with `~/`. Integrations derive all managed paths from `configDir`; per-surface path overrides are intentionally unsupported. `displayName` and `binary` are optional and default from the harness type. Harness instance ids may contain only lowercase ASCII letters, numbers, and dashes.
 
-State and profile preferences are keyed by harness instance id. If two instances have the same type and normalized `configDir`, they are aliases for the same native state; profile use updates active state for every alias in that group. Doctor reports shared config directories.
+State and profile preferences are keyed by harness instance id. If two instances have the same type and lexically normalized `configDir`, they are aliases for the same native state; profile use updates active state for every alias in that group. Doctor reports shared config directories using the same normalized alias identity.
 
 ## Profile Config
 
@@ -139,7 +141,7 @@ Rules:
 - Permission values are opaque and may be strings or structured JSON.
 - Unknown config keys are ignored.
 
-Do not validate model names or permission vocabularies unless a harness cannot serialize the value shape.
+Do not validate model names or permission vocabularies unless a harness cannot serialize the value shape. Codex, Gemini, and Pi currently require string preferences for the native settings they patch. Pi model strings may use `provider/model`; otherwise Pi preserves any existing provider and updates only the model.
 
 ## MCP Definitions
 
@@ -162,10 +164,38 @@ Rules:
 - Disabled entries are fully validated and emitted to native configs as disabled.
 - `stdio` requires `command`; `args` and `env` default empty.
 - `http` requires `url`; `headers` defaults empty.
+- `http` URLs must start with `http://` or `https://`.
 - Unknown MCP keys are ignored.
 - Environment variable references are passed through.
 
+Codex represents HTTP headers split across literal `http_headers` and environment-backed `env_http_headers`; neutral header values that start with `$` are rendered to Codex env header entries.
+
 Integrations with native MCP support translate the neutral list into native harness config. MCP support is optional per harness; integrations without native MCP support ignore profile MCP definitions, do not drift-check them, and preserve existing profile MCPs on import/save by returning no MCP import data. If a harness supports MCP but cannot represent a valid neutral MCP definition, apply must fail and roll back.
+
+## Sub-agent Definitions
+
+Profiles use one neutral sub-agent directory:
+
+```text
+agents/*.md
+```
+
+Each file is Markdown with YAML frontmatter. Required frontmatter fields:
+
+- `name`
+- `description`
+
+Optional neutral fields:
+
+- `model`: scalar value or per-harness/default map
+- `tools`: neutral allow/deny map or native-compatible value
+- `permission`: scalar value or per-harness/default map
+- `maxTurns`
+- `harness`: per-harness native override maps
+
+The Markdown body becomes the native sub-agent prompt/instructions. Empty bodies are allowed for harness-native agents that intentionally carry all behavior in frontmatter. There is no `prompt` frontmatter field in the neutral contract.
+
+Integrations with native sub-agent support render neutral sub-agents into native files. Codex renders TOML files under `agents/`; Claude, Gemini, and OpenCode render Markdown files with native frontmatter. Integrations without native sub-agent support return `supports_subagents() == false`, ignore profile sub-agents during apply/drift, and preserve existing profile sub-agents on import/save by returning no sub-agent import data. Pi currently falls into this category because Pi core does not ship sub-agents.
 
 ## Profile Use Workflow
 
@@ -193,6 +223,10 @@ All-harness profile use:
 - continues after individual harness failures
 - updates state per successful harness
 
+Mutating workflows acquire an exclusive lazyagents home lock before changing profiles, settings, harness config, or state. A second mutating command fails rather than racing the first.
+
+In non-interactive shells, drift prompts are not attempted. The CLI reports the required explicit flag instead: `--save-changes` or `--discard-changes` for one harness, and only `--discard-changes` for `--all`.
+
 ## Drift
 
 Drift is checked before switching away from an active profile.
@@ -213,10 +247,13 @@ Saving drift imports current harness managed state into the active profile:
 - instruction target into `AGENTS.md`
 - valid skills into `skills/`
 - Markdown commands into `commands/`
+- native sub-agents into neutral `agents/`, when the harness supports native sub-agents
 - native MCP list into `mcps.json`, when the harness supports native MCP
 - native model/permission values into `config.json`
 
 Saving drift updates only the relevant harness model and permission entries.
+
+Saving drift also imports valid shared skills from `~/.agents/skills`, using the same merge rules as `create --harness`: harness-native skills win on name collision, imported shared skills are removed from the shared skills directory, and invalid or hidden shared entries are left alone.
 
 Hidden files and directories starting with `.` inside managed folders are ignored for drift, backup, import, and clearing.
 
@@ -250,6 +287,7 @@ Responsibilities:
 
 - identify the harness kind
 - declare whether skills, commands, and native MCP are supported
+- declare whether native sub-agents are supported
 - detect the binary from `AppEnvironment.path_entries`
 - define native config paths from `AppEnvironment.user_home`
 - declare managed surfaces
@@ -282,6 +320,7 @@ config dir: ~/.claude
 instruction target: ~/.claude/CLAUDE.md
 skills dir: ~/.claude/skills
 commands dir: ~/.claude/commands
+agents dir: ~/.claude/agents
 settings file: ~/.claude/settings.json
 MCP file: ~/.claude.json
 nested commands: yes
@@ -294,6 +333,7 @@ config dir: ~/.codex
 instruction target: ~/.codex/AGENTS.md
 skills dir: ~/.codex/skills
 commands dir: ~/.codex/prompts
+agents dir: ~/.codex/agents
 settings file: ~/.codex/config.toml
 MCP file: ~/.codex/config.toml
 nested commands: no
@@ -306,6 +346,7 @@ config dir: ~/.config/opencode
 instruction target: ~/.config/opencode/AGENTS.md
 skills dir: ~/.config/opencode/skills
 commands dir: ~/.config/opencode/commands
+agents dir: ~/.config/opencode/agents
 settings file: ~/.config/opencode/opencode.json
 MCP file: ~/.config/opencode/opencode.json
 nested commands: yes
@@ -318,6 +359,7 @@ config dir: ~/.gemini
 instruction target: ~/.gemini/GEMINI.md
 skills dir: ~/.gemini/skills
 commands dir: ~/.gemini/commands
+agents dir: ~/.gemini/agents
 settings file: ~/.gemini/settings.json
 MCP file: ~/.gemini/settings.json
 nested commands: yes
@@ -330,6 +372,7 @@ config dir: ~/.pi/agent
 instruction target: ~/.pi/agent/AGENTS.md
 skills dir: ~/.pi/agent/skills
 commands dir: ~/.pi/agent/prompts
+agents dir: unsupported
 settings file: ~/.pi/agent/settings.json
 MCP file: unsupported
 nested commands: no

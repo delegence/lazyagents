@@ -24,6 +24,8 @@ pub struct ProfileSummary {
     pub ignored_skills: Vec<String>,
     pub commands: Vec<String>,
     pub ignored_command_files: Vec<String>,
+    pub agents: Vec<String>,
+    pub ignored_agent_files: Vec<String>,
     pub mcp_summary: McpSummary,
     pub models: BTreeMap<String, Value>,
     pub permissions: BTreeMap<String, Value>,

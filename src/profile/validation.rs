@@ -1,3 +1,4 @@
+use crate::harness::agents::{profile_agents, scan_agents};
 use crate::profile::inspect::{scan_commands, scan_skills};
 use crate::profile::mcp::collect_mcp_validation_errors;
 use std::path::Path;
@@ -81,6 +82,25 @@ pub fn validate_profile(path: &Path) -> Vec<ValidationIssue> {
                 issues.push(ValidationIssue::warning("Commands", "nested command may be incompatible with some target harnesses (e.g., Codex)").with_path(format!("commands/{}", cmd)));
             }
         }
+    }
+
+    // sub-agents
+    if let Ok((_agents, ignored)) = scan_agents(&path.join("agents")) {
+        for ignored_agent in ignored {
+            issues.push(
+                ValidationIssue::warning("Sub-agents", "ignored non-markdown sub-agent file")
+                    .with_path(format!("agents/{}", ignored_agent)),
+            );
+        }
+    }
+    if let Err(error) = profile_agents(path) {
+        issues.push(
+            ValidationIssue::error(
+                "Sub-agents",
+                format!("malformed sub-agent definition: {error}"),
+            )
+            .with_path("agents"),
+        );
     }
 
     // mcps.json

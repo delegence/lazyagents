@@ -75,184 +75,29 @@ fn load_profile(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use anyhow::anyhow;
+    use anyhow::{anyhow, Context};
 
     use super::*;
-    use crate::app::state::LazyagentsState;
-    use crate::harness::drift::DriftItem;
     use crate::harness::drift::DriftReport;
-    use crate::harness::integration::{HarnessDetection, ImportedPreference, ProfileImport};
+    use crate::harness::integration::{HarnessDetection, ProfileImport};
     use crate::harness::kind::HarnessKind;
     use crate::harness::managed::ManagedSurface;
     use crate::profile::LazyagentsHome;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum DriftPolicy {
-        Cancel,
-        Discard,
-        SaveChanges,
-    }
-
-    fn use_profile(
-        integration: &dyn HarnessIntegration,
-        env: &AppEnvironment,
-        profile_store: &ProfileStore,
-        profile: &ProfileName,
-        policy: DriftPolicy,
-    ) -> Result<ProfileUseResult> {
-        profile_store.normalize_optional_artifacts(profile)?;
-        let paths = integration.paths(env)?;
-        let state_path = env.lazyagents_home.join("state.json");
-        let mut state = LazyagentsState::load(&state_path)?;
-        let active_profile = state
-            .active_profiles
-            .get(integration.instance_id())
-            .map(|name| load_profile(profile_store, name, integration.instance_id()));
-
-        let drift = match active_profile.as_ref() {
-            Some(active) => integration.detect_drift(active, &paths)?,
-            None => DriftReport::clean(),
-        };
-
-        if !drift.is_clean() {
-            match policy {
-                DriftPolicy::Cancel => {
-                    return Ok(ProfileUseResult {
-                        harness: integration.instance_id().to_string(),
-                        display_name: integration.display_name().to_string(),
-                        alias_updates: Vec::new(),
-                        profile: profile.clone(),
-                        status: ProfileUseStatus::CancelledForDrift,
-                    });
-                }
-                DriftPolicy::Discard => {}
-                DriftPolicy::SaveChanges => {
-                    let imported = integration.import_from_harness(&paths)?;
-                    if let Some(active) = active_profile.as_ref() {
-                        profile_store.apply_import(
-                            &active.name,
-                            integration.instance_id(),
-                            imported,
-                        )?;
-                    }
-                }
-            }
-        }
-
-        apply_profile_to_harness_with_commit(integration, env, profile_store, profile, || {
-            state
-                .active_profiles
-                .insert(integration.instance_id().to_string(), profile.clone());
-            state.save(&state_path)
-        })?;
-
-        Ok(ProfileUseResult {
-            harness: integration.instance_id().to_string(),
-            display_name: integration.display_name().to_string(),
-            alias_updates: Vec::new(),
-            profile: profile.clone(),
-            status: ProfileUseStatus::Applied,
-        })
-    }
-
-    struct UseProfileAllResult {
-        applied: Vec<ProfileUseResult>,
-        failures: Vec<(String, anyhow::Error)>,
-    }
-
-    fn use_profile_all<F>(
-        integrations: &[&dyn HarnessIntegration],
-        env: &AppEnvironment,
-        profile_store: &ProfileStore,
-        profile: &ProfileName,
-        discard_changes: bool,
-        mut prompt_discard_drift: F,
-    ) -> Result<UseProfileAllResult>
-    where
-        F: FnMut(&[String]) -> Result<bool>,
-    {
-        let mut drifted_harnesses = Vec::new();
-        for integration in integrations {
-            let paths = integration.paths(env)?;
-            let state = LazyagentsState::load(&env.lazyagents_home.join("state.json"))?;
-            let active_profile = state
-                .active_profiles
-                .get(integration.instance_id())
-                .map(|name| load_profile(profile_store, name, integration.instance_id()));
-            let drift = match active_profile.as_ref() {
-                Some(active) => integration.detect_drift(active, &paths)?,
-                None => DriftReport::clean(),
-            };
-            if !drift.is_clean() {
-                drifted_harnesses.push(integration.display_name().to_string());
-            }
-        }
-
-        if !drifted_harnesses.is_empty()
-            && !discard_changes
-            && !prompt_discard_drift(&drifted_harnesses)?
-        {
-            anyhow::bail!(
-                "operation cancelled due to drift in {}",
-                drifted_harnesses.join(", ")
-            );
-        }
-
-        let mut results = UseProfileAllResult {
-            applied: Vec::new(),
-            failures: Vec::new(),
-        };
-
-        for integration in integrations {
-            match use_profile(
-                *integration,
-                env,
-                profile_store,
-                profile,
-                DriftPolicy::Discard,
-            ) {
-                Ok(res) => match res.status {
-                    ProfileUseStatus::Applied => results.applied.push(res),
-                    ProfileUseStatus::CancelledForDrift => {}
-                },
-                Err(e) => results
-                    .failures
-                    .push((integration.instance_id().to_string(), e)),
-            }
-        }
-
-        Ok(results)
-    }
-
     struct FakeIntegration {
         root: PathBuf,
-        drift: DriftReport,
         fail_verify: bool,
-        import_called: Cell<bool>,
     }
 
     impl FakeIntegration {
         fn new(root: PathBuf) -> Self {
             Self {
                 root,
-                drift: DriftReport::clean(),
                 fail_verify: false,
-                import_called: Cell::new(false),
             }
-        }
-
-        fn with_drift(mut self) -> Self {
-            self.drift = DriftReport {
-                items: vec![DriftItem {
-                    surface: "instructions".to_string(),
-                    detail: "changed".to_string(),
-                }],
-            };
-            self
         }
 
         fn fail_verify(mut self) -> Self {
@@ -275,6 +120,7 @@ mod tests {
                 instruction_target: config_dir.join("AGENTS.md"),
                 skills_dir: config_dir.join("skills"),
                 commands_dir: config_dir.join("commands"),
+                agents_dir: config_dir.join("agents"),
                 settings_file: config_dir.join("settings.json"),
                 mcp_file: config_dir.join("mcp.json"),
                 config_dir,
@@ -308,19 +154,11 @@ mod tests {
             _active: &ProfileRef,
             _paths: &HarnessConfigPaths,
         ) -> Result<DriftReport> {
-            Ok(self.drift.clone())
+            Ok(DriftReport::clean())
         }
 
         fn import_from_harness(&self, _paths: &HarnessConfigPaths) -> Result<ProfileImport> {
-            self.import_called.set(true);
-            Ok(ProfileImport {
-                instruction: Some("saved".to_string()),
-                skills: Vec::new(),
-                commands: Vec::new(),
-                mcp_definitions: None,
-                model_preference: ImportedPreference::new(serde_json::json!("imported-model")),
-                permission_preference: ImportedPreference::new(serde_json::json!({"bash":"allow"})),
-            })
+            Ok(ProfileImport::default())
         }
 
         fn apply(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
@@ -360,8 +198,17 @@ mod tests {
         let env = test_env(&home);
         let integration = FakeIntegration::new(harness_root.clone());
 
-        use_profile(&integration, &env, &store, &full, DriftPolicy::Discard).unwrap();
-        use_profile(&integration, &env, &store, &empty, DriftPolicy::Discard).unwrap();
+        apply_profile_to_harness_with_commit(&integration, &env, &store, &full, || Ok(())).unwrap();
+        apply_profile_to_harness_with_commit(&integration, &env, &store, &empty, || {
+            fs::create_dir_all(&home).unwrap();
+            fs::write(
+                home.join("state.json"),
+                "{\n  \"active_profiles\": {\n    \"codex\": \"empty\"\n  }\n}\n",
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
 
         assert_eq!(
             fs::read_to_string(harness_root.join("AGENTS.md")).unwrap(),
@@ -396,7 +243,12 @@ mod tests {
         let integration = FakeIntegration::new(harness_root.clone()).fail_verify();
 
         let error =
-            use_profile(&integration, &env, &store, &profile, DriftPolicy::Discard).unwrap_err();
+            apply_profile_to_harness_with_commit(&integration, &env, &store, &profile, || {
+                fs::create_dir_all(&home).unwrap();
+                fs::write(home.join("state.json"), "should not be written").unwrap();
+                Ok(())
+            })
+            .unwrap_err();
 
         assert!(error.to_string().contains("verify failed"));
         assert_eq!(
@@ -426,7 +278,11 @@ mod tests {
         let integration = FakeIntegration::new(harness_root.clone());
 
         let error =
-            use_profile(&integration, &env, &store, &profile, DriftPolicy::Discard).unwrap_err();
+            apply_profile_to_harness_with_commit(&integration, &env, &store, &profile, || {
+                fs::write(home.join("state.json"), "{}").context("failed to write state.json")?;
+                Ok(())
+            })
+            .unwrap_err();
 
         assert!(error.to_string().contains("state.json"));
         assert_eq!(
@@ -440,169 +296,11 @@ mod tests {
         assert!(home.join("state.json").is_dir());
     }
 
-    #[test]
-    fn save_changes_reuses_import_before_apply() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("lazyagents");
-        let harness_root = temp.path().join("harness");
-        let store = ProfileStore::new(LazyagentsHome::from_path(&home));
-        let active = ProfileName::parse("active").unwrap();
-        let target = ProfileName::parse("target").unwrap();
-        store.create_skeleton(&active).unwrap();
-        store.create_skeleton(&target).unwrap();
-        fs::create_dir_all(&home).unwrap();
-        fs::write(
-            home.join("state.json"),
-            "{\n  \"active_profiles\": {\n    \"codex\": \"active\"\n  }\n}\n",
-        )
-        .unwrap();
-        let env = test_env(&home);
-        let integration = FakeIntegration::new(harness_root).with_drift();
-
-        let result = use_profile(
-            &integration,
-            &env,
-            &store,
-            &target,
-            DriftPolicy::SaveChanges,
-        )
-        .unwrap();
-
-        assert_eq!(result.status, ProfileUseStatus::Applied);
-        assert!(integration.import_called.get());
-
-        let active_config = store.load_config(&active).unwrap();
-        let target_config = store.load_config(&target).unwrap();
-        assert_eq!(active_config.model_preference("codex"), "imported-model");
-        assert_eq!(
-            active_config.permission_preference("codex"),
-            serde_json::json!({"bash":"allow"})
-        );
-        assert_eq!(active_config.model_preference("claude"), "default");
-        assert_eq!(target_config.model_preference("codex"), "default");
-    }
-
-    #[test]
-    fn cancel_policy_returns_without_mutation_when_drift_exists() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("lazyagents");
-        let harness_root = temp.path().join("harness");
-        let store = ProfileStore::new(LazyagentsHome::from_path(&home));
-        let active = ProfileName::parse("active").unwrap();
-        let target = ProfileName::parse("target").unwrap();
-        store.create_skeleton(&active).unwrap();
-        store.create_skeleton(&target).unwrap();
-        fs::create_dir_all(&home).unwrap();
-        fs::write(
-            home.join("state.json"),
-            "{\n  \"active_profiles\": {\n    \"codex\": \"active\"\n  }\n}\n",
-        )
-        .unwrap();
-        let env = test_env(&home);
-        let integration = FakeIntegration::new(harness_root.clone()).with_drift();
-
-        let result = use_profile(&integration, &env, &store, &target, DriftPolicy::Cancel).unwrap();
-
-        assert_eq!(result.status, ProfileUseStatus::CancelledForDrift);
-        assert!(!harness_root.join("AGENTS.md").exists());
-        assert_eq!(
-            fs::read_to_string(home.join("state.json")).unwrap(),
-            "{\n  \"active_profiles\": {\n    \"codex\": \"active\"\n  }\n}\n"
-        );
-    }
-
     fn test_env(home: &Path) -> AppEnvironment {
         AppEnvironment {
             lazyagents_home: home.to_path_buf(),
             user_home: home.join("user"),
             path_entries: Vec::new(),
         }
-    }
-
-    #[test]
-    fn use_profile_all_reports_failures_but_applies_successes() {
-        let temp = tempfile::tempdir().unwrap();
-        let home = temp.path().join("lazyagents");
-        let harness_root1 = temp.path().join("harness1");
-        let harness_root2 = temp.path().join("harness2");
-        let store = ProfileStore::new(LazyagentsHome::from_path(&home));
-        let profile = ProfileName::parse("target").unwrap();
-        store.create_skeleton(&profile).unwrap();
-
-        let env = test_env(&home);
-
-        struct Integration2 {
-            root: PathBuf,
-        }
-        impl HarnessIntegration for Integration2 {
-            fn kind(&self) -> HarnessKind {
-                HarnessKind::Claude
-            }
-            fn default_config_dir(&self, _e: &AppEnvironment) -> PathBuf {
-                self.root.clone()
-            }
-            fn paths_from_config_dir(&self, config_dir: PathBuf) -> Result<HarnessConfigPaths> {
-                Ok(HarnessConfigPaths {
-                    instruction_target: config_dir.join("CLAUDE.md"),
-                    skills_dir: config_dir.join("skills"),
-                    commands_dir: config_dir.join("commands"),
-                    settings_file: config_dir.join("settings.json"),
-                    mcp_file: config_dir.join("settings.json"),
-                    config_dir,
-                })
-            }
-            fn detect(&self, _e: &AppEnvironment) -> Result<HarnessDetection> {
-                Ok(HarnessDetection::NotDetected)
-            }
-            fn paths(&self, _e: &AppEnvironment) -> Result<HarnessConfigPaths> {
-                self.paths_from_config_dir(self.root.clone())
-            }
-            fn managed_surfaces(&self, _p: &HarnessConfigPaths) -> Vec<ManagedSurface> {
-                vec![]
-            }
-            fn preflight(&self, _p: &crate::harness::integration::ProfileRef) -> Result<()> {
-                Ok(())
-            }
-            fn detect_drift(
-                &self,
-                _p: &crate::harness::integration::ProfileRef,
-                _paths: &HarnessConfigPaths,
-            ) -> Result<DriftReport> {
-                Ok(DriftReport::clean())
-            }
-            fn apply(
-                &self,
-                _p: &crate::harness::integration::ProfileRef,
-                _paths: &HarnessConfigPaths,
-            ) -> Result<()> {
-                anyhow::bail!("apply failure")
-            }
-            fn verify(
-                &self,
-                _p: &crate::harness::integration::ProfileRef,
-                _paths: &HarnessConfigPaths,
-            ) -> Result<()> {
-                Ok(())
-            }
-            fn import_from_harness(&self, _paths: &HarnessConfigPaths) -> Result<ProfileImport> {
-                anyhow::bail!("no")
-            }
-        }
-
-        let integration1 = FakeIntegration::new(harness_root1);
-        let integration2 = Integration2 {
-            root: harness_root2,
-        };
-
-        let integrations: Vec<&dyn HarnessIntegration> = vec![&integration1, &integration2];
-
-        let results =
-            use_profile_all(&integrations, &env, &store, &profile, true, |_| Ok(true)).unwrap();
-
-        assert_eq!(results.applied.len(), 1);
-        assert_eq!(results.applied[0].harness, "codex");
-        assert_eq!(results.failures.len(), 1);
-        assert_eq!(results.failures[0].0, "claude");
-        assert!(results.failures[0].1.to_string().contains("apply failure"));
     }
 }

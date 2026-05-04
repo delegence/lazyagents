@@ -57,13 +57,13 @@ pub fn run() -> Result<()> {
         },
         Some(Command::Create(args)) => {
             let profile = ProfileName::parse(args.name)?;
-            let from = args
-                .from
+            let harness = args
+                .harness
                 .as_deref()
                 .map(|id| registry.require_id(&runtime_env, id))
                 .transpose()?;
             let _lock = LazyagentsHomeLock::acquire(&home_path)?;
-            match create_profile(&registry, &runtime_env, &store, profile, from)? {
+            match create_profile(&registry, &runtime_env, &store, profile, harness)? {
                 CreateProfileResult::Created { profile, path } => {
                     println!("Created profile {profile} at {}", path.display());
                 }
@@ -111,6 +111,11 @@ pub fn run() -> Result<()> {
                 render_resource_list(&summary.commands)
             );
             println!(
+                " Sub-agents ({}): {}",
+                summary.agents.len(),
+                render_resource_list(&summary.agents)
+            );
+            println!(
                 " MCPs ({}): {}",
                 mcp_summary_count(&summary.mcp_summary),
                 render_mcp_resource_list(&summary.mcp_summary)
@@ -131,8 +136,9 @@ pub fn run() -> Result<()> {
                 render_artifact_status(&summary.instruction_source)
             );
 
-            let has_ignored =
-                !summary.ignored_skills.is_empty() || !summary.ignored_command_files.is_empty();
+            let has_ignored = !summary.ignored_skills.is_empty()
+                || !summary.ignored_command_files.is_empty()
+                || !summary.ignored_agent_files.is_empty();
             if has_ignored || !summary.validation_issues.is_empty() {
                 println!("\nIssues:");
                 if !summary.ignored_skills.is_empty() {
@@ -147,6 +153,12 @@ pub fn run() -> Result<()> {
                         render_string_list(&summary.ignored_command_files)
                     );
                 }
+                if !summary.ignored_agent_files.is_empty() {
+                    println!(
+                        "Ignored Sub-agent files: {}",
+                        render_string_list(&summary.ignored_agent_files)
+                    );
+                }
                 let other_issues = summary
                     .validation_issues
                     .into_iter()
@@ -155,6 +167,8 @@ pub fn run() -> Result<()> {
                             && issue.message == "ignored skill directory or missing SKILL.md")
                             && !(issue.category == "Commands"
                                 && issue.message == "ignored non-markdown command file")
+                            && !(issue.category == "Sub-agents"
+                                && issue.message == "ignored non-markdown sub-agent file")
                     })
                     .collect::<Vec<_>>();
                 if !other_issues.is_empty() {
@@ -184,6 +198,7 @@ pub fn run() -> Result<()> {
             }
         }
         Some(Command::Delete(args)) => {
+            ProfileName::parse(args.name.clone())?;
             if !args.yes && !confirm_delete(&args.name)? {
                 println!("Delete cancelled");
                 return Ok(());
@@ -198,7 +213,7 @@ pub fn run() -> Result<()> {
             println!("Deleted profile {} at {}", args.name, path.display());
         }
         Some(Command::Use(args)) => {
-            let profile = ProfileName::parse(args.profile.clone())?;
+            let requested_profile = ProfileName::parse(args.profile.clone())?;
             args.validate()?;
             let _lock = LazyagentsHomeLock::acquire(&home_path)?;
             match args.target() {
@@ -209,7 +224,7 @@ pub fn run() -> Result<()> {
                         &runtime_env,
                         &store,
                         UseProfileRequest {
-                            profile: profile.clone(),
+                            profile: requested_profile.clone(),
                             target: UseProfileTarget::Harness(id.clone()),
                             drift_decision: args.drift_decision(),
                         },
@@ -218,17 +233,20 @@ pub fn run() -> Result<()> {
                         UseProfileOutcome::Applied(result) => result,
                         UseProfileOutcome::NeedsSingleHarnessDriftDecision {
                             display_name,
-                            profile,
+                            profile: active_profile,
                             drift,
                         } => {
-                            let decision =
-                                prompt_single_drift_decision(&display_name, &profile, &drift)?;
+                            let decision = prompt_single_drift_decision(
+                                &display_name,
+                                &active_profile,
+                                &drift,
+                            )?;
                             match use_profile_workflow(
                                 &registry,
                                 &runtime_env,
                                 &store,
                                 UseProfileRequest {
-                                    profile: profile.clone(),
+                                    profile: requested_profile.clone(),
                                     target: UseProfileTarget::Harness(id),
                                     drift_decision: Some(decision),
                                 },
@@ -266,7 +284,7 @@ pub fn run() -> Result<()> {
                         &runtime_env,
                         &store,
                         UseProfileRequest {
-                            profile: profile.clone(),
+                            profile: requested_profile.clone(),
                             target: UseProfileTarget::All,
                             drift_decision: args.drift_decision(),
                         },
@@ -289,7 +307,7 @@ pub fn run() -> Result<()> {
                                 &runtime_env,
                                 &store,
                                 UseProfileRequest {
-                                    profile: profile.clone(),
+                                    profile: requested_profile.clone(),
                                     target: UseProfileTarget::All,
                                     drift_decision: Some(DriftDecision::DiscardChanges),
                                 },
@@ -406,6 +424,9 @@ fn active_profile_for_show(
     }
     if integration.supports_mcp() {
         crate::profile::mcp::read_mcp_definitions(&path)?;
+    }
+    if integration.supports_subagents() {
+        crate::harness::agents::profile_agents(&path)?;
     }
     Ok(ProfileRef {
         name: name.clone(),

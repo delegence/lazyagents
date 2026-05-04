@@ -244,6 +244,10 @@ impl HarnessIntegration for ConfiguredIntegration {
         self.base.supports_mcp()
     }
 
+    fn supports_subagents(&self) -> bool {
+        self.base.supports_subagents()
+    }
+
     fn default_config_dir(&self, _env: &AppEnvironment) -> PathBuf {
         self.instance.config_dir.clone()
     }
@@ -296,5 +300,30 @@ impl HarnessIntegration for ConfiguredIntegration {
 
     fn verify(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
         self.base.verify(profile, paths)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_pi_preserves_unsupported_subagents_flag() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = AppEnvironment {
+            lazyagents_home: temp.path().join("lazyagents"),
+            user_home: temp.path().join("user"),
+            path_entries: Vec::new(),
+        };
+        let registry = BuiltInHarnessRegistry;
+
+        let pi = registry
+            .all(&env)
+            .unwrap()
+            .into_iter()
+            .find(|integration| integration.instance_id() == "pi")
+            .unwrap();
+
+        assert!(!pi.supports_subagents());
     }
 }

@@ -1,8 +1,10 @@
-use crate::harness::integration::{AppEnvironment, HarnessDetection};
+use crate::harness::drift::DriftItem;
+use crate::harness::integration::{AppEnvironment, HarnessDetection, ImportedFile};
 use anyhow::{Context, Result};
 use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn detect_binary(env: &AppEnvironment, binary_name: &str) -> HarnessDetection {
     for path in &env.path_entries {
@@ -32,6 +34,50 @@ pub fn symlink_points_to(link: &Path, source: &Path) -> bool {
     fs::read_link(link)
         .map(|target| target == source)
         .unwrap_or(false)
+}
+
+pub fn collect_directory_link_drift(
+    surface: &str,
+    expected_sources: Vec<PathBuf>,
+    target_dir: &Path,
+    items: &mut Vec<DriftItem>,
+) -> Result<()> {
+    let mut expected_names = BTreeSet::new();
+    for source in expected_sources {
+        let name = source
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("invalid source path {}", source.display()))?
+            .to_string_lossy()
+            .into_owned();
+        expected_names.insert(name.clone());
+        if !symlink_points_to(&target_dir.join(&name), &source) {
+            items.push(DriftItem {
+                surface: surface.to_string(),
+                detail: format!(
+                    "{} is not linked to active profile",
+                    target_dir.join(&name).display()
+                ),
+            });
+        }
+    }
+    if target_dir.exists() {
+        for entry in fs::read_dir(target_dir)
+            .with_context(|| format!("failed to read {}", target_dir.display()))?
+        {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            if !expected_names.contains(&name) {
+                items.push(DriftItem {
+                    surface: surface.to_string(),
+                    detail: format!("unexpected managed entry {}", entry.path().display()),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -93,6 +139,32 @@ pub fn read_optional_string(path: &Path) -> Result<Option<String>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
     }
+}
+
+pub fn import_files_recursive(root: &Path, path: &Path) -> Result<Vec<ImportedFile>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.metadata()?.is_dir() {
+            files.extend(import_files_recursive(root, &path)?);
+        } else if path.metadata()?.is_file() {
+            files.push(ImportedFile {
+                relative_path: path
+                    .strip_prefix(root)
+                    .with_context(|| format!("{} is not under {}", path.display(), root.display()))?
+                    .to_path_buf(),
+                contents: fs::read(&path)
+                    .with_context(|| format!("failed to read {}", path.display()))?,
+            });
+        }
+    }
+    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(files)
 }
 
 #[cfg(test)]

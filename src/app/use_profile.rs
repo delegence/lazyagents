@@ -287,6 +287,9 @@ fn active_profile_for_drift(
     if integration.supports_mcp() {
         read_mcp_definitions(&path)?;
     }
+    if integration.supports_subagents() {
+        crate::harness::agents::profile_agents(&path)?;
+    }
 
     Ok(ProfileRef {
         name: name.clone(),
@@ -332,6 +335,7 @@ mod tests {
         fail_apply: bool,
         replace_state_with_dir: bool,
         supports_mcp: bool,
+        supports_subagents: bool,
         import_called: Cell<bool>,
     }
 
@@ -345,12 +349,18 @@ mod tests {
                 fail_apply: false,
                 replace_state_with_dir: false,
                 supports_mcp: true,
+                supports_subagents: true,
                 import_called: Cell::new(false),
             }
         }
 
         fn without_mcp(mut self) -> Self {
             self.supports_mcp = false;
+            self
+        }
+
+        fn without_subagents(mut self) -> Self {
+            self.supports_subagents = false;
             self
         }
 
@@ -394,6 +404,7 @@ mod tests {
                 instruction_target: config_dir.join("AGENTS.md"),
                 skills_dir: config_dir.join("skills"),
                 commands_dir: config_dir.join("commands"),
+                agents_dir: config_dir.join("agents"),
                 settings_file: config_dir.join("settings.json"),
                 mcp_file: config_dir.join("mcp.json"),
                 config_dir,
@@ -402,6 +413,10 @@ mod tests {
 
         fn supports_mcp(&self) -> bool {
             self.supports_mcp
+        }
+
+        fn supports_subagents(&self) -> bool {
+            self.supports_subagents
         }
 
         fn detect(&self, _env: &AppEnvironment) -> Result<HarnessDetection> {
@@ -444,6 +459,7 @@ mod tests {
                 instruction: Some("saved drift".to_string()),
                 skills: Vec::new(),
                 commands: Vec::new(),
+                agents: Some(Vec::new()),
                 mcp_definitions: None,
                 model_preference: ImportedPreference::new(serde_json::json!("saved-model")),
                 permission_preference: ImportedPreference::default_value(),
@@ -621,6 +637,41 @@ mod tests {
             UseProfileRequest {
                 profile: ProfileName::parse("target").unwrap(),
                 target: UseProfileTarget::Harness("codex".to_string()),
+                drift_decision: None,
+            },
+        )
+        .unwrap();
+
+        match outcome {
+            UseProfileOutcome::Applied(result) => {
+                assert_eq!(result.profile, ProfileName::parse("target").unwrap());
+            }
+            _ => panic!("expected apply outcome"),
+        }
+    }
+
+    #[test]
+    fn active_profile_invalid_sub_agent_is_ignored_for_harness_without_subagent_support() {
+        let fixture = Fixture::new();
+        fixture.profile("active");
+        fixture.profile("target");
+        let agents_dir = fixture.profile_path("active").join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(agents_dir.join("bad.md"), "not frontmatter").unwrap();
+        fixture.write_state(r#"{"active_profiles":{"pi":"active"}}"#);
+        let integration =
+            FakeIntegration::new(HarnessKind::Pi, fixture.harness("pi")).without_subagents();
+        let registry = FakeCatalog {
+            integrations: vec![integration],
+        };
+
+        let outcome = use_profile_workflow(
+            &registry,
+            &fixture.env,
+            &fixture.store,
+            UseProfileRequest {
+                profile: ProfileName::parse("target").unwrap(),
+                target: UseProfileTarget::Harness("pi".to_string()),
                 drift_decision: None,
             },
         )

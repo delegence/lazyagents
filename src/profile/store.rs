@@ -59,11 +59,6 @@ impl ProfileStore {
         self.home.path().join("profiles").join(name.as_str())
     }
 
-    pub fn profile_dir_for_raw_name(&self, name: &str) -> Result<PathBuf> {
-        ensure_single_path_component(name)?;
-        Ok(self.home.path().join("profiles").join(name))
-    }
-
     pub fn create_skeleton(&self, name: &ProfileName) -> Result<PathBuf> {
         let profiles_dir = self.home.path().join("profiles");
         std::fs::create_dir_all(&profiles_dir).with_context(|| {
@@ -121,6 +116,9 @@ impl ProfileStore {
                 "failed to create {}",
                 profile_dir.join("commands").display()
             )
+        })?;
+        std::fs::create_dir_all(profile_dir.join("agents")).with_context(|| {
+            format!("failed to create {}", profile_dir.join("agents").display())
         })?;
         create_file_if_missing(&profile_dir.join("AGENTS.md"), "")?;
         create_file_if_missing(&profile_dir.join("mcps.json"), "")?;
@@ -242,6 +240,8 @@ impl ProfileStore {
         let instruction_source = artifact_status(path.join("AGENTS.md"));
         let (valid_skills, ignored_skills) = scan_skills(&path.join("skills"))?;
         let (commands, ignored_command_files) = scan_commands(&path.join("commands"))?;
+        let (agents, ignored_agent_files) =
+            crate::harness::agents::scan_agents(&path.join("agents"))?;
         let mcp_summary = summarize_mcps(&path.join("mcps.json"))?;
 
         let validation_issues = crate::profile::validation::validate_profile(&path);
@@ -256,19 +256,13 @@ impl ProfileStore {
             ignored_skills,
             commands,
             ignored_command_files,
+            agents,
+            ignored_agent_files,
             mcp_summary,
             models: config.models,
             permissions: config.permissions,
             validation_issues,
         })
-    }
-
-    pub fn get_path(&self, name: &str) -> Result<PathBuf> {
-        let path = self.profile_dir_for_raw_name(name)?;
-        if !path.is_dir() {
-            anyhow::bail!("profile {name} does not exist at {}", path.display());
-        }
-        Ok(path)
     }
 }
 
@@ -288,6 +282,9 @@ fn apply_import_to_dir(
 
     replace_imported_directories(&profile_dir.join("skills"), imported.skills)?;
     replace_imported_files(&profile_dir.join("commands"), imported.commands)?;
+    if let Some(agents) = imported.agents {
+        replace_imported_files(&profile_dir.join("agents"), agents)?;
+    }
 
     if let Some(mcps) = imported.mcp_definitions {
         std::fs::write(profile_dir.join("mcps.json"), mcps).with_context(|| {
@@ -439,6 +436,8 @@ fn write_default_skeleton(path: &Path, name: &ProfileName) -> Result<()> {
         .with_context(|| format!("failed to create {}", path.join("skills").display()))?;
     std::fs::create_dir(path.join("commands"))
         .with_context(|| format!("failed to create {}", path.join("commands").display()))?;
+    std::fs::create_dir(path.join("agents"))
+        .with_context(|| format!("failed to create {}", path.join("agents").display()))?;
 
     std::fs::write(
         path.join("AGENTS.md"),
@@ -664,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn get_path_accepts_invalid_profile_names_without_normalizing() {
+    fn edit_profile_rejects_invalid_legacy_profile_names() {
         let _guard = ENV_LOCK.lock().unwrap();
         let temp = tempfile::tempdir().unwrap();
         env::remove_var("EDITOR");
@@ -672,13 +671,16 @@ mod tests {
         let profile_dir = temp.path().join("profiles").join("bad_name");
         std::fs::create_dir_all(&profile_dir).unwrap();
 
-        let target = store.get_path("bad_name").unwrap();
+        let error = crate::app::edit_profile::edit_profile_path(&store, "bad_name").unwrap_err();
 
-        assert_eq!(target, profile_dir);
+        assert!(error
+            .to_string()
+            .contains("profile name may contain only ASCII letters"));
+        assert!(profile_dir.exists());
     }
 
     #[test]
-    fn delete_profile_allows_invalid_inactive_profiles_and_preserves_backups() {
+    fn delete_profile_rejects_invalid_legacy_profile_names_and_preserves_backups() {
         let temp = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(LazyagentsHome::from_path(temp.path()));
         let profile_dir = temp.path().join("profiles").join("bad_name");
@@ -688,16 +690,18 @@ mod tests {
         std::fs::write(&backup_file, "backup").unwrap();
         let env = test_runtime_env(temp.path());
 
-        let deleted = crate::app::delete_profile::delete_profile(
+        let error = crate::app::delete_profile::delete_profile(
             &BuiltInHarnessRegistry,
             &env,
             &store,
             "bad_name",
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(deleted, profile_dir);
-        assert!(!deleted.exists());
+        assert!(error
+            .to_string()
+            .contains("profile name may contain only ASCII letters"));
+        assert!(profile_dir.exists());
         assert_eq!(std::fs::read_to_string(backup_file).unwrap(), "backup");
     }
 
@@ -755,15 +759,6 @@ mod tests {
 
         assert!(error.to_string().contains("Codex config links to it"));
         assert!(profile_dir.exists());
-    }
-
-    #[test]
-    fn raw_profile_names_reject_path_traversal() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = ProfileStore::new(LazyagentsHome::from_path(temp.path()));
-
-        assert!(store.profile_dir_for_raw_name("../work").is_err());
-        assert!(store.profile_dir_for_raw_name("nested/work").is_err());
     }
 
     fn snapshot_files(root: &Path) -> BTreeMap<String, String> {
