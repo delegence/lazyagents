@@ -1,3 +1,63 @@
+#[macro_export]
+macro_rules! define_standard_harness_tests {
+    ($adapter:ty) => {
+        #[test]
+        fn test_use_normalizes_missing_optional_artifacts() {
+            $crate::integrations::test_suite::template::test_use_normalizes_missing_optional_artifacts(&<$adapter>::default());
+        }
+
+        #[test]
+        fn test_use_removes_stale_surfaces_and_clears_mcp_list() {
+            $crate::integrations::test_suite::template::test_use_removes_stale_surfaces_and_optionally_clears_mcp_list(&<$adapter>::default());
+        }
+
+        #[test]
+        fn test_use_default_preferences_do_not_modify_existing_native_settings() {
+            $crate::integrations::test_suite::template::test_use_default_preferences_do_not_modify_existing_native_settings(&<$adapter>::default());
+        }
+
+        #[test]
+        fn test_use_handles_invalid_disabled_mcp_according_to_harness_support() {
+            $crate::integrations::test_suite::template::test_use_handles_invalid_disabled_mcp_according_to_harness_support(&<$adapter>::default());
+        }
+
+        #[test]
+        fn test_use_rolls_back_and_dereferences_symlink_backup_on_failure() {
+            $crate::integrations::test_suite::template::test_use_rolls_back_and_dereferences_symlink_backup_on_failure(&<$adapter>::default());
+        }
+
+        #[test]
+        fn test_import_reads_managed_state_and_dereferences_symlinks() {
+            $crate::integrations::test_suite::template::test_import_reads_managed_state_and_dereferences_symlinks(&<$adapter>::default());
+        }
+
+        #[test]
+        fn test_import_fails_on_malformed_native_config() {
+            $crate::integrations::test_suite::template::test_import_fails_on_malformed_native_config(&<$adapter>::default());
+        }
+
+        #[test]
+        fn test_save_changes_imports_drift_into_active_profile_before_switching() {
+            $crate::integrations::test_suite::template::test_save_changes_imports_drift_into_active_profile_before_switching(&<$adapter>::default());
+        }
+
+        #[test]
+        fn test_discard_changes_switches_without_updating_active_profile() {
+            $crate::integrations::test_suite::template::test_discard_changes_switches_without_updating_active_profile(&<$adapter>::default());
+        }
+
+        #[test]
+        fn test_use_applies_profile_artifacts_preferences_mcp_and_state() {
+            $crate::integrations::test_suite::template::test_use_applies_profile_artifacts_preferences_mcp_and_state(&<$adapter>::default());
+        }
+
+        #[test]
+        fn test_nested_commands_behavior() {
+            $crate::integrations::test_suite::template::test_nested_commands_behavior(&<$adapter>::default());
+        }
+    };
+}
+
 #[cfg(test)]
 pub mod template {
     use crate::app::harness_registry::HarnessRegistry;
@@ -251,7 +311,7 @@ pub mod template {
         let profile = fixture.profile("work");
         write_config(
             &profile,
-            &format!(r#"{{"name": "work", "models": {{}}, "permissions": {{}}}}"#),
+            r#"{"name": "work", "models": {}, "permissions": {}}"#,
         );
         let integration = adapter.integration();
         let paths = integration.paths(&fixture.env).unwrap();
@@ -291,10 +351,9 @@ pub mod template {
                         || err.contains("missing")
                         || err.contains("invalid"))
             );
-            assert!(state
+            assert!(!state
                 .active_profiles
-                .get(integration.instance_id())
-                .is_none());
+                .contains_key(integration.instance_id()));
         } else {
             result.unwrap();
             assert_eq!(
@@ -624,64 +683,4 @@ pub mod template {
             assert!(!fixture.home.join("state.json").exists());
         }
     }
-}
-
-#[macro_export]
-macro_rules! define_standard_harness_tests {
-    ($adapter:ty) => {
-        #[test]
-        fn test_use_normalizes_missing_optional_artifacts() {
-            $crate::integrations::test_suite::template::test_use_normalizes_missing_optional_artifacts(&<$adapter>::default());
-        }
-
-        #[test]
-        fn test_use_removes_stale_surfaces_and_clears_mcp_list() {
-            $crate::integrations::test_suite::template::test_use_removes_stale_surfaces_and_optionally_clears_mcp_list(&<$adapter>::default());
-        }
-
-        #[test]
-        fn test_use_default_preferences_do_not_modify_existing_native_settings() {
-            $crate::integrations::test_suite::template::test_use_default_preferences_do_not_modify_existing_native_settings(&<$adapter>::default());
-        }
-
-        #[test]
-        fn test_use_handles_invalid_disabled_mcp_according_to_harness_support() {
-            $crate::integrations::test_suite::template::test_use_handles_invalid_disabled_mcp_according_to_harness_support(&<$adapter>::default());
-        }
-
-        #[test]
-        fn test_use_rolls_back_and_dereferences_symlink_backup_on_failure() {
-            $crate::integrations::test_suite::template::test_use_rolls_back_and_dereferences_symlink_backup_on_failure(&<$adapter>::default());
-        }
-
-        #[test]
-        fn test_import_reads_managed_state_and_dereferences_symlinks() {
-            $crate::integrations::test_suite::template::test_import_reads_managed_state_and_dereferences_symlinks(&<$adapter>::default());
-        }
-
-        #[test]
-        fn test_import_fails_on_malformed_native_config() {
-            $crate::integrations::test_suite::template::test_import_fails_on_malformed_native_config(&<$adapter>::default());
-        }
-
-        #[test]
-        fn test_save_changes_imports_drift_into_active_profile_before_switching() {
-            $crate::integrations::test_suite::template::test_save_changes_imports_drift_into_active_profile_before_switching(&<$adapter>::default());
-        }
-
-        #[test]
-        fn test_discard_changes_switches_without_updating_active_profile() {
-            $crate::integrations::test_suite::template::test_discard_changes_switches_without_updating_active_profile(&<$adapter>::default());
-        }
-
-        #[test]
-        fn test_use_applies_profile_artifacts_preferences_mcp_and_state() {
-            $crate::integrations::test_suite::template::test_use_applies_profile_artifacts_preferences_mcp_and_state(&<$adapter>::default());
-        }
-
-        #[test]
-        fn test_nested_commands_behavior() {
-            $crate::integrations::test_suite::template::test_nested_commands_behavior(&<$adapter>::default());
-        }
-    };
 }

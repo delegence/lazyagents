@@ -165,14 +165,7 @@ pub fn run() -> Result<()> {
                 let other_issues = summary
                     .validation_issues
                     .into_iter()
-                    .filter(|issue| {
-                        !(issue.category == "Skills"
-                            && issue.message == "ignored skill directory or missing SKILL.md")
-                            && !(issue.category == "Commands"
-                                && issue.message == "ignored non-markdown command file")
-                            && !(issue.category == "Sub-agents"
-                                && issue.message == "ignored non-markdown sub-agent file")
-                    })
+                    .filter(|issue| !is_rendered_ignored_artifact_issue(issue))
                     .collect::<Vec<_>>();
                 if !other_issues.is_empty() {
                     print!("{}", render_validation_issues(&other_issues));
@@ -355,6 +348,15 @@ fn render_mcp_resource_list(summary: &crate::profile::McpSummary) -> String {
         crate::profile::McpSummary::Servers(names) => render_resource_list(names),
         crate::profile::McpSummary::Invalid(error) => format!("invalid: {error}"),
     }
+}
+
+fn is_rendered_ignored_artifact_issue(issue: &crate::profile::validation::ValidationIssue) -> bool {
+    matches!(
+        (issue.category.as_str(), issue.message.as_str()),
+        ("Skills", "ignored skill directory or missing SKILL.md")
+            | ("Commands", "ignored non-markdown command file")
+            | ("Sub-agents", "ignored non-markdown sub-agent file")
+    )
 }
 
 fn render_preferences(

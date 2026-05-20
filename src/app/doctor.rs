@@ -162,7 +162,7 @@ fn status_rows_for(
                 };
 
                 let drift = if matches!(availability, HarnessAvailability::Available) {
-                    match {
+                    let drift_result = (|| {
                         if !loaded.path.exists() {
                             anyhow::bail!("Active profile directory is missing");
                         }
@@ -172,7 +172,8 @@ fn status_rows_for(
                         integration
                             .detect_drift(&loaded, &paths)
                             .map(|report| drift_state(&report))
-                    } {
+                    })();
+                    match drift_result {
                         Ok(state) => state,
                         Err(_) => DriftStatus::Error,
                     }

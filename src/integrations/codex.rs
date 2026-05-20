@@ -232,10 +232,10 @@ fn import_codex_agents(path: &Path) -> Result<Option<Vec<ImportedFile>>> {
     }
     let mut imported = Vec::new();
     for file in crate::harness::fs::import_files_recursive(path, path)? {
-        if !file
+        if file
             .relative_path
             .extension()
-            .is_some_and(|ext| ext == "toml")
+            .is_none_or(|ext| ext != "toml")
         {
             continue;
         }

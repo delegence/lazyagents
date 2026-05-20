@@ -305,7 +305,7 @@ fn e2e_doctor_replaces_list_and_status() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut lines = stdout.lines();
     assert_eq!(lines.next(), Some("Doctor summary:"));
-    assert_eq!(lines.next(), Some("[✓] LazyAgents (0.0.1)"));
+    assert_eq!(lines.next(), Some("[✓] LazyAgents (0.1.0)"));
     assert!(stdout.contains("Harnesses ("));
     assert!(stdout.contains("- codex (work)"));
     assert!(stdout.contains("[✓] Profiles"));

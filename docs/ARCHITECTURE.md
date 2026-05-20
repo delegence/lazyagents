@@ -132,8 +132,8 @@ permissions:
 
 Rules:
 
-- `models` and `permissions` are required objects.
-- Missing harness entries behave like `"default"`.
+- `models` and `permissions` are optional objects.
+- Missing preference objects, missing native harness preference keys during import, and missing harness entries behave like `"default"`.
 - The string `"default"` means leave that native harness setting unchanged.
 - Model values are opaque harness-owned values.
 - Permission values are opaque and may be strings or structured JSON.

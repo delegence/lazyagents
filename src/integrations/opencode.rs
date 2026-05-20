@@ -224,11 +224,7 @@ fn import_opencode_agents(path: &Path) -> Result<Option<Vec<ImportedFile>>> {
     }
     let mut imported = Vec::new();
     for file in crate::harness::fs::import_files_recursive(path, path)? {
-        if !file
-            .relative_path
-            .extension()
-            .is_some_and(|ext| ext == "md")
-        {
+        if file.relative_path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
         let text = String::from_utf8(file.contents).with_context(|| {

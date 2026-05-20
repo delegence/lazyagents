@@ -181,10 +181,11 @@ Use:
 - `instruction_target` for the harness-native instruction file
 - `skills_dir` for managed skill directory contents, when supported
 - `commands_dir` for managed command file contents, when supported
+- `agents_dir` for managed native sub-agent files, when supported
 - `settings_file` for native model/permission config
 - `mcp_file` for the native MCP config location, when the harness has one
 
-`settings_file` and `mcp_file` may be the same path. If the harness does not support skills, commands, or MCP, set the corresponding path to a harmless config path such as `config_dir`, do not include it as a managed surface for that artifact type, and ignore that artifact type in the integration methods.
+`settings_file` and `mcp_file` may be the same path. If the harness does not support skills, commands, sub-agents, or MCP, set the corresponding path to a harmless config path such as `config_dir`, do not include it as a managed surface for that artifact type, and ignore that artifact type in the integration methods.
 
 ### `managed_surfaces`
 
@@ -230,9 +231,11 @@ Rules:
 - import only valid skill directories, when skills are supported
 - import Markdown command files, when commands are supported
 - preserve nested command paths when the harness supports them
+- import native sub-agents into neutral `agents/*.md`, when the harness supports them
 - parse malformed native config as an error
 - import native model/permission values when present
 - use `ImportedPreference::default_value()` when the native key is absent
+- return `agents: None` when the harness does not support native sub-agents so existing profile sub-agents are preserved
 - produce neutral `mcps.json` text for `mcp_definitions` when the harness supports native MCP; otherwise return `None` so existing profile MCP definitions are preserved
 
 ### `apply`
@@ -243,6 +246,7 @@ Rules:
 
 - create missing config directories
 - write profile instructions directly and symlink supported valid skills/command files with absolute symlinks
+- render neutral sub-agents into native files, when the harness supports native sub-agents
 - patch native config files, preserving unrelated keys
 - translate neutral MCP definitions into native format, when the harness supports native MCP
 - honor `"default"` model/permission values by not mutating those native keys
@@ -258,7 +262,7 @@ Verification failures trigger rollback. Keep errors clear and path-specific.
 
 ## Artifact Support And MCP Rules
 
-Skill, command, and MCP support are optional per harness. If the harness has no native support for one of these artifact types, the integration should not apply, verify, drift-check, import, or clear it. Returning `mcp_definitions: None` from `import_from_harness` preserves existing profile MCPs during `--save-changes` and `create --harness`.
+Skill, command, sub-agent, and MCP support are optional per harness. If the harness has no native support for one of these artifact types, the integration should not apply, verify, drift-check, import, or clear it. Returning `agents: None` from `import_from_harness` preserves existing profile sub-agents during `--save-changes` and `create --harness`. Returning `mcp_definitions: None` from `import_from_harness` preserves existing profile MCPs during those same workflows.
 
 For harnesses with native MCP support, use `crate::profile::mcp::read_mcp_definitions` to parse profile MCP definitions.
 
