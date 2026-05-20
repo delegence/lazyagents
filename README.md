@@ -115,7 +115,7 @@ Harness instances are configured in:
 ~/.lazyagents/settings.json
 ```
 
-If the file is missing, `lazyagents` creates it with the default Claude, Codex, Gemini, OpenCode, and Pi instances. Each instance has an id, a harness `type`, an optional `displayName`, an optional `binary`, and a `configDir`. Instance ids use lowercase ASCII letters, numbers, and dashes. `configDir` must be absolute, `~`, or begin with `~/`.
+If the file is missing, `lazyagents` creates it with the default Claude, Codex, Gemini, OpenCode, and Pi instances when a command first loads harness settings. Each instance has an id, a harness `type`, an optional `displayName`, an optional `binary`, and a `configDir`. Instance ids use lowercase ASCII letters, numbers, and dashes. `configDir` must be absolute, `~`, or begin with `~/`.
 
 Example:
 
@@ -293,7 +293,7 @@ Some harnesses can only serialize string model or permission preferences. Pi mod
 
 ## Operational Notes
 
-Mutating commands take an exclusive lock in `~/.lazyagents/.lock`, so a second mutating command fails while another one is running.
+Commands that explicitly mutate profiles, settings, harness config, or active state take an exclusive lock in `~/.lazyagents/.lock`, so a second mutating command fails while another one is running. A missing `settings.json` is created lazily when harness settings are first loaded.
 
 `edit` opens the profile directory with `$EDITOR` when it is set; otherwise it prints the path.
 

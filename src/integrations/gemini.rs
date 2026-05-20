@@ -7,38 +7,29 @@ use serde_json::{json, Map, Value};
 use toml_edit::{value, DocumentMut, Item};
 
 use crate::harness::agents::{
-    apply_rendered_agents, collect_rendered_agent_drift, harness_scoped_value, profile_agents,
-    remove_string, remove_value, select_harness_value, split_markdown_frontmatter,
-    sub_agent_import_file, verify_rendered_agents, RenderedAgent, SubAgent,
+    harness_scoped_value, remove_string, remove_value, select_harness_value,
+    split_markdown_frontmatter, RenderedAgent, SubAgent,
+};
+use crate::harness::artifact::{
+    CommandCodec, CommandMode, CommandsDirectory, HarnessArtifact, InstructionFile, JsonConfigFile,
+    McpCodec, McpConfig, NativeConfig, PreferenceBinding, SettingsPreferences, SkillsDirectory,
+    SubagentCodec, SubagentsDirectory,
 };
 use crate::harness::commands::profile_commands_recursive;
-use crate::harness::drift::{DriftItem, DriftReport};
-use crate::harness::fs::{
-    collect_directory_link_drift, collect_instruction_content_drift, detect_binary,
-    import_files_recursive, read_json, read_optional_string, symlink_points_to,
-    verify_profile_instructions, write_profile_instructions,
-};
+use crate::harness::drift::DriftItem;
+use crate::harness::fs::import_files_recursive;
 use crate::harness::integration::{
-    AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedFile,
-    ImportedPreference, ProfileImport, ProfileRef,
+    AppEnvironment, HarnessConfigPaths, HarnessIntegration, ImportedFile, ProfileRef,
 };
 use crate::harness::kind::HarnessKind;
-use crate::harness::managed::{write_text_atomic, ManagedSurface};
-use crate::harness::skills::{import_skills, link_skills, valid_skills};
-use crate::profile::mcp::{
-    canonical_mcp_json, parse_mcp_definitions, read_mcp_definitions, McpDefinition, McpTransport,
-};
-use crate::profile::{read_profile_config as read_profile_config_from_profile, ProfileConfig};
+use crate::harness::managed::write_text_atomic;
+use crate::profile::mcp::{McpDefinition, McpTransport};
 
 pub struct GeminiIntegration;
 
 impl HarnessIntegration for GeminiIntegration {
     fn kind(&self) -> HarnessKind {
         HarnessKind::Gemini
-    }
-
-    fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection> {
-        Ok(detect_binary(env, self.kind().binary_name()))
     }
 
     fn default_config_dir(&self, env: &AppEnvironment) -> std::path::PathBuf {
@@ -57,128 +48,101 @@ impl HarnessIntegration for GeminiIntegration {
         })
     }
 
-    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-        self.paths_from_config_dir(self.default_config_dir(env))
-    }
-
-    fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
+    fn artifacts(&self) -> Vec<Box<dyn HarnessArtifact>> {
         vec![
-            ManagedSurface::file(&paths.instruction_target),
-            ManagedSurface::directory(&paths.skills_dir),
-            ManagedSurface::directory(&paths.commands_dir),
-            ManagedSurface::directory(&paths.agents_dir),
-            ManagedSurface::preserved_file(&paths.settings_file),
+            Box::new(InstructionFile::new(|paths| &paths.instruction_target)),
+            Box::new(SkillsDirectory::new(|paths| &paths.skills_dir)),
+            Box::new(CommandsDirectory::new(
+                |paths| &paths.commands_dir,
+                CommandMode::Rendered(Box::new(GeminiCommandCodec)),
+            )),
+            Box::new(SubagentsDirectory::new(
+                |paths| &paths.agents_dir,
+                GeminiSubagentCodec,
+            )),
+            Box::new(McpConfig::new(
+                JsonConfigFile::new(|paths| &paths.settings_file).label("Gemini settings JSON"),
+                GeminiMcpCodec,
+            )),
         ]
     }
 
-    fn preflight(&self, _profile: &ProfileRef) -> Result<()> {
-        Ok(())
-    }
-
-    fn detect_drift(&self, active: &ProfileRef, paths: &HarnessConfigPaths) -> Result<DriftReport> {
-        let mut items = Vec::new();
-        collect_instruction_content_drift(&active.path, &paths.instruction_target, &mut items)?;
-        collect_directory_link_drift(
-            "skills",
-            valid_skills(&active.path)?,
-            &paths.skills_dir,
-            &mut items,
-        )?;
-        collect_gemini_command_drift(active, paths, &mut items)?;
-        collect_rendered_agent_drift(
-            &render_gemini_profile_agents(active)?,
-            &paths.agents_dir,
-            &mut items,
-        )?;
-
-        let native_mcps =
-            parse_mcp_definitions(&import_gemini_mcps(&read_json(&paths.mcp_file)?)?)?;
-        let profile_mcps = read_mcp_definitions(&active.path)?;
-        if canonical_mcp_json(&native_mcps)? != canonical_mcp_json(&profile_mcps)? {
-            items.push(DriftItem {
-                surface: "mcp".to_string(),
-                detail: "Gemini MCP list differs from active profile".to_string(),
-            });
-        }
-        Ok(DriftReport { items })
-    }
-
-    fn import_from_harness(&self, paths: &HarnessConfigPaths) -> Result<ProfileImport> {
-        let settings = read_json(&paths.settings_file)?;
-        Ok(ProfileImport {
-            instruction: read_optional_string(&paths.instruction_target)?,
-            skills: import_skills(&paths.skills_dir)?,
-            commands: import_gemini_commands(&paths.commands_dir)?,
-            agents: import_gemini_agents(&paths.agents_dir)?,
-            mcp_definitions: Some(import_gemini_mcps(&settings)?),
-            model_preference: ImportedPreference::new(import_nested_setting(
-                &settings,
-                &["model", "name"],
-            )),
-            permission_preference: ImportedPreference::new(import_nested_setting(
-                &settings,
-                &["general", "defaultApprovalMode"],
-            )),
-        })
-    }
-
-    fn apply(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-        fs::create_dir_all(&paths.config_dir)
-            .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
-        fs::create_dir_all(&paths.skills_dir)
-            .with_context(|| format!("failed to create {}", paths.skills_dir.display()))?;
-        fs::create_dir_all(&paths.commands_dir)
-            .with_context(|| format!("failed to create {}", paths.commands_dir.display()))?;
-        fs::create_dir_all(&paths.agents_dir)
-            .with_context(|| format!("failed to create {}", paths.agents_dir.display()))?;
-
-        write_profile_instructions(&profile.path, &paths.instruction_target)?;
-        link_skills(profile, paths)?;
-        write_gemini_commands(profile, paths)?;
-        apply_rendered_agents(&render_gemini_profile_agents(profile)?, &paths.agents_dir)?;
-        patch_gemini_settings(profile, paths)?;
-        Ok(())
-    }
-
-    fn verify(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-        verify_profile_instructions("Gemini", &profile.path, &paths.instruction_target)?;
-
-        for skill in valid_skills(&profile.path)? {
-            let target = paths.skills_dir.join(
-                skill
-                    .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("invalid skill path {}", skill.display()))?,
-            );
-            if !symlink_points_to(&target, &skill) {
-                anyhow::bail!("Gemini skill link {} was not applied", target.display());
-            }
-        }
-
-        for command in profile_commands_recursive(&profile.path)? {
-            let relative = command.strip_prefix(profile.path.join("commands")).unwrap();
-            let target = paths.commands_dir.join(markdown_command_to_toml(relative));
-            let actual = read_gemini_command_prompt(&target)?;
-            let expected = fs::read_to_string(&command)
-                .with_context(|| format!("failed to read {}", command.display()))?;
-            if actual != expected {
-                anyhow::bail!("Gemini command {} was not applied", target.display());
-            }
-        }
-        verify_rendered_agents(&render_gemini_profile_agents(profile)?, &paths.agents_dir)?;
-
-        let settings = read_json(&paths.settings_file)?;
-        let native_mcps = parse_mcp_definitions(&import_gemini_mcps(&settings)?)?;
-        let profile_mcps = read_mcp_definitions(&profile.path)?;
-        if canonical_mcp_json(&native_mcps)? != canonical_mcp_json(&profile_mcps)? {
-            anyhow::bail!("Gemini MCP config does not match profile MCP definitions");
-        }
-        Ok(())
+    fn settings(&self) -> Option<Box<dyn crate::harness::artifact::HarnessSettings>> {
+        Some(Box::new(
+            SettingsPreferences::new(
+                JsonConfigFile::new(|paths| &paths.settings_file).label("Gemini settings JSON"),
+            )
+            .model(PreferenceBinding::JsonPointer {
+                pointer: "/model/name",
+            })
+            .permission(PreferenceBinding::JsonPointer {
+                pointer: "/general/defaultApprovalMode",
+            }),
+        ))
     }
 }
 
-fn collect_gemini_command_drift(
+struct GeminiCommandCodec;
+
+impl CommandCodec for GeminiCommandCodec {
+    fn import(&self, path: &Path) -> Result<Vec<ImportedFile>> {
+        import_gemini_commands(path)
+    }
+
+    fn apply(&self, profile: &ProfileRef, target_dir: &Path) -> Result<()> {
+        write_gemini_commands_to(profile, target_dir)
+    }
+
+    fn detect_drift(&self, profile: &ProfileRef, target_dir: &Path) -> Result<Vec<DriftItem>> {
+        let mut items = Vec::new();
+        collect_gemini_command_drift_in(profile, target_dir, &mut items)?;
+        Ok(items)
+    }
+
+    fn verify(&self, profile: &ProfileRef, target_dir: &Path, _display_name: &str) -> Result<()> {
+        verify_gemini_commands_in(profile, target_dir)
+    }
+}
+
+struct GeminiSubagentCodec;
+
+impl SubagentCodec for GeminiSubagentCodec {
+    fn native_file_name(&self, agent: &SubAgent) -> String {
+        format!("{}.md", agent.name)
+    }
+
+    fn render(&self, agent: &SubAgent) -> Result<String> {
+        Ok(render_gemini_agent(agent)?.contents)
+    }
+
+    fn should_import(&self, path: &Path) -> bool {
+        path.extension().is_some_and(|ext| ext == "md")
+    }
+
+    fn parse(&self, path: &Path, contents: &str) -> Result<SubAgent> {
+        let fallback_name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("invalid agent path {}", path.display()))?;
+        native_markdown_to_neutral(contents, fallback_name, "gemini")
+    }
+}
+
+struct GeminiMcpCodec;
+
+impl McpCodec for GeminiMcpCodec {
+    fn import(&self, config: &NativeConfig) -> Result<Vec<McpDefinition>> {
+        import_gemini_mcps(json_config_object(config)?)
+    }
+
+    fn apply(&self, config: &mut NativeConfig, definitions: &[McpDefinition]) -> Result<()> {
+        patch_gemini_mcps(json_config_object_mut(config)?, definitions)
+    }
+}
+
+fn collect_gemini_command_drift_in(
     active: &ProfileRef,
-    paths: &HarnessConfigPaths,
+    commands_dir: &Path,
     items: &mut Vec<DriftItem>,
 ) -> Result<()> {
     let expected = profile_commands_recursive(&active.path)?
@@ -194,7 +158,7 @@ fn collect_gemini_command_drift(
         })
         .collect::<Result<BTreeMap<_, _>>>()?;
 
-    let actual = import_gemini_commands(&paths.commands_dir)?
+    let actual = import_gemini_commands(commands_dir)?
         .into_iter()
         .map(|file| (file.relative_path, file.contents))
         .collect::<BTreeMap<_, _>>();
@@ -205,8 +169,7 @@ fn collect_gemini_command_drift(
                 surface: "commands".to_string(),
                 detail: format!(
                     "{} does not match active profile",
-                    paths
-                        .commands_dir
+                    commands_dir
                         .join(markdown_command_to_toml(relative))
                         .display()
                 ),
@@ -219,8 +182,7 @@ fn collect_gemini_command_drift(
                 surface: "commands".to_string(),
                 detail: format!(
                     "unexpected harness entry {}",
-                    paths
-                        .commands_dir
+                    commands_dir
                         .join(markdown_command_to_toml(relative))
                         .display()
                 ),
@@ -230,10 +192,10 @@ fn collect_gemini_command_drift(
     Ok(())
 }
 
-fn write_gemini_commands(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
+fn write_gemini_commands_to(profile: &ProfileRef, commands_dir: &Path) -> Result<()> {
     for command in profile_commands_recursive(&profile.path)? {
         let relative = command.strip_prefix(profile.path.join("commands")).unwrap();
-        let target = paths.commands_dir.join(markdown_command_to_toml(relative));
+        let target = commands_dir.join(markdown_command_to_toml(relative));
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -244,6 +206,20 @@ fn write_gemini_commands(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Re
         document["prompt"] = value(prompt);
         write_text_atomic(&target, &document.to_string())
             .with_context(|| format!("failed to write {}", target.display()))?;
+    }
+    Ok(())
+}
+
+fn verify_gemini_commands_in(profile: &ProfileRef, commands_dir: &Path) -> Result<()> {
+    for command in profile_commands_recursive(&profile.path)? {
+        let relative = command.strip_prefix(profile.path.join("commands")).unwrap();
+        let target = commands_dir.join(markdown_command_to_toml(relative));
+        let actual = read_gemini_command_prompt(&target)?;
+        let expected = fs::read_to_string(&command)
+            .with_context(|| format!("failed to read {}", command.display()))?;
+        if actual != expected {
+            anyhow::bail!("Gemini command {} was not applied", target.display());
+        }
     }
     Ok(())
 }
@@ -295,13 +271,6 @@ fn toml_command_to_markdown(relative: &Path) -> PathBuf {
     path
 }
 
-fn render_gemini_profile_agents(profile: &ProfileRef) -> Result<Vec<RenderedAgent>> {
-    profile_agents(&profile.path)?
-        .into_iter()
-        .map(|agent| render_gemini_agent(&agent))
-        .collect()
-}
-
 fn render_gemini_agent(agent: &SubAgent) -> Result<RenderedAgent> {
     let mut map = serde_yaml::Mapping::new();
     map.insert(yaml_key("name"), agent.name.clone().into());
@@ -327,39 +296,6 @@ fn render_gemini_agent(agent: &SubAgent) -> Result<RenderedAgent> {
         relative_path: PathBuf::from(format!("{}.md", agent.name)),
         contents: render_native_markdown(map, &agent.body)?,
     })
-}
-
-fn import_gemini_agents(path: &Path) -> Result<Option<Vec<ImportedFile>>> {
-    import_markdown_agents_as_neutral(path, "gemini")
-}
-
-fn import_markdown_agents_as_neutral(
-    path: &Path,
-    harness_id: &str,
-) -> Result<Option<Vec<ImportedFile>>> {
-    if !path.exists() {
-        return Ok(Some(Vec::new()));
-    }
-    let mut imported = Vec::new();
-    for file in crate::harness::fs::import_files_recursive(path, path)? {
-        if file.relative_path.extension().is_none_or(|ext| ext != "md") {
-            continue;
-        }
-        let text = String::from_utf8(file.contents).with_context(|| {
-            format!("Gemini agent {} is not UTF-8", file.relative_path.display())
-        })?;
-        let fallback_name = file
-            .relative_path
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                anyhow::anyhow!("invalid agent path {}", file.relative_path.display())
-            })?;
-        let neutral = native_markdown_to_neutral(&text, fallback_name, harness_id)?;
-        imported.push(sub_agent_import_file(&neutral));
-    }
-    imported.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(Some(imported))
 }
 
 fn native_markdown_to_neutral(
@@ -488,52 +424,6 @@ fn yaml_key(key: &str) -> serde_yaml::Value {
     serde_yaml::Value::String(key.to_string())
 }
 
-fn patch_gemini_settings(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-    let profile_config = read_profile_config(&profile.path)?;
-    let mcp_definitions = read_mcp_definitions(&profile.path)?;
-    let mut document = read_json(&paths.settings_file)?;
-
-    if let Some(model) = non_default_string(
-        profile_config.model_preference(&profile.harness_id),
-        "model preference",
-    )? {
-        set_nested_value(&mut document, &["model", "name"], json!(model))?;
-    }
-    if let Some(permission) = non_default_string(
-        profile_config.permission_preference(&profile.harness_id),
-        "permission preference",
-    )? {
-        set_nested_value(
-            &mut document,
-            &["general", "defaultApprovalMode"],
-            json!(permission),
-        )?;
-    }
-
-    patch_gemini_mcps(&mut document, &mcp_definitions)?;
-
-    write_text_atomic(
-        &paths.settings_file,
-        &serde_json::to_string_pretty(&document)?,
-    )
-    .with_context(|| format!("failed to write {}", paths.settings_file.display()))
-}
-
-fn read_profile_config(profile_path: &Path) -> Result<ProfileConfig> {
-    read_profile_config_from_profile(profile_path)
-}
-
-fn import_nested_setting(settings: &Map<String, Value>, path: &[&str]) -> Value {
-    let mut current = Value::Object(settings.clone());
-    for key in path {
-        let Some(next) = current.get(*key).cloned() else {
-            return json!("default");
-        };
-        current = next;
-    }
-    current
-}
-
 fn set_nested_value(document: &mut Map<String, Value>, path: &[&str], value: Value) -> Result<()> {
     let mut current = document;
     for key in &path[..path.len() - 1] {
@@ -551,19 +441,11 @@ fn set_nested_value(document: &mut Map<String, Value>, path: &[&str], value: Val
     Ok(())
 }
 
-fn non_default_string(value: Value, label: &str) -> Result<Option<String>> {
-    match value {
-        Value::String(value) if value == "default" => Ok(None),
-        Value::String(value) => Ok(Some(value)),
-        other => anyhow::bail!("Gemini {label} must be a string or \"default\", got {other}"),
-    }
-}
-
-fn import_gemini_mcps(document: &Map<String, Value>) -> Result<String> {
+fn import_gemini_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefinition>> {
     let mut servers = Vec::new();
     let excluded = gemini_excluded_mcps(document)?;
     let Some(mcp_servers) = document.get("mcpServers") else {
-        return Ok(String::new());
+        return Ok(Vec::new());
     };
     let Some(mcp_table) = mcp_servers.as_object() else {
         anyhow::bail!("Gemini mcpServers must be an object");
@@ -600,11 +482,7 @@ fn import_gemini_mcps(document: &Map<String, Value>) -> Result<String> {
         }
     }
 
-    if servers.is_empty() {
-        Ok(String::new())
-    } else {
-        Ok(format!("{}\n", serde_json::to_string_pretty(&servers)?))
-    }
+    crate::profile::mcp::parse_mcp_definitions(&serde_json::to_string(&servers)?)
 }
 
 fn patch_gemini_mcps(
@@ -645,6 +523,25 @@ fn patch_gemini_mcps(
         }
     }
     Ok(())
+}
+
+fn json_config_object(config: &NativeConfig) -> Result<&Map<String, Value>> {
+    let NativeConfig::Json(Value::Object(document)) = config else {
+        anyhow::bail!("Gemini JSON config must be an object");
+    };
+    Ok(document)
+}
+
+fn json_config_object_mut(config: &mut NativeConfig) -> Result<&mut Map<String, Value>> {
+    let NativeConfig::Json(value) = config else {
+        anyhow::bail!("Gemini JSON config must be an object");
+    };
+    if !value.is_object() {
+        *value = Value::Object(Map::new());
+    }
+    value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Gemini JSON config must be an object"))
 }
 
 fn gemini_excluded_mcps(document: &Map<String, Value>) -> Result<BTreeSet<String>> {

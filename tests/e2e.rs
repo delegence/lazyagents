@@ -185,11 +185,19 @@ fn e2e_create_from_imports_and_removes_shared_agent_skills() {
     fs::write(codex_dir.join("skills/native/SKILL.md"), "native").unwrap();
     fs::create_dir_all(codex_dir.join("skills/shared")).unwrap();
     fs::write(codex_dir.join("skills/shared/SKILL.md"), "native wins").unwrap();
+    fs::create_dir_all(codex_dir.join("skills/.native-hidden")).unwrap();
+    fs::write(
+        codex_dir.join("skills/.native-hidden/SKILL.md"),
+        "native hidden",
+    )
+    .unwrap();
 
     fs::create_dir_all(shared_dir.join("shared")).unwrap();
     fs::write(shared_dir.join("shared/SKILL.md"), "shared shadowed").unwrap();
     fs::create_dir_all(shared_dir.join("global")).unwrap();
     fs::write(shared_dir.join("global/SKILL.md"), "global").unwrap();
+    fs::create_dir_all(shared_dir.join(".global-hidden")).unwrap();
+    fs::write(shared_dir.join(".global-hidden/SKILL.md"), "hidden global").unwrap();
     fs::create_dir_all(shared_dir.join("broken")).unwrap();
     fs::write(shared_dir.join(".DS_Store"), "").unwrap();
 
@@ -213,12 +221,16 @@ fn e2e_create_from_imports_and_removes_shared_agent_skills() {
         fs::read_to_string(profile.join("skills/global/SKILL.md")).unwrap(),
         "global"
     );
+    assert!(!profile.join("skills/.native-hidden/SKILL.md").exists());
+    assert!(!profile.join("skills/.global-hidden/SKILL.md").exists());
 
     assert!(!shared_dir.join("global").exists());
     assert!(
         shared_dir.join("shared").exists(),
         "shadowed shared skill should be left alone"
     );
+    assert!(codex_dir.join("skills/.native-hidden").exists());
+    assert!(shared_dir.join(".global-hidden").exists());
     assert!(shared_dir.join("broken").exists());
     assert!(shared_dir.join(".DS_Store").exists());
 }

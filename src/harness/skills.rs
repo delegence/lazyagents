@@ -23,10 +23,13 @@ pub fn import_skills(path: &Path) -> Result<Vec<ImportedDirectory>> {
     }
     for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
         let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
         if !entry.path().metadata()?.is_dir() || !entry.path().join("SKILL.md").is_file() {
             continue;
         }
-        let name = entry.file_name().to_string_lossy().into_owned();
         skills.push(ImportedDirectory {
             name,
             files: import_files_recursive(&entry.path(), &entry.path())?,
@@ -60,4 +63,30 @@ pub fn valid_skills(profile_path: &Path) -> Result<Vec<PathBuf>> {
     }
     skills.sort();
     Ok(skills)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn import_skills_ignores_hidden_root_skill_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let skills_dir = temp.path();
+
+        fs::create_dir_all(skills_dir.join("visible")).unwrap();
+        fs::write(skills_dir.join("visible").join("SKILL.md"), "visible").unwrap();
+
+        fs::create_dir_all(skills_dir.join(".hidden")).unwrap();
+        fs::write(skills_dir.join(".hidden").join("SKILL.md"), "hidden").unwrap();
+
+        let skills = import_skills(skills_dir).unwrap();
+        let names = skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["visible"]);
+    }
 }

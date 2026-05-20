@@ -1,24 +1,14 @@
-use std::fs;
-use std::path::Path;
-
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{json, Map, Value};
 
-use crate::harness::commands::{flat_profile_commands, import_flat_commands, link_flat_commands};
-use crate::harness::drift::DriftReport;
-use crate::harness::fs::{
-    collect_directory_link_drift, collect_instruction_content_drift, detect_binary, read_json,
-    read_optional_string, symlink_points_to, verify_profile_instructions,
-    write_profile_instructions,
+use crate::harness::artifact::{
+    CommandMode, CommandsDirectory, HarnessArtifact, InstructionFile, JsonConfigFile, NativeConfig,
+    PreferenceBinding, PreferenceCodec, PreferenceKind, SettingsPreferences, SkillsDirectory,
 };
 use crate::harness::integration::{
-    AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedPreference,
-    ProfileImport, ProfileRef,
+    AppEnvironment, HarnessConfigPaths, HarnessIntegration, ImportedPreference, ProfileRef,
 };
 use crate::harness::kind::HarnessKind;
-use crate::harness::managed::{write_text_atomic, ManagedSurface};
-use crate::harness::skills::{import_skills, link_skills, valid_skills};
-use crate::profile::{read_profile_config as read_profile_config_from_profile, ProfileConfig};
 
 pub struct PiIntegration;
 
@@ -33,10 +23,6 @@ impl HarnessIntegration for PiIntegration {
 
     fn supports_subagents(&self) -> bool {
         false
-    }
-
-    fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection> {
-        Ok(detect_binary(env, self.kind().binary_name()))
     }
 
     fn default_config_dir(&self, env: &AppEnvironment) -> std::path::PathBuf {
@@ -55,122 +41,51 @@ impl HarnessIntegration for PiIntegration {
         })
     }
 
-    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-        self.paths_from_config_dir(self.default_config_dir(env))
-    }
-
-    fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
+    fn artifacts(&self) -> Vec<Box<dyn HarnessArtifact>> {
         vec![
-            ManagedSurface::file(&paths.instruction_target),
-            ManagedSurface::directory(&paths.skills_dir),
-            ManagedSurface::directory(&paths.commands_dir),
-            ManagedSurface::preserved_file(&paths.settings_file),
+            Box::new(InstructionFile::new(|paths| &paths.instruction_target)),
+            Box::new(SkillsDirectory::new(|paths| &paths.skills_dir)),
+            Box::new(CommandsDirectory::new(
+                |paths| &paths.commands_dir,
+                CommandMode::FlatSymlink,
+            )),
         ]
     }
 
-    fn preflight(&self, profile: &ProfileRef) -> Result<()> {
-        flat_profile_commands(&profile.path).map(|_| ())
+    fn settings(&self) -> Option<Box<dyn crate::harness::artifact::HarnessSettings>> {
+        Some(Box::new(
+            SettingsPreferences::new(
+                JsonConfigFile::new(|paths| &paths.settings_file).label("Pi settings JSON"),
+            )
+            .model(PreferenceBinding::Custom(Box::new(PiModelCodec))),
+        ))
+    }
+}
+
+struct PiModelCodec;
+
+impl PreferenceCodec for PiModelCodec {
+    fn import(&self, config: &NativeConfig) -> Result<ImportedPreference> {
+        Ok(ImportedPreference::new(import_pi_model_preference(
+            json_config_object(config)?,
+        )))
     }
 
-    fn detect_drift(&self, active: &ProfileRef, paths: &HarnessConfigPaths) -> Result<DriftReport> {
-        let mut items = Vec::new();
-        collect_instruction_content_drift(&active.path, &paths.instruction_target, &mut items)?;
-        collect_directory_link_drift(
-            "skills",
-            valid_skills(&active.path)?,
-            &paths.skills_dir,
-            &mut items,
-        )?;
-        collect_directory_link_drift(
-            "commands",
-            flat_profile_commands(&active.path)?,
-            &paths.commands_dir,
-            &mut items,
-        )?;
-        Ok(DriftReport { items })
-    }
-
-    fn import_from_harness(&self, paths: &HarnessConfigPaths) -> Result<ProfileImport> {
-        let settings = read_pi_settings(&paths.settings_file)?;
-        Ok(ProfileImport {
-            instruction: read_optional_string(&paths.instruction_target)?,
-            skills: import_skills(&paths.skills_dir)?,
-            commands: import_flat_commands(&paths.commands_dir)?,
-            agents: None,
-            mcp_definitions: None,
-            model_preference: ImportedPreference::new(import_pi_model_preference(&settings)),
-            permission_preference: ImportedPreference::default_value(),
-        })
-    }
-
-    fn apply(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-        fs::create_dir_all(&paths.config_dir)
-            .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
-        fs::create_dir_all(&paths.skills_dir)
-            .with_context(|| format!("failed to create {}", paths.skills_dir.display()))?;
-        fs::create_dir_all(&paths.commands_dir)
-            .with_context(|| format!("failed to create {}", paths.commands_dir.display()))?;
-
-        write_profile_instructions(&profile.path, &paths.instruction_target)?;
-        link_skills(profile, paths)?;
-        link_flat_commands(profile, paths)?;
-        patch_pi_settings(profile, paths)?;
+    fn apply(
+        &self,
+        config: &mut NativeConfig,
+        profile: &ProfileRef,
+        _preference_kind: PreferenceKind,
+    ) -> Result<()> {
+        let profile_config = crate::profile::read_profile_config(&profile.path)?;
+        if let Some(model) = non_default_string(
+            profile_config.model_preference(&profile.harness_id),
+            "Pi model preference",
+        )? {
+            patch_pi_model_preference(json_config_object_mut(config)?, &model);
+        }
         Ok(())
     }
-
-    fn verify(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-        verify_profile_instructions("Pi", &profile.path, &paths.instruction_target)?;
-
-        for skill in valid_skills(&profile.path)? {
-            let target = paths.skills_dir.join(
-                skill
-                    .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("invalid skill path {}", skill.display()))?,
-            );
-            if !symlink_points_to(&target, &skill) {
-                anyhow::bail!("Pi skill link {} was not applied", target.display());
-            }
-        }
-
-        for command in flat_profile_commands(&profile.path)? {
-            let target =
-                paths.commands_dir.join(command.file_name().ok_or_else(|| {
-                    anyhow::anyhow!("invalid command path {}", command.display())
-                })?);
-            if !symlink_points_to(&target, &command) {
-                anyhow::bail!("Pi prompt link {} was not applied", target.display());
-            }
-        }
-
-        let _ = read_pi_settings(&paths.settings_file)?;
-        Ok(())
-    }
-}
-
-fn patch_pi_settings(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-    let profile_config = read_profile_config(&profile.path)?;
-    let mut document = read_pi_settings(&paths.settings_file)?;
-
-    if let Some(model) = non_default_string(
-        profile_config.model_preference(&profile.harness_id),
-        "Pi model preference",
-    )? {
-        patch_pi_model_preference(&mut document, &model);
-    }
-
-    write_text_atomic(
-        &paths.settings_file,
-        &serde_json::to_string_pretty(&document)?,
-    )
-    .with_context(|| format!("failed to write {}", paths.settings_file.display()))
-}
-
-fn read_profile_config(profile_path: &Path) -> Result<ProfileConfig> {
-    read_profile_config_from_profile(profile_path)
-}
-
-fn read_pi_settings(path: &Path) -> Result<Map<String, Value>> {
-    read_json(path)
 }
 
 fn import_pi_model_preference(settings: &Map<String, Value>) -> Value {
@@ -181,6 +96,25 @@ fn import_pi_model_preference(settings: &Map<String, Value>) -> Value {
         (None, Some(model)) => json!(model),
         _ => json!("default"),
     }
+}
+
+fn json_config_object(config: &NativeConfig) -> Result<&Map<String, Value>> {
+    let NativeConfig::Json(Value::Object(document)) = config else {
+        anyhow::bail!("Pi JSON config must be an object");
+    };
+    Ok(document)
+}
+
+fn json_config_object_mut(config: &mut NativeConfig) -> Result<&mut Map<String, Value>> {
+    let NativeConfig::Json(value) = config else {
+        anyhow::bail!("Pi JSON config must be an object");
+    };
+    if !value.is_object() {
+        *value = Value::Object(Map::new());
+    }
+    value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Pi JSON config must be an object"))
 }
 
 fn patch_pi_model_preference(document: &mut Map<String, Value>, model: &str) {

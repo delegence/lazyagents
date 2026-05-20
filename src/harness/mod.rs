@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod apply;
+pub mod artifact;
 pub mod commands;
 pub mod drift;
 pub mod fs;

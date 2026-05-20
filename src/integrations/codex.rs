@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -7,38 +6,22 @@ use serde_json::{json, Value};
 use toml_edit::{value, Array, DocumentMut, Item, Table};
 
 use crate::harness::agents::{
-    apply_rendered_agents, collect_rendered_agent_drift, harness_scoped_value, profile_agents,
-    select_harness_value, sub_agent_import_file, verify_rendered_agents, yaml_scalar_string,
-    RenderedAgent, SubAgent,
+    harness_scoped_value, select_harness_value, yaml_scalar_string, RenderedAgent, SubAgent,
 };
-use crate::harness::commands::{flat_profile_commands, import_flat_commands, link_flat_commands};
-use crate::harness::drift::{DriftItem, DriftReport};
-use crate::harness::fs::{
-    collect_directory_link_drift, collect_instruction_content_drift, detect_binary,
-    read_optional_string, symlink_points_to, verify_profile_instructions,
-    write_profile_instructions,
+use crate::harness::artifact::{
+    CommandMode, CommandsDirectory, HarnessArtifact, InstructionFile, McpCodec, McpConfig,
+    NativeConfig, PreferenceBinding, SettingsPreferences, SkillsDirectory, SubagentCodec,
+    SubagentsDirectory, TomlConfigFile,
 };
-use crate::harness::integration::{
-    AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedFile,
-    ImportedPreference, ProfileImport, ProfileRef,
-};
+use crate::harness::integration::{AppEnvironment, HarnessConfigPaths, HarnessIntegration};
 use crate::harness::kind::HarnessKind;
-use crate::harness::managed::{write_text_atomic, ManagedSurface};
-use crate::harness::skills::{import_skills, link_skills, valid_skills};
-use crate::profile::mcp::{
-    canonical_mcp_json, parse_mcp_definitions, read_mcp_definitions, McpDefinition, McpTransport,
-};
-use crate::profile::{read_profile_config as read_profile_config_from_profile, ProfileConfig};
+use crate::profile::mcp::{McpDefinition, McpTransport};
 
 pub struct CodexIntegration;
 
 impl HarnessIntegration for CodexIntegration {
     fn kind(&self) -> HarnessKind {
         HarnessKind::Codex
-    }
-
-    fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection> {
-        Ok(detect_binary(env, self.kind().binary_name()))
     }
 
     fn default_config_dir(&self, env: &AppEnvironment) -> std::path::PathBuf {
@@ -57,141 +40,83 @@ impl HarnessIntegration for CodexIntegration {
         })
     }
 
-    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-        self.paths_from_config_dir(self.default_config_dir(env))
-    }
-
-    fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
+    fn artifacts(&self) -> Vec<Box<dyn HarnessArtifact>> {
         vec![
-            ManagedSurface::file(&paths.instruction_target),
-            ManagedSurface::directory(&paths.skills_dir),
-            ManagedSurface::directory(&paths.commands_dir),
-            ManagedSurface::directory(&paths.agents_dir),
-            ManagedSurface::preserved_file(&paths.settings_file),
+            Box::new(InstructionFile::new(|paths| &paths.instruction_target)),
+            Box::new(SkillsDirectory::new(|paths| &paths.skills_dir)),
+            Box::new(CommandsDirectory::new(
+                |paths| &paths.commands_dir,
+                CommandMode::FlatSymlink,
+            )),
+            Box::new(SubagentsDirectory::new(
+                |paths| &paths.agents_dir,
+                CodexSubagentCodec,
+            )),
+            Box::new(McpConfig::new(
+                TomlConfigFile::new(|paths| &paths.settings_file).label("Codex config TOML"),
+                CodexMcpCodec,
+            )),
         ]
     }
 
-    fn preflight(&self, profile: &ProfileRef) -> Result<()> {
-        flat_profile_commands(&profile.path)?;
-        profile_agents(&profile.path)?;
-        Ok(())
-    }
-
-    fn detect_drift(&self, active: &ProfileRef, paths: &HarnessConfigPaths) -> Result<DriftReport> {
-        let mut items = Vec::new();
-        collect_instruction_content_drift(&active.path, &paths.instruction_target, &mut items)?;
-        collect_directory_link_drift(
-            "skills",
-            valid_skills(&active.path)?,
-            &paths.skills_dir,
-            &mut items,
-        )?;
-        collect_directory_link_drift(
-            "commands",
-            flat_profile_commands(&active.path)?,
-            &paths.commands_dir,
-            &mut items,
-        )?;
-        collect_rendered_agent_drift(
-            &render_codex_profile_agents(active)?,
-            &paths.agents_dir,
-            &mut items,
-        )?;
-        let native_mcps =
-            parse_mcp_definitions(&import_codex_mcps(&read_config(&paths.settings_file)?)?)?;
-        let profile_mcps = read_mcp_definitions(&active.path)?;
-        if canonical_mcp_json(&native_mcps)? != canonical_mcp_json(&profile_mcps)? {
-            items.push(DriftItem {
-                surface: "mcp".to_string(),
-                detail: "Codex MCP list differs from active profile".to_string(),
-            });
-        }
-        Ok(DriftReport { items })
-    }
-
-    fn import_from_harness(&self, paths: &HarnessConfigPaths) -> Result<ProfileImport> {
-        let document = read_config(&paths.settings_file)?;
-        Ok(ProfileImport {
-            instruction: read_optional_string(&paths.instruction_target)?,
-            skills: import_skills(&paths.skills_dir)?,
-            commands: import_flat_commands(&paths.commands_dir)?,
-            agents: import_codex_agents(&paths.agents_dir)?,
-            mcp_definitions: Some(import_codex_mcps(&document)?),
-            model_preference: ImportedPreference::new(
-                document
-                    .get("model")
-                    .and_then(Item::as_str)
-                    .map(|value| json!(value))
-                    .unwrap_or_else(|| json!("default")),
-            ),
-            permission_preference: ImportedPreference::new(
-                document
-                    .get("approval_policy")
-                    .and_then(Item::as_str)
-                    .map(|value| json!(value))
-                    .unwrap_or_else(|| json!("default")),
-            ),
-        })
-    }
-
-    fn apply(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-        fs::create_dir_all(&paths.config_dir)
-            .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
-        fs::create_dir_all(&paths.skills_dir)
-            .with_context(|| format!("failed to create {}", paths.skills_dir.display()))?;
-        fs::create_dir_all(&paths.commands_dir)
-            .with_context(|| format!("failed to create {}", paths.commands_dir.display()))?;
-        fs::create_dir_all(&paths.agents_dir)
-            .with_context(|| format!("failed to create {}", paths.agents_dir.display()))?;
-
-        write_profile_instructions(&profile.path, &paths.instruction_target)?;
-        link_skills(profile, paths)?;
-        link_flat_commands(profile, paths)?;
-        apply_rendered_agents(&render_codex_profile_agents(profile)?, &paths.agents_dir)?;
-        patch_codex_config(profile, paths)?;
-        Ok(())
-    }
-
-    fn verify(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-        verify_profile_instructions("Codex", &profile.path, &paths.instruction_target)?;
-
-        for skill in valid_skills(&profile.path)? {
-            let target = paths.skills_dir.join(
-                skill
-                    .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("invalid skill path {}", skill.display()))?,
-            );
-            if !symlink_points_to(&target, &skill) {
-                anyhow::bail!("Codex skill link {} was not applied", target.display());
-            }
-        }
-
-        for command in flat_profile_commands(&profile.path)? {
-            let target =
-                paths.commands_dir.join(command.file_name().ok_or_else(|| {
-                    anyhow::anyhow!("invalid command path {}", command.display())
-                })?);
-            if !symlink_points_to(&target, &command) {
-                anyhow::bail!("Codex command link {} was not applied", target.display());
-            }
-        }
-        verify_rendered_agents(&render_codex_profile_agents(profile)?, &paths.agents_dir)?;
-
-        let document = read_config(&paths.settings_file)?;
-        let native_mcps = parse_mcp_definitions(&import_codex_mcps(&document)?)?;
-        let profile_mcps = read_mcp_definitions(&profile.path)?;
-        if canonical_mcp_json(&native_mcps)? != canonical_mcp_json(&profile_mcps)? {
-            anyhow::bail!("Codex MCP config does not match profile MCP definitions");
-        }
-        Ok(())
+    fn settings(&self) -> Option<Box<dyn crate::harness::artifact::HarnessSettings>> {
+        Some(Box::new(
+            SettingsPreferences::new(
+                TomlConfigFile::new(|paths| &paths.settings_file).label("Codex config TOML"),
+            )
+            .model(PreferenceBinding::TomlKey { key: "model" })
+            .permission(PreferenceBinding::TomlKey {
+                key: "approval_policy",
+            }),
+        ))
     }
 }
 
-fn render_codex_profile_agents(profile: &ProfileRef) -> Result<Vec<RenderedAgent>> {
-    profile_agents(&profile.path)?
-        .into_iter()
-        .map(|agent| render_codex_agent(&agent))
-        .collect()
+struct CodexSubagentCodec;
+
+impl SubagentCodec for CodexSubagentCodec {
+    fn native_file_name(&self, agent: &SubAgent) -> String {
+        format!("{}.toml", agent.name)
+    }
+
+    fn render(&self, agent: &SubAgent) -> Result<String> {
+        Ok(render_codex_agent(agent)?.contents)
+    }
+
+    fn should_import(&self, path: &Path) -> bool {
+        path.extension().is_some_and(|ext| ext == "toml")
+    }
+
+    fn parse(&self, path: &Path, contents: &str) -> Result<SubAgent> {
+        codex_toml_to_neutral(contents)
+            .with_context(|| format!("failed to import Codex agent {}", path.display()))
+    }
+}
+
+struct CodexMcpCodec;
+
+impl McpCodec for CodexMcpCodec {
+    fn import(&self, config: &NativeConfig) -> Result<Vec<McpDefinition>> {
+        let NativeConfig::Toml(document) = config else {
+            anyhow::bail!("Codex MCP codec requires TOML config");
+        };
+        parse_codex_mcps(document)
+    }
+
+    fn apply(&self, config: &mut NativeConfig, definitions: &[McpDefinition]) -> Result<()> {
+        let NativeConfig::Toml(document) = config else {
+            anyhow::bail!("Codex MCP codec requires TOML config");
+        };
+        document.as_table_mut().remove("mcp_servers");
+        if !definitions.is_empty() {
+            let mut servers = Table::new();
+            for definition in definitions {
+                servers[&definition.name] = Item::Table(definition.to_codex_table()?);
+            }
+            document["mcp_servers"] = Item::Table(servers);
+        }
+        Ok(())
+    }
 }
 
 fn render_codex_agent(agent: &SubAgent) -> Result<RenderedAgent> {
@@ -224,34 +149,6 @@ fn render_codex_agent(agent: &SubAgent) -> Result<RenderedAgent> {
         relative_path: std::path::PathBuf::from(format!("{}.toml", agent.name)),
         contents: document.to_string(),
     })
-}
-
-fn import_codex_agents(path: &Path) -> Result<Option<Vec<ImportedFile>>> {
-    if !path.exists() {
-        return Ok(Some(Vec::new()));
-    }
-    let mut imported = Vec::new();
-    for file in crate::harness::fs::import_files_recursive(path, path)? {
-        if file
-            .relative_path
-            .extension()
-            .is_none_or(|ext| ext != "toml")
-        {
-            continue;
-        }
-        let text = String::from_utf8(file.contents).with_context(|| {
-            format!("Codex agent {} is not UTF-8", file.relative_path.display())
-        })?;
-        let neutral = codex_toml_to_neutral(&text).with_context(|| {
-            format!(
-                "failed to import Codex agent {}",
-                file.relative_path.display()
-            )
-        })?;
-        imported.push(sub_agent_import_file(&neutral));
-    }
-    imported.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    Ok(Some(imported))
 }
 
 fn codex_toml_to_neutral(text: &str) -> Result<SubAgent> {
@@ -423,57 +320,10 @@ fn yaml_to_toml_item(yaml: &serde_yaml::Value) -> Result<Item> {
     })
 }
 
-fn patch_codex_config(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-    let profile_config = read_profile_config(&profile.path)?;
-    let mcp_definitions = read_mcp_definitions(&profile.path)?;
-    let mut document = read_config(&paths.settings_file)?;
-
-    if let Some(model) = non_default_string(
-        profile_config.model_preference(&profile.harness_id),
-        "Model Preference",
-    )? {
-        document["model"] = value(model);
-    }
-    if let Some(permission) = non_default_string(
-        profile_config.permission_preference(&profile.harness_id),
-        "Permission Preference",
-    )? {
-        document["approval_policy"] = value(permission);
-    }
-
-    document.as_table_mut().remove("mcp_servers");
-    if !mcp_definitions.is_empty() {
-        let mut servers = Table::new();
-        for definition in mcp_definitions {
-            servers[&definition.name] = Item::Table(definition.to_codex_table()?);
-        }
-        document["mcp_servers"] = Item::Table(servers);
-    }
-
-    write_text_atomic(&paths.settings_file, &document.to_string())
-        .with_context(|| format!("failed to write {}", paths.settings_file.display()))
-}
-
-fn read_profile_config(profile_path: &Path) -> Result<ProfileConfig> {
-    read_profile_config_from_profile(profile_path)
-}
-
-fn read_config(path: &Path) -> Result<DocumentMut> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()))
-        }
-    };
-    text.parse::<DocumentMut>()
-        .with_context(|| format!("invalid Codex config TOML at {}", path.display()))
-}
-
-fn import_codex_mcps(document: &DocumentMut) -> Result<String> {
+fn parse_codex_mcps(document: &DocumentMut) -> Result<Vec<McpDefinition>> {
     let mut servers = Vec::new();
     let Some(mcp_item) = document.as_table().get("mcp_servers") else {
-        return Ok("".to_string());
+        return Ok(Vec::new());
     };
     let Some(mcp_table) = mcp_item.as_table() else {
         anyhow::bail!("Codex config mcp_servers must be a table");
@@ -525,11 +375,7 @@ fn import_codex_mcps(document: &DocumentMut) -> Result<String> {
         }
     }
 
-    if servers.is_empty() {
-        Ok("".to_string())
-    } else {
-        Ok(format!("{}\n", serde_json::to_string_pretty(&servers)?))
-    }
+    crate::profile::mcp::parse_mcp_definitions(&serde_json::to_string(&servers)?)
 }
 
 fn table_to_json_object(item: Option<&Item>) -> Result<Value> {
@@ -552,14 +398,6 @@ fn table_to_string_map(item: Option<&Item>) -> Result<BTreeMap<String, String>> 
         map.insert(key.to_string(), value.to_string());
     }
     Ok(map)
-}
-
-fn non_default_string(value: Value, label: &str) -> Result<Option<String>> {
-    match value {
-        Value::String(value) if value == "default" => Ok(None),
-        Value::String(value) => Ok(Some(value)),
-        other => anyhow::bail!("Codex {label} must be a string or \"default\", got {other}"),
-    }
 }
 
 impl McpDefinition {

@@ -81,8 +81,7 @@ mod tests {
     use anyhow::{anyhow, Context};
 
     use super::*;
-    use crate::harness::drift::DriftReport;
-    use crate::harness::integration::{HarnessDetection, ProfileImport};
+    use crate::harness::artifact::{ArtifactContext, HarnessArtifact};
     use crate::harness::kind::HarnessKind;
     use crate::harness::managed::ManagedSurface;
     use crate::profile::LazyagentsHome;
@@ -127,61 +126,70 @@ mod tests {
             })
         }
 
-        fn detect(&self, _env: &AppEnvironment) -> Result<HarnessDetection> {
-            Ok(HarnessDetection::Detected {
-                binary_path: self.root.join("bin").join("fake"),
-            })
-        }
-
-        fn paths(&self, _env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-            self.paths_from_config_dir(self.root.clone())
-        }
-
-        fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
+        fn artifacts(&self) -> Vec<Box<dyn HarnessArtifact>> {
             vec![
-                ManagedSurface::file(&paths.instruction_target),
-                ManagedSurface::directory(&paths.skills_dir),
-                ManagedSurface::directory(&paths.commands_dir),
+                Box::new(FakeInstructionArtifact {
+                    fail_verify: self.fail_verify,
+                }),
+                Box::new(FakeSkillsArtifact),
+                Box::new(FakeCommandsArtifact),
             ]
         }
+    }
 
-        fn preflight(&self, _profile: &ProfileRef) -> Result<()> {
-            Ok(())
+    struct FakeInstructionArtifact {
+        fail_verify: bool,
+    }
+
+    impl HarnessArtifact for FakeInstructionArtifact {
+        fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
+            vec![ManagedSurface::file(&paths.instruction_target)]
         }
 
-        fn detect_drift(
-            &self,
-            _active: &ProfileRef,
-            _paths: &HarnessConfigPaths,
-        ) -> Result<DriftReport> {
-            Ok(DriftReport::clean())
-        }
-
-        fn import_from_harness(&self, _paths: &HarnessConfigPaths) -> Result<ProfileImport> {
-            Ok(ProfileImport::default())
-        }
-
-        fn apply(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-            fs::create_dir_all(&paths.config_dir)?;
-            fs::create_dir_all(&paths.skills_dir)?;
-            fs::create_dir_all(&paths.commands_dir)?;
+        fn apply(&self, ctx: &ArtifactContext<'_>, profile: &ProfileRef) -> Result<()> {
             fs::write(
-                &paths.instruction_target,
+                &ctx.paths.instruction_target,
                 format!("profile={}", profile.name.as_str()),
             )?;
-            if profile.name.as_str() == "full" {
-                fs::write(paths.skills_dir.join("skill.txt"), "skill")?;
-                fs::write(paths.commands_dir.join("cmd.md"), "cmd")?;
-            }
             Ok(())
         }
 
-        fn verify(&self, _profile: &ProfileRef, _paths: &HarnessConfigPaths) -> Result<()> {
+        fn verify(&self, _ctx: &ArtifactContext<'_>, _profile: &ProfileRef) -> Result<()> {
             if self.fail_verify {
                 Err(anyhow!("verify failed"))
             } else {
                 Ok(())
             }
+        }
+    }
+
+    struct FakeSkillsArtifact;
+
+    impl HarnessArtifact for FakeSkillsArtifact {
+        fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
+            vec![ManagedSurface::directory(&paths.skills_dir)]
+        }
+
+        fn apply(&self, ctx: &ArtifactContext<'_>, profile: &ProfileRef) -> Result<()> {
+            if profile.name.as_str() == "full" {
+                fs::write(ctx.paths.skills_dir.join("skill.txt"), "skill")?;
+            }
+            Ok(())
+        }
+    }
+
+    struct FakeCommandsArtifact;
+
+    impl HarnessArtifact for FakeCommandsArtifact {
+        fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
+            vec![ManagedSurface::directory(&paths.commands_dir)]
+        }
+
+        fn apply(&self, ctx: &ArtifactContext<'_>, profile: &ProfileRef) -> Result<()> {
+            if profile.name.as_str() == "full" {
+                fs::write(ctx.paths.commands_dir.join("cmd.md"), "cmd")?;
+            }
+            Ok(())
         }
     }
 

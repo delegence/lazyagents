@@ -2,7 +2,6 @@ use crate::harness::drift::DriftItem;
 use crate::harness::integration::{AppEnvironment, HarnessDetection, ImportedFile};
 use crate::harness::managed::write_text_atomic;
 use anyhow::{Context, Result};
-use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -105,28 +104,8 @@ pub fn symlink_dir(source: impl AsRef<Path>, target: impl AsRef<Path>) -> Result
         .with_context(|| format!("failed to link {}", target.as_ref().display()))
 }
 
-pub fn read_json(path: &Path) -> Result<Map<String, Value>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Map::new()),
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()))
-        }
-    };
-    if text.trim().is_empty() {
-        return Ok(Map::new());
-    }
-    let value: Value = serde_json::from_str(&text)
-        .with_context(|| format!("invalid JSON at {}", path.display()))?;
-    if let Value::Object(map) = value {
-        Ok(map)
-    } else {
-        anyhow::bail!("JSON at {} is not an object", path.display())
-    }
-}
-
 #[cfg(test)]
-pub fn normalize_json_text(text: &str) -> Value {
+pub fn normalize_json_text(text: &str) -> serde_json::Value {
     if text.trim().is_empty() {
         serde_json::json!([])
     } else {

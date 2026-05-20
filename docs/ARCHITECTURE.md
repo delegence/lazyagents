@@ -94,7 +94,7 @@ Profile names are represented by `ProfileName` and must be validated at boundari
 
 ## Harness Settings
 
-`~/.lazyagents/settings.json` is created automatically when missing and is the source of truth for harness instances:
+`~/.lazyagents/settings.json` is the source of truth for harness instances. When it is missing, commands that load the harness registry create it automatically from the built-in integrations:
 
 ```json
 {
@@ -221,7 +221,7 @@ All-harness profile use:
 - continues after individual harness failures
 - updates state per successful harness
 
-Mutating workflows acquire an exclusive lazyagents home lock before changing profiles, settings, harness config, or state. A second mutating command fails rather than racing the first.
+Workflows that explicitly mutate profiles, settings, harness config, or active state acquire an exclusive lazyagents home lock before making those changes. A second mutating command fails rather than racing the first. Missing `settings.json` creation is a lazy registry-load side effect and may happen before a workflow has acquired the mutation lock.
 
 In non-interactive shells, drift prompts are not attempted. The CLI reports the required explicit flag instead: `--save-changes` or `--discard-changes` for one harness, and only `--discard-changes` for `--all`.
 
@@ -268,6 +268,7 @@ Backups cover only managed surfaces:
 - instruction target
 - skills directory contents
 - commands directory contents
+- native sub-agent directory contents, when supported by the harness
 - native settings file
 - native MCP file, if separate and supported by the harness
 
@@ -301,11 +302,11 @@ Adding a harness should usually touch:
 src/harness/kind.rs
 src/integrations/<harness>.rs
 src/integrations/mod.rs
-src/app/harness_registry.rs
 docs/ARCHITECTURE.md
-docs/INTEGRATION.md
 README.md
 ```
+
+Default settings are derived from `built_in_integrations()`, so adding a built-in harness does not require a second default path table in `src/app/harness_registry.rs`. Update `docs/INTEGRATION.md` only if the integration workflow itself changes.
 
 Do not add a second CLI-only harness enum. CLI accepts harness ids as strings and resolves them through `HarnessRegistry`.
 
@@ -402,7 +403,7 @@ Use focused harness-specific tests for native format quirks, config preservation
 - Prefer standard library plus well-known crates.
 - Use structured parsers for JSON and TOML rather than string manipulation.
 - Patch native config files; preserve unrelated settings.
-- Use direct file writes for profile instructions and absolute symlinks for profile-owned skills and commands.
+- Use direct file writes for profile instructions and symlink profile-owned skills and commands from the resolved profile paths.
 - Keep CLI output user-facing and clear.
 - Keep validation accumulated where possible so `show` and `doctor` can report multiple issues.
 - Avoid async until there is a clear need.

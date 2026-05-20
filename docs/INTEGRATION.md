@@ -58,20 +58,36 @@ impl HarnessIntegration for ExampleIntegration {
     fn kind(&self) -> HarnessKind { ... }
     fn default_config_dir(&self, env: &AppEnvironment) -> PathBuf { ... }
     fn paths_from_config_dir(&self, config_dir: PathBuf) -> Result<HarnessConfigPaths> { ... }
-    fn supports_skills(&self) -> bool { ... } // optional; defaults to true
-    fn supports_commands(&self) -> bool { ... } // optional; defaults to true
-    fn supports_mcp(&self) -> bool { ... } // optional; defaults to true
-    fn supports_subagents(&self) -> bool { ... } // optional; defaults to true
-    fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection> { ... }
-    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> { ... }
-    fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> { ... }
-    fn preflight(&self, profile: &ProfileRef) -> Result<()> { ... }
-    fn detect_drift(&self, active: &ProfileRef, paths: &HarnessConfigPaths) -> Result<DriftReport> { ... }
-    fn import_from_harness(&self, paths: &HarnessConfigPaths) -> Result<ProfileImport> { ... }
-    fn apply(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> { ... }
-    fn verify(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> { ... }
+    fn artifacts(&self) -> Vec<Box<dyn HarnessArtifact>> {
+        vec![
+            Box::new(InstructionFile::new(|paths| &paths.instruction_target)),
+            Box::new(SkillsDirectory::new(|paths| &paths.skills_dir)),
+            Box::new(CommandsDirectory::new(
+                |paths| &paths.commands_dir,
+                CommandMode::RecursiveSymlink,
+            )),
+            Box::new(SubagentsDirectory::new(
+                |paths| &paths.agents_dir,
+                ExampleSubagentCodec,
+            )),
+            Box::new(McpConfig::new(
+                JsonConfigFile::new(|paths| &paths.mcp_file),
+                ExampleMcpCodec,
+            )),
+        ]
+    }
+
+    fn settings(&self) -> Option<Box<dyn HarnessSettings>> {
+        Some(Box::new(
+            SettingsPreferences::new(JsonConfigFile::new(|paths| &paths.settings_file))
+                .model(PreferenceBinding::JsonPointer { pointer: "/model" })
+                .permission(PreferenceBinding::JsonPointer { pointer: "/permissions" }),
+        ))
+    }
 }
 ```
+
+Most harnesses should not implement lifecycle orchestration directly. The default `HarnessIntegration` methods detect the binary, derive paths, concatenate managed surfaces, run preflight, detect drift, import, apply, and verify by walking the declared artifacts and settings in order. Override a lifecycle method only when a harness has genuinely unusual behavior and document why in the integration file.
 
 Use existing integrations as models:
 
@@ -211,7 +227,7 @@ Compare the active profile to current harness managed surfaces and return `Drift
 
 Drift should include:
 
-- instruction target not linked to active profile instruction source
+- instruction target content differing from the active profile instructions
 - skill set mismatch, when skills are supported
 - command set mismatch, when commands are supported
 - MCP differences, when native MCP is supported
@@ -245,7 +261,7 @@ Apply a profile to the harness after shared transaction code has captured backup
 Rules:
 
 - create missing config directories
-- write profile instructions directly and symlink supported valid skills/command files with absolute symlinks
+- write profile instructions directly and symlink supported valid skills/command files from the resolved profile paths
 - render neutral sub-agents into native files, when the harness supports native sub-agents
 - patch native config files, preserving unrelated keys
 - translate neutral MCP definitions into native format, when the harness supports native MCP
@@ -338,6 +354,6 @@ Before considering the integration done, confirm:
 - Replacing entire native config files and losing unrelated settings.
 - Treating `"default"` as a literal native model or permission value.
 - Letting nested commands partially apply on a harness that cannot represent them.
-- Forgetting to register the integration in `BuiltInHarnessRegistry`.
+- Forgetting to register the integration in `built_in_integrations()`.
 - Adding a duplicate CLI harness enum instead of resolving harness strings through `HarnessRegistry`.
 - Adding broad `#[allow(dead_code)]` instead of deleting stale code or gating test helpers with `#[cfg(test)]`.

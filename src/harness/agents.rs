@@ -39,7 +39,7 @@ struct AgentFrontmatter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RenderedAgent {
+pub(crate) struct RenderedAgent {
     pub relative_path: PathBuf,
     pub contents: String,
 }
@@ -76,7 +76,7 @@ pub fn scan_agents(path: &Path) -> Result<(Vec<String>, Vec<String>)> {
     Ok((valid, ignored))
 }
 
-pub fn apply_rendered_agents(agents: &[RenderedAgent], target_dir: &Path) -> Result<()> {
+pub(crate) fn apply_rendered_agents(agents: &[RenderedAgent], target_dir: &Path) -> Result<()> {
     fs::create_dir_all(target_dir)
         .with_context(|| format!("failed to create {}", target_dir.display()))?;
     for agent in agents {
@@ -91,7 +91,7 @@ pub fn apply_rendered_agents(agents: &[RenderedAgent], target_dir: &Path) -> Res
     Ok(())
 }
 
-pub fn verify_rendered_agents(agents: &[RenderedAgent], target_dir: &Path) -> Result<()> {
+pub(crate) fn verify_rendered_agents(agents: &[RenderedAgent], target_dir: &Path) -> Result<()> {
     for agent in agents {
         let target = target_dir.join(&agent.relative_path);
         let actual = fs::read_to_string(&target)
@@ -106,7 +106,7 @@ pub fn verify_rendered_agents(agents: &[RenderedAgent], target_dir: &Path) -> Re
     Ok(())
 }
 
-pub fn collect_rendered_agent_drift(
+pub(crate) fn collect_rendered_agent_drift(
     agents: &[RenderedAgent],
     target_dir: &Path,
     items: &mut Vec<DriftItem>,

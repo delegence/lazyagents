@@ -1,46 +1,33 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+#[cfg(test)]
+use anyhow::Context;
+use anyhow::Result;
 use serde_json::{json, Map, Value};
 
+#[cfg(test)]
+use crate::harness::agents::sub_agent_import_file;
 use crate::harness::agents::{
-    apply_rendered_agents, collect_rendered_agent_drift, harness_scoped_value, profile_agents,
-    remove_string, remove_value, select_harness_value, split_markdown_frontmatter,
-    sub_agent_import_file, verify_rendered_agents, RenderedAgent, SubAgent,
+    harness_scoped_value, remove_string, remove_value, select_harness_value,
+    split_markdown_frontmatter, RenderedAgent, SubAgent,
 };
-use crate::harness::commands::{
-    collect_directory_link_drift_recursive, import_commands, link_commands,
-    profile_commands_recursive,
+use crate::harness::artifact::{
+    CommandMode, CommandsDirectory, HarnessArtifact, InstructionFile, JsonConfigFile, McpCodec,
+    McpConfig, NativeConfig, PreferenceBinding, SettingsPreferences, SkillsDirectory,
+    SubagentCodec, SubagentsDirectory,
 };
-use crate::harness::drift::{DriftItem, DriftReport};
-use crate::harness::fs::{
-    collect_directory_link_drift, collect_instruction_content_drift, detect_binary, read_json,
-    read_optional_string, symlink_points_to, verify_profile_instructions,
-    write_profile_instructions,
-};
-use crate::harness::integration::{
-    AppEnvironment, HarnessConfigPaths, HarnessDetection, HarnessIntegration, ImportedFile,
-    ImportedPreference, ProfileImport, ProfileRef,
-};
+#[cfg(test)]
+use crate::harness::integration::ImportedFile;
+use crate::harness::integration::{AppEnvironment, HarnessConfigPaths, HarnessIntegration};
 use crate::harness::kind::HarnessKind;
-use crate::harness::managed::{write_text_atomic, ManagedSurface};
-use crate::harness::skills::{import_skills, link_skills, valid_skills};
-use crate::profile::mcp::{
-    canonical_mcp_json, parse_mcp_definitions, read_mcp_definitions, McpDefinition, McpTransport,
-};
-use crate::profile::{read_profile_config as read_profile_config_from_profile, ProfileConfig};
+use crate::profile::mcp::{McpDefinition, McpTransport};
 
 pub struct OpenCodeIntegration;
 
 impl HarnessIntegration for OpenCodeIntegration {
     fn kind(&self) -> HarnessKind {
         HarnessKind::OpenCode
-    }
-
-    fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection> {
-        Ok(detect_binary(env, self.kind().binary_name()))
     }
 
     fn default_config_dir(&self, env: &AppEnvironment) -> std::path::PathBuf {
@@ -59,136 +46,81 @@ impl HarnessIntegration for OpenCodeIntegration {
         })
     }
 
-    fn paths(&self, env: &AppEnvironment) -> Result<HarnessConfigPaths> {
-        self.paths_from_config_dir(self.default_config_dir(env))
-    }
-
-    fn managed_surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
+    fn artifacts(&self) -> Vec<Box<dyn HarnessArtifact>> {
         vec![
-            ManagedSurface::file(&paths.instruction_target),
-            ManagedSurface::directory(&paths.skills_dir),
-            ManagedSurface::directory(&paths.commands_dir),
-            ManagedSurface::directory(&paths.agents_dir),
-            ManagedSurface::preserved_file(&paths.settings_file),
+            Box::new(InstructionFile::new(|paths| &paths.instruction_target)),
+            Box::new(SkillsDirectory::new(|paths| &paths.skills_dir)),
+            Box::new(CommandsDirectory::new(
+                |paths| &paths.commands_dir,
+                CommandMode::RecursiveSymlink,
+            )),
+            Box::new(SubagentsDirectory::new(
+                |paths| &paths.agents_dir,
+                OpenCodeSubagentCodec,
+            )),
+            Box::new(McpConfig::new(
+                JsonConfigFile::new(|paths| &paths.settings_file).label("OpenCode settings JSON"),
+                OpenCodeMcpCodec,
+            )),
         ]
     }
 
-    fn preflight(&self, _profile: &ProfileRef) -> Result<()> {
-        Ok(())
-    }
-
-    fn detect_drift(&self, active: &ProfileRef, paths: &HarnessConfigPaths) -> Result<DriftReport> {
-        let mut items = Vec::new();
-        collect_instruction_content_drift(&active.path, &paths.instruction_target, &mut items)?;
-        collect_directory_link_drift(
-            "skills",
-            valid_skills(&active.path)?,
-            &paths.skills_dir,
-            &mut items,
-        )?;
-        collect_directory_link_drift_recursive(
-            "commands",
-            profile_commands_recursive(&active.path)?,
-            &paths.commands_dir,
-            &active.path.join("commands"),
-            &mut items,
-        )?;
-        collect_rendered_agent_drift(
-            &render_opencode_profile_agents(active)?,
-            &paths.agents_dir,
-            &mut items,
-        )?;
-        let native_mcps =
-            parse_mcp_definitions(&import_opencode_mcps(&read_json(&paths.mcp_file)?)?)?;
-        let profile_mcps = read_mcp_definitions(&active.path)?;
-        if canonical_mcp_json(&native_mcps)? != canonical_mcp_json(&profile_mcps)? {
-            items.push(DriftItem {
-                surface: "mcp".to_string(),
-                detail: "OpenCode MCP list differs from active profile".to_string(),
-            });
-        }
-        Ok(DriftReport { items })
-    }
-
-    fn import_from_harness(&self, paths: &HarnessConfigPaths) -> Result<ProfileImport> {
-        let settings = read_json(&paths.settings_file)?;
-        Ok(ProfileImport {
-            instruction: read_optional_string(&paths.instruction_target)?,
-            skills: import_skills(&paths.skills_dir)?,
-            commands: import_commands(&paths.commands_dir)?,
-            agents: import_opencode_agents(&paths.agents_dir)?,
-            mcp_definitions: Some(import_opencode_mcps(&settings)?),
-            model_preference: ImportedPreference::new(
-                settings
-                    .get("model")
-                    .cloned()
-                    .unwrap_or_else(|| json!("default")),
-            ),
-            permission_preference: ImportedPreference::new(
-                settings
-                    .get("permissions")
-                    .cloned()
-                    .unwrap_or_else(|| json!("default")),
-            ),
-        })
-    }
-
-    fn apply(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-        fs::create_dir_all(&paths.config_dir)
-            .with_context(|| format!("failed to create {}", paths.config_dir.display()))?;
-        fs::create_dir_all(&paths.skills_dir)
-            .with_context(|| format!("failed to create {}", paths.skills_dir.display()))?;
-        fs::create_dir_all(&paths.commands_dir)
-            .with_context(|| format!("failed to create {}", paths.commands_dir.display()))?;
-        fs::create_dir_all(&paths.agents_dir)
-            .with_context(|| format!("failed to create {}", paths.agents_dir.display()))?;
-
-        write_profile_instructions(&profile.path, &paths.instruction_target)?;
-        link_skills(profile, paths)?;
-        link_commands(profile, paths)?;
-        apply_rendered_agents(&render_opencode_profile_agents(profile)?, &paths.agents_dir)?;
-        patch_opencode_config(profile, paths)?;
-        Ok(())
-    }
-
-    fn verify(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-        verify_profile_instructions("OpenCode", &profile.path, &paths.instruction_target)?;
-
-        for skill in valid_skills(&profile.path)? {
-            let target = paths.skills_dir.join(
-                skill
-                    .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("invalid skill path {}", skill.display()))?,
-            );
-            if !symlink_points_to(&target, &skill) {
-                anyhow::bail!("OpenCode skill link {} was not applied", target.display());
-            }
-        }
-
-        for command in profile_commands_recursive(&profile.path)? {
-            let relative = command.strip_prefix(profile.path.join("commands")).unwrap();
-            let target = paths.commands_dir.join(relative);
-            if !symlink_points_to(&target, &command) {
-                anyhow::bail!("OpenCode command link {} was not applied", target.display());
-            }
-        }
-        verify_rendered_agents(&render_opencode_profile_agents(profile)?, &paths.agents_dir)?;
-
-        let settings = read_json(&paths.settings_file)?;
-        let native_mcps = parse_mcp_definitions(&import_opencode_mcps(&settings)?)?;
-        let profile_mcps = read_mcp_definitions(&profile.path)?;
-        if canonical_mcp_json(&native_mcps)? != canonical_mcp_json(&profile_mcps)? {
-            anyhow::bail!("OpenCode MCP config does not match profile MCP definitions");
-        }
-        Ok(())
+    fn settings(&self) -> Option<Box<dyn crate::harness::artifact::HarnessSettings>> {
+        Some(Box::new(
+            SettingsPreferences::new(
+                JsonConfigFile::new(|paths| &paths.settings_file).label("OpenCode settings JSON"),
+            )
+            .model(PreferenceBinding::JsonPointer { pointer: "/model" })
+            .permission(PreferenceBinding::JsonPointer {
+                pointer: "/permissions",
+            }),
+        ))
     }
 }
 
-fn render_opencode_profile_agents(profile: &ProfileRef) -> Result<Vec<RenderedAgent>> {
-    profile_agents(&profile.path)?
-        .into_iter()
-        .map(|agent| render_opencode_agent(&agent))
-        .collect()
+struct OpenCodeSubagentCodec;
+
+impl SubagentCodec for OpenCodeSubagentCodec {
+    fn native_file_name(&self, agent: &SubAgent) -> String {
+        format!("{}.md", agent.name)
+    }
+
+    fn render(&self, agent: &SubAgent) -> Result<String> {
+        Ok(render_opencode_agent(agent)?.contents)
+    }
+
+    fn should_import(&self, path: &Path) -> bool {
+        path.extension().is_some_and(|ext| ext == "md")
+    }
+
+    fn parse(&self, path: &Path, contents: &str) -> Result<SubAgent> {
+        let fallback_name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("invalid agent path {}", path.display()))?;
+        native_markdown_to_neutral(contents, fallback_name, "opencode")
+    }
+}
+
+struct OpenCodeMcpCodec;
+
+impl McpCodec for OpenCodeMcpCodec {
+    fn import(&self, config: &NativeConfig) -> Result<Vec<McpDefinition>> {
+        import_opencode_mcps(json_config_object(config)?)
+    }
+
+    fn apply(&self, config: &mut NativeConfig, definitions: &[McpDefinition]) -> Result<()> {
+        let document = json_config_object_mut(config)?;
+        document.remove("mcp");
+        if !definitions.is_empty() {
+            let mut servers = Map::new();
+            for definition in definitions {
+                servers.insert(definition.name.clone(), definition.to_opencode_value()?);
+            }
+            document.insert("mcp".to_string(), Value::Object(servers));
+        }
+        Ok(())
+    }
 }
 
 fn render_opencode_agent(agent: &SubAgent) -> Result<RenderedAgent> {
@@ -218,6 +150,7 @@ fn render_opencode_agent(agent: &SubAgent) -> Result<RenderedAgent> {
     })
 }
 
+#[cfg(test)]
 fn import_opencode_agents(path: &Path) -> Result<Option<Vec<ImportedFile>>> {
     if !path.exists() {
         return Ok(Some(Vec::new()));
@@ -368,44 +301,10 @@ fn yaml_key(key: &str) -> serde_yaml::Value {
     serde_yaml::Value::String(key.to_string())
 }
 
-fn patch_opencode_config(profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-    let profile_config = read_profile_config(&profile.path)?;
-    let mut document = read_json(&paths.settings_file)?;
-
-    if let Some(model) = non_default_value(profile_config.model_preference(&profile.harness_id)) {
-        document.insert("model".to_string(), model);
-    }
-    if let Some(permission) =
-        non_default_value(profile_config.permission_preference(&profile.harness_id))
-    {
-        document.insert("permissions".to_string(), permission);
-    }
-
-    let mcp_definitions = read_mcp_definitions(&profile.path)?;
-    document.remove("mcp");
-    if !mcp_definitions.is_empty() {
-        let mut servers = Map::new();
-        for definition in mcp_definitions {
-            servers.insert(definition.name.clone(), definition.to_opencode_value()?);
-        }
-        document.insert("mcp".to_string(), Value::Object(servers));
-    }
-
-    write_text_atomic(
-        &paths.settings_file,
-        &serde_json::to_string_pretty(&document)?,
-    )
-    .with_context(|| format!("failed to write {}", paths.settings_file.display()))
-}
-
-fn read_profile_config(profile_path: &Path) -> Result<ProfileConfig> {
-    read_profile_config_from_profile(profile_path)
-}
-
-fn import_opencode_mcps(document: &Map<String, Value>) -> Result<String> {
+fn import_opencode_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefinition>> {
     let mut servers = Vec::new();
     let Some(mcp_servers) = document.get("mcp") else {
-        return Ok("".to_string());
+        return Ok(Vec::new());
     };
     let Some(mcp_table) = mcp_servers.as_object() else {
         anyhow::bail!("OpenCode mcp must be an object");
@@ -497,18 +396,26 @@ fn import_opencode_mcps(document: &Map<String, Value>) -> Result<String> {
         }
     }
 
-    if servers.is_empty() {
-        Ok("".to_string())
-    } else {
-        Ok(format!("{}\n", serde_json::to_string_pretty(&servers)?))
-    }
+    crate::profile::mcp::parse_mcp_definitions(&serde_json::to_string(&servers)?)
 }
 
-fn non_default_value(value: Value) -> Option<Value> {
-    match value {
-        Value::String(ref string_val) if string_val == "default" => None,
-        other => Some(other),
+fn json_config_object(config: &NativeConfig) -> Result<&Map<String, Value>> {
+    let NativeConfig::Json(Value::Object(document)) = config else {
+        anyhow::bail!("OpenCode JSON config must be an object");
+    };
+    Ok(document)
+}
+
+fn json_config_object_mut(config: &mut NativeConfig) -> Result<&mut Map<String, Value>> {
+    let NativeConfig::Json(value) = config else {
+        anyhow::bail!("OpenCode JSON config must be an object");
+    };
+    if !value.is_object() {
+        *value = Value::Object(Map::new());
     }
+    value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("OpenCode JSON config must be an object"))
 }
 
 impl McpDefinition {
