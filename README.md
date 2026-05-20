@@ -6,6 +6,25 @@ Manage reusable Agent profiles across various coding agents.
 
 ## Install
 
+Install the latest release:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/delegence/lazyagents/main/install.sh | sh
+```
+
+Or inspect the installer first:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/delegence/lazyagents/main/install.sh
+sh install.sh
+```
+
+Install a specific version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/delegence/lazyagents/main/install.sh | LAZYAGENTS_VERSION=0.1.0 sh
+```
+
 Build from source:
 
 ```sh
@@ -23,6 +42,24 @@ For example:
 ```sh
 cargo run -- doctor
 ```
+
+## Releasing
+
+Release automation lives in `.github/workflows/release.yml` and runs when a `v*` tag is pushed. The workflow file must already be committed before the tag is created.
+
+For the first release, commit the release infrastructure, then run:
+
+```sh
+make release VERSION=0.1.0
+```
+
+For later releases, choose the next version and run:
+
+```sh
+make release VERSION=0.1.1
+```
+
+The release target updates `Cargo.toml`, runs `cargo test`, commits `Cargo.toml` and `Cargo.lock` if they changed, creates an annotated tag, pushes the current branch, and pushes the tag.
 
 ## Commands
 

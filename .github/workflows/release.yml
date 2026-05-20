@@ -1,0 +1,119 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify-version:
+    name: Verify version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check tag matches Cargo.toml
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            use-cross: false
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            use-cross: true
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            use-cross: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            use-cross: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use-cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        run: |
+          if [ "${{ matrix.use-cross }}" = "true" ]; then
+            cross build --release --locked --target "${{ matrix.target }}"
+          else
+            cargo build --release --locked --target "${{ matrix.target }}"
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          package="lazyagents-${{ matrix.target }}"
+          mkdir "$package"
+          cp "target/${{ matrix.target }}/release/lazyagents" "$package/"
+          cp README.md "$package/"
+          if [ -f LICENSE ]; then
+            cp LICENSE "$package/"
+          fi
+          tar -czf "$package.tar.gz" "$package"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lazyagents-${{ matrix.target }}
+          path: lazyagents-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz > checksums.txt
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          generate_release_notes: true
