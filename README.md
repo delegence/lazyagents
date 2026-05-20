@@ -12,13 +12,6 @@ Install the latest release:
 curl -fsSL https://raw.githubusercontent.com/delegence/lazyagents/main/install.sh | sh
 ```
 
-Or inspect the installer first:
-
-```sh
-curl -fsSLO https://raw.githubusercontent.com/delegence/lazyagents/main/install.sh
-sh install.sh
-```
-
 Install a specific version:
 
 ```sh
@@ -29,18 +22,6 @@ Build from source:
 
 ```sh
 cargo build --release
-```
-
-Run directly during development:
-
-```sh
-cargo run -- <command>
-```
-
-For example:
-
-```sh
-cargo run -- doctor
 ```
 
 ## Commands
