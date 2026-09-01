@@ -43,10 +43,12 @@ Avoid using "agent" for both sides of the system. Use **Profile** for the saved 
 
 ```text
 src/profile/       profile names, config, MCP parsing, validation, inspection, storage
-src/harness/       generic harness mechanics, drift, backup, rollback, symlinks
+src/harness/       generic harness mechanics, drift, backup, rollback, managed copies
 src/integrations/  concrete Claude Code, Codex, Gemini CLI, OpenCode, Pi implementations
 src/app/           UI-independent workflows and composition
 src/cli/           terminal parsing, prompts, rendering, editor launch
+src/file_system.rs shared atomic-write and filesystem-name primitives
+src/yaml.rs        private YAML backend boundary
 ```
 
 Dependency direction:
@@ -94,7 +96,7 @@ Profile names are represented by `ProfileName` and must be validated at boundari
 
 ## Harness Settings
 
-`~/.lazyagents/settings.json` is the source of truth for harness instances. When it is missing, commands that load the harness registry create it automatically from the built-in integrations:
+`~/.lazyagents/settings.json` is the source of truth for custom harness instances. When it is missing, registry reads use defaults derived from the built-in integrations without writing to disk. `settings edit` materializes the defaults and `settings reset` explicitly replaces the file:
 
 ```json
 {
@@ -111,7 +113,7 @@ Profile names are represented by `ProfileName` and must be validated at boundari
 
 `type` selects integration behavior. `configDir` selects the native harness home and must be absolute, `~`, or begin with `~/`. Integrations derive all managed paths from `configDir`; per-surface path overrides are intentionally unsupported. `displayName` and `binary` are optional and default from the harness type. Harness instance ids may contain only lowercase ASCII letters, numbers, and dashes.
 
-State and profile preferences are keyed by harness instance id. If two instances have the same type and lexically normalized `configDir`, they are aliases for the same native state; profile use updates active state for every alias in that group. Doctor reports shared config directories using the same normalized alias identity.
+State and profile preferences are keyed by harness instance id. If two instances have the same type and physically resolved `configDir`, they are aliases for the same native state. Existing symlinked ancestors are resolved even when final path components are missing. Profile use updates active state for every alias in that group. `use --all` applies only the first detected instance in each alias group so one native configuration is not rewritten with conflicting alias preferences. Doctor reports shared config directories using the same alias identity.
 
 ## Profile File
 
@@ -164,9 +166,13 @@ Rules:
 - `http` requires `url`; `headers` defaults empty.
 - `http` URLs must start with `http://` or `https://`.
 - Unknown MCP keys are ignored.
-- Environment variable references are passed through.
+- Plain environment and header strings are literal. `{"env":"NAME"}` is an environment reference.
 
-Codex represents HTTP headers split across literal `http_headers` and environment-backed `env_http_headers`; neutral header values that start with `$` are rendered to Codex env header entries.
+Claude renders references as `${NAME}` and OpenCode renders `{env:NAME}`. Codex uses `env_http_headers` for HTTP references. Codex stdio uses `env_vars` and rejects aliases where the destination key differs from the source variable name.
+
+MCP import accepts only the neutral core fields. It rejects native authentication, security, working-directory, timeout, and tool-restriction fields before mutation. Claude global configuration cannot represent project-specific disabled state, so Claude preflight rejects disabled neutral MCP definitions.
+
+Gemini SSE and mixed transports are rejected because the neutral transport model represents stdio and Streamable HTTP only. Gemini and OpenCode literals that activate native environment or file substitution are rejected. OpenCode global and per-agent MCP tool rules are rejected conservatively while the neutral contract cannot preserve them. Codex rejects duplicate literal and inherited environment or header sources. Claude and Codex reject a present non-array `args` field. Codex approval policies accept only canonical strings or the documented granular Boolean object.
 
 Integrations with native MCP support translate the neutral list into native harness config. MCP support is optional per harness; integrations without native MCP support ignore profile MCP definitions, do not drift-check them, and preserve existing profile MCPs on import/save by returning no MCP import data. If a harness supports MCP but cannot represent a valid neutral MCP definition, apply must fail and roll back.
 
@@ -191,9 +197,11 @@ Optional neutral fields:
 - `maxTurns`
 - `harness`: per-harness native override maps
 
-The Markdown body becomes the native sub-agent prompt/instructions. Empty bodies are allowed for harness-native agents that intentionally carry all behavior in frontmatter. There is no `prompt` frontmatter field in the neutral contract.
+The Markdown body becomes the native sub-agent prompt/instructions. Codex requires a nonblank body. Other supported harnesses can keep an empty body. There is no `prompt` frontmatter field in the neutral contract.
 
-Integrations with native sub-agent support render neutral sub-agents into native files. Codex renders TOML files under `agents/`; Claude, Gemini, and OpenCode render Markdown files with native frontmatter. Integrations without native sub-agent support return `supports_subagents() == false`, ignore profile sub-agents during apply/drift, and preserve existing profile sub-agents on import/save by returning no sub-agent import data. Pi currently falls into this category because Pi core does not ship sub-agents.
+Integrations with native sub-agent support render neutral sub-agents into native files. Codex renders TOML files under `agents/`; Claude, Gemini, and OpenCode render Markdown files with native frontmatter. Integrations without native sub-agent support omit the sub-agent artifact, ignore profile sub-agents during apply/drift, and preserve existing profile sub-agents on import/save by returning no sub-agent import data. Pi currently falls into this category because Pi core does not ship sub-agents.
+
+The neutral contract represents local sub-agents. Gemini import accepts local agents and rejects remote agents. OpenCode import requires explicit `mode: subagent` and rejects primary or all-mode agents. Claude uses `permissionMode`/`maxTurns`, Gemini uses `max_turns`, and OpenCode uses `permission`/`steps`. Codex does not render neutral `maxTurns`. Native-only fields survive imports only when they do not change the agent role.
 
 ## Profile Use Workflow
 
@@ -221,7 +229,9 @@ All-harness profile use:
 - continues after individual harness failures
 - updates state per successful harness
 
-Workflows that explicitly mutate profiles, settings, harness config, or active state acquire an exclusive lazyagents home lock before making those changes. A second mutating command fails rather than racing the first. Missing `settings.json` creation is a lazy registry-load side effect and may happen before a workflow has acquired the mutation lock.
+Profile unset is intentionally state-only. `unset --harness <id>` removes the active profile association for that harness and any aliases with the same harness type and normalized `configDir`. `unset --all` removes every active profile association, including stale entries for harnesses no longer in `settings.json`. Unset does not detect the harness binary, check drift, or change harness files.
+
+All profile and harness mutations, including automatic profile rollback recovery, run under the exclusive LazyAgents home lock. A second command fails before it can rename recovery data. Registry reads do not create a missing `settings.json`.
 
 In non-interactive shells, drift prompts are not attempted. The CLI reports the required explicit flag instead: `--save-changes` or `--discard-changes` for one harness, and only `--discard-changes` for `--all`.
 
@@ -251,7 +261,11 @@ Saving drift imports current harness managed state into the active profile:
 
 Saving drift updates only the relevant harness model and permission entries.
 
-Saving drift also imports valid shared skills from `~/.agents/skills`, using the same merge rules as `create --harness`: harness-native skills win on name collision, imported shared skills are removed from the shared skills directory, and invalid or hidden shared entries are left alone.
+Saving drift also imports valid shared skills from `~/.agents/skills`. Harness-native skills win on name collision. Hidden nested files, empty directories, and Unix file and directory modes are preserved. Symlinks and unsupported filesystem entries make import fail before source deletion.
+
+Removal is a deliberate ownership policy. The shared skills directory acts as an import source rather than a canonical store; after the profile copy is durable, the profile owns the skill. Retaining the source would create two competing copies and cause repeated imports. Consequently, deleting successfully imported shared skills should not be treated as accidental data loss or simplified into copy-only behavior.
+
+Shared-skill sources stay visible until the profile, target harness, verification, and state transaction commits. Cleanup then writes a committed marker, stages, and validates each source before removal. A process stop during cleanup cannot remove the durable profile copy. The next locked mutating command removes a marked `.lazyagents-import-*` recovery copy. Unmarked recovery data is left unchanged for manual inspection.
 
 Hidden files and directories starting with `.` inside managed folders are ignored for drift, backup, import, and clearing.
 
@@ -272,9 +286,15 @@ Backups cover only managed surfaces:
 - native settings file
 - native MCP file, if separate and supported by the harness
 
-Backups copy real file contents and dereference symlinks. Rollback must not depend on profile files still existing.
+Backups copy real file contents. A top-level legacy managed link is an explicit dereference exception. A nested link must stay inside its managed tree. Backups reject external nested links, cycles, and symlinks in stored backup data. Applied skills and commands are independent copies, so rollback restores a drift-clean active profile without depending on profile files still existing.
 
-Native config files are usually `ManagedSurface::preserved_file`: they are backed up, then patched rather than deleted wholesale.
+Profile import publishes a synced staged directory by first writing a prepared transaction marker and renaming the canonical profile to a rollback directory. If a crash leaves the canonical profile missing, the next locked profile access restores exactly one valid rollback that matches a prepared marker. A committed marker causes stale rollback data to be removed, not restored. Unmarked, invalid, mismatched, or multiple candidates are left unchanged and require manual recovery. Profile deletion removes valid stale rollback directories and markers before it removes the canonical profile, so deleted data cannot be recovered automatically.
+
+A completed temporary backup is published in two phases: the previous backup is renamed aside, the new backup is renamed into place, and only then is the previous copy removed. A leftover previous copy is recovered on the next capture if publication was interrupted.
+
+YAML parsing and rendering goes through `src/yaml.rs`. The current deprecated backend is intentionally private so it can be replaced after candidate parsers pass the profile and sub-agent compatibility corpus.
+
+Native config files are usually `ManagedSurface::preserved_file`: they are backed up, then patched rather than deleted wholesale. Atomic rewrites preserve the existing native file permissions.
 
 Rollback is internal. There is no public restore command in v1.
 
@@ -403,7 +423,7 @@ Use focused harness-specific tests for native format quirks, config preservation
 - Prefer standard library plus well-known crates.
 - Use structured parsers for JSON and TOML rather than string manipulation.
 - Patch native config files; preserve unrelated settings.
-- Use direct file writes for profile instructions and symlink profile-owned skills and commands from the resolved profile paths.
+- Write instructions directly and copy profile-owned skills and commands into native harness directories. Drift compares copied contents with the active profile.
 - Keep CLI output user-facing and clear.
 - Keep validation accumulated where possible so `show` and `doctor` can report multiple issues.
 - Avoid async until there is a clear need.
@@ -416,13 +436,15 @@ Release automation lives in `.github/workflows/release.yml` and runs when a `v*`
 For the first release, commit the release infrastructure, then run:
 
 ```sh
-make release VERSION=0.1.0
+mise run release 0.1.0
 ```
 
 For later releases, choose the next version and run:
 
 ```sh
-make release VERSION=0.1.1
+mise run release 0.1.1
 ```
 
-The release target updates `Cargo.toml`, runs `cargo test`, commits `Cargo.toml` and `Cargo.lock` if they changed, creates an annotated tag, pushes the current branch, and pushes the tag.
+The release target requires a clean `main` branch that matches `origin/main`. It rejects existing local or remote tags before it edits files. It runs the locked format check, Clippy, and full test checks. It creates a Conventional Commit only when the version files changed, creates an annotated tag, and pushes the branch and tag atomically. Remote tag absence must be verified. A network or authentication error stops before `Cargo.toml` changes. Release-task tests run the embedded script with fake commands in a temporary directory and never contact origin or publish refs.
+
+CI and release workflows grant `contents: read` at workflow level. Only the publish job grants `contents: write`. Every external action is pinned to a full commit SHA with its release version in a comment.

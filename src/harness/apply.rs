@@ -19,6 +19,7 @@ pub struct ProfileUseResult {
     pub alias_updates: Vec<String>,
     pub profile: ProfileName,
     pub status: ProfileUseStatus,
+    pub warnings: Vec<String>,
 }
 
 pub fn apply_profile_to_harness_with_commit<F>(
@@ -31,20 +32,46 @@ pub fn apply_profile_to_harness_with_commit<F>(
 where
     F: FnOnce() -> Result<()>,
 {
-    profile_store.normalize_optional_artifacts(profile)?;
     let paths = integration.paths(env)?;
     let target_profile = load_profile(profile_store, profile, integration.instance_id());
-    integration.preflight(&target_profile)?;
     let surfaces = integration.managed_surfaces(&paths);
+    reject_managed_path_overlap(env, &target_profile, &surfaces)?;
+    profile_store.normalize_optional_artifacts(profile)?;
+    integration.preflight(&target_profile, &paths)?;
     let backup =
         ManagedBackup::capture(&env.lazyagents_home, integration.instance_id(), &surfaces)?;
     if let Err(error) =
         apply_transaction(integration, &target_profile, &paths, &surfaces).and_then(|_| commit())
     {
         backup
-            .restore(&surfaces)
+            .restore()
             .context("profile use failed and rollback failed")?;
         return Err(error);
+    }
+    Ok(())
+}
+
+fn reject_managed_path_overlap(
+    env: &AppEnvironment,
+    profile: &ProfileRef,
+    surfaces: &[crate::harness::managed::ManagedSurface],
+) -> Result<()> {
+    let protected = [
+        ("source profile", profile.path.as_path()),
+        ("LazyAgents home", env.lazyagents_home.as_path()),
+    ];
+    for surface in surfaces {
+        let managed = crate::file_system::resolve_path_identity(&surface.path)?;
+        for (label, path) in protected {
+            let protected = crate::file_system::resolve_path_identity(path)?;
+            if managed.starts_with(&protected) || protected.starts_with(&managed) {
+                anyhow::bail!(
+                    "managed path {} overlaps the {label} at {}",
+                    surface.path.display(),
+                    path.display()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -81,7 +108,7 @@ mod tests {
     use anyhow::{anyhow, Context};
 
     use super::*;
-    use crate::harness::artifact::{ArtifactContext, HarnessArtifact};
+    use crate::harness::artifact::{ArtifactContext, ArtifactKind, HarnessArtifact};
     use crate::harness::kind::HarnessKind;
     use crate::harness::managed::ManagedSurface;
     use crate::profile::LazyagentsHome;
@@ -142,6 +169,10 @@ mod tests {
     }
 
     impl HarnessArtifact for FakeInstructionArtifact {
+        fn kind(&self) -> ArtifactKind {
+            ArtifactKind::Instructions
+        }
+
         fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
             vec![ManagedSurface::file(&paths.instruction_target)]
         }
@@ -166,6 +197,10 @@ mod tests {
     struct FakeSkillsArtifact;
 
     impl HarnessArtifact for FakeSkillsArtifact {
+        fn kind(&self) -> ArtifactKind {
+            ArtifactKind::Skills
+        }
+
         fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
             vec![ManagedSurface::directory(&paths.skills_dir)]
         }
@@ -181,6 +216,10 @@ mod tests {
     struct FakeCommandsArtifact;
 
     impl HarnessArtifact for FakeCommandsArtifact {
+        fn kind(&self) -> ArtifactKind {
+            ArtifactKind::Commands
+        }
+
         fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
             vec![ManagedSurface::directory(&paths.commands_dir)]
         }
@@ -270,6 +309,65 @@ mod tests {
         assert!(!home.join("state.json").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn verify_failure_preserves_hidden_opaque_entries_in_managed_directories() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{symlink, FileTypeExt};
+
+        unsafe extern "C" {
+            fn mkfifo(path: *const std::os::raw::c_char, mode: u32) -> i32;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("lazyagents");
+        let harness_root = temp.path().join("harness");
+        let skills = harness_root.join("skills");
+        fs::create_dir_all(skills.join("visible/nested")).unwrap();
+        fs::write(skills.join("visible/old.txt"), "old").unwrap();
+        fs::write(skills.join(".hidden"), "secret").unwrap();
+        fs::write(skills.join("visible/nested/.data"), "nested").unwrap();
+        let external = temp.path().join("external");
+        fs::write(&external, "external").unwrap();
+        symlink(&external, skills.join(".external-link")).unwrap();
+        let fifo = skills.join(".pipe");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        fs::write(harness_root.join("AGENTS.md"), "previous").unwrap();
+        let store = ProfileStore::new(LazyagentsHome::from_path(&home));
+        let profile = ProfileName::parse("work").unwrap();
+        store.create_skeleton(&profile).unwrap();
+
+        let error = apply_profile_to_harness_with_commit(
+            &FakeIntegration::new(harness_root.clone()).fail_verify(),
+            &test_env(&home),
+            &store,
+            &profile,
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("verify failed"));
+        assert_eq!(
+            fs::read_to_string(skills.join("visible/old.txt")).unwrap(),
+            "old"
+        );
+        assert_eq!(
+            fs::read_to_string(skills.join(".hidden")).unwrap(),
+            "secret"
+        );
+        assert_eq!(
+            fs::read_to_string(skills.join("visible/nested/.data")).unwrap(),
+            "nested"
+        );
+        assert!(fs::symlink_metadata(skills.join(".external-link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(fifo).unwrap().file_type().is_fifo());
+    }
+
     #[test]
     fn rollback_restores_surfaces_when_state_update_fails() {
         let temp = tempfile::tempdir().unwrap();
@@ -302,6 +400,134 @@ mod tests {
             "old"
         );
         assert!(home.join("state.json").is_dir());
+    }
+
+    #[test]
+    fn rejects_profile_and_control_path_overlap_before_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("lazyagents");
+        let store = ProfileStore::new(LazyagentsHome::from_path(&home));
+        let profile = ProfileName::parse("work").unwrap();
+        store.create_skeleton(&profile).unwrap();
+        let profile_path = store.profile_dir(&profile);
+        let env = test_env(&home);
+
+        for managed in [
+            profile_path.clone(),
+            profile_path.join("nested"),
+            profile_path.join("nested/../skills"),
+            home.join("backups"),
+        ] {
+            let marker = profile_path.join("PROFILE.md");
+            let before = fs::read(&marker).unwrap();
+            let error = reject_managed_path_overlap(
+                &env,
+                &ProfileRef {
+                    name: profile.clone(),
+                    path: profile_path.clone(),
+                    harness_id: "codex".to_string(),
+                },
+                &[ManagedSurface::directory(managed)],
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("overlaps"));
+            assert_eq!(fs::read(&marker).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn rejected_apply_does_not_normalize_or_create_backup() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("lazyagents");
+        let store = ProfileStore::new(LazyagentsHome::from_path(&home));
+        let profile = ProfileName::parse("work").unwrap();
+        store.create_skeleton(&profile).unwrap();
+        let profile_path = store.profile_dir(&profile);
+        fs::remove_dir_all(profile_path.join("skills")).unwrap();
+        fs::remove_dir_all(profile_path.join("commands")).unwrap();
+        fs::remove_dir_all(profile_path.join("agents")).unwrap();
+        fs::remove_file(profile_path.join("mcps.json")).unwrap();
+        let integration = FakeIntegration::new(profile_path.clone());
+
+        let error = apply_profile_to_harness_with_commit(
+            &integration,
+            &test_env(&home),
+            &store,
+            &profile,
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("overlaps"));
+        assert!(!profile_path.join("skills").exists());
+        assert!(!profile_path.join("mcps.json").exists());
+        assert!(!home.join("backups").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_overlap_through_a_symlinked_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("lazyagents");
+        let store = ProfileStore::new(LazyagentsHome::from_path(&home));
+        let profile = ProfileName::parse("work").unwrap();
+        store.create_skeleton(&profile).unwrap();
+        let link = temp.path().join("profile-link");
+        symlink(store.profile_dir(&profile), &link).unwrap();
+
+        let error = reject_managed_path_overlap(
+            &test_env(&home),
+            &ProfileRef {
+                name: profile.clone(),
+                path: store.profile_dir(&profile),
+                harness_id: "codex".to_string(),
+            },
+            &[ManagedSurface::directory(link.join("missing"))],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("overlaps"));
+        assert!(store.profile_dir(&profile).join("PROFILE.md").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_apply_resolves_symlink_before_parent_component() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("lazyagents");
+        let store = ProfileStore::new(LazyagentsHome::from_path(&home));
+        let profile = ProfileName::parse("work").unwrap();
+        store.create_skeleton(&profile).unwrap();
+        let profile_path = store.profile_dir(&profile);
+        fs::create_dir(profile_path.join("sub")).unwrap();
+        let config = temp.path().join("config");
+        fs::create_dir(&config).unwrap();
+        symlink(profile_path.join("sub"), config.join("link")).unwrap();
+        let outside = config.join("skills");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("sentinel"), "outside").unwrap();
+        let before = fs::read(profile_path.join("PROFILE.md")).unwrap();
+
+        let error = apply_profile_to_harness_with_commit(
+            &FakeIntegration::new(config.join("link/../skills")),
+            &test_env(&home),
+            &store,
+            &profile,
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("overlaps"));
+        assert_eq!(fs::read(profile_path.join("PROFILE.md")).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(outside.join("sentinel")).unwrap(),
+            "outside"
+        );
+        assert!(!home.join("backups").exists());
     }
 
     fn test_env(home: &Path) -> AppEnvironment {

@@ -63,10 +63,9 @@ pub fn default_preference_value() -> Value {
 }
 
 pub fn default_profile_document(name: &ProfileName) -> ProfileDocument {
-    let display_name = default_display_name(name);
     ProfileDocument {
         config: ProfileConfig::default_for(name),
-        instructions: format!("# {display_name}\n\nAdd profile instructions here.\n"),
+        instructions: String::new(),
     }
 }
 
@@ -89,13 +88,13 @@ pub fn read_profile_instructions(profile_path: &Path) -> Result<String> {
 pub fn write_profile_document(profile_path: &Path, document: &ProfileDocument) -> Result<()> {
     let path = profile_path.join(PROFILE_FILE_NAME);
     let text = profile_document_to_markdown(document)?;
-    std::fs::write(&path, text)
+    crate::file_system::write_text_atomic(&path, &text)
         .with_context(|| format!("failed to write profile file at {}", path.display()))
 }
 
 pub fn parse_profile_document(text: &str) -> Result<ProfileDocument> {
     let (frontmatter, body) = split_markdown_frontmatter(text)?;
-    let config: ProfileConfig = serde_yaml::from_str(frontmatter)?;
+    let config: ProfileConfig = crate::yaml::from_str(frontmatter)?;
     Ok(ProfileDocument {
         config,
         instructions: body.to_string(),
@@ -103,7 +102,7 @@ pub fn parse_profile_document(text: &str) -> Result<ProfileDocument> {
 }
 
 pub fn profile_document_to_markdown(document: &ProfileDocument) -> Result<String> {
-    let yaml = serde_yaml::to_string(&document.config)?;
+    let yaml = crate::yaml::to_string(&document.config)?;
     Ok(format!(
         "---\n{}---\n{}",
         trim_yaml_header(&yaml),

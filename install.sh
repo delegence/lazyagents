@@ -5,6 +5,7 @@ repo="delegence/lazyagents"
 bin_name="lazyagents"
 install_dir="${LAZYAGENTS_INSTALL_DIR:-$HOME/.local/bin}"
 version="${LAZYAGENTS_VERSION:-latest}"
+caller_dir="$(pwd -P)"
 
 fail() {
   echo "lazyagents installer: $*" >&2
@@ -18,6 +19,15 @@ need() {
 need curl
 need tar
 need uname
+
+case "$install_dir" in
+  /*) ;;
+  *) install_dir="$caller_dir/$install_dir" ;;
+esac
+
+if [ -e "$install_dir" ] && [ ! -d "$install_dir" ]; then
+  fail "install destination is not a directory: $install_dir"
+fi
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -67,9 +77,9 @@ else
 fi
 
 tar -xzf "$asset"
-mkdir -p "$install_dir"
-cp "$bin_name-$target/$bin_name" "$install_dir/$bin_name"
-chmod 755 "$install_dir/$bin_name"
+mkdir -p "$install_dir" || fail "cannot create install destination: $install_dir"
+cp "$bin_name-$target/$bin_name" "$install_dir/$bin_name" || fail "cannot copy binary to $install_dir"
+chmod 755 "$install_dir/$bin_name" || fail "cannot make installed binary executable"
 
 echo "Installed $bin_name to $install_dir/$bin_name"
 

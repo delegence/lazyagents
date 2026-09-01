@@ -9,19 +9,22 @@ use serde_json::{json, Map, Value};
 #[cfg(test)]
 use crate::harness::agents::sub_agent_import_file;
 use crate::harness::agents::{
-    harness_scoped_value, remove_string, remove_value, select_harness_value,
-    split_markdown_frontmatter, RenderedAgent, SubAgent,
+    merge_harness_override, normalize_tool_permissions_with_allow_list,
+    parse_native_markdown_agent, render_native_markdown, select_harness_value,
+    validate_merged_markdown_agent, yaml_key, NativeAgentParseOptions, NativeAgentRole, SubAgent,
 };
 use crate::harness::artifact::{
     CommandMode, CommandsDirectory, HarnessArtifact, InstructionFile, JsonConfigFile, McpCodec,
-    McpConfig, NativeConfig, PreferenceBinding, SettingsPreferences, SkillsDirectory,
-    SubagentCodec, SubagentsDirectory,
+    McpConfig, NativeConfig, PreferenceBinding, PreferenceCodec, PreferenceKind,
+    SettingsPreferences, SkillsDirectory, SubagentCodec, SubagentsDirectory,
 };
 #[cfg(test)]
 use crate::harness::integration::ImportedFile;
-use crate::harness::integration::{AppEnvironment, HarnessConfigPaths, HarnessIntegration};
+use crate::harness::integration::{
+    AppEnvironment, HarnessConfigPaths, HarnessIntegration, ImportedPreference, ProfileRef,
+};
 use crate::harness::kind::HarnessKind;
-use crate::profile::mcp::{McpDefinition, McpTransport};
+use crate::profile::mcp::{McpDefinition, McpTransport, McpValue};
 
 pub struct OpenCodeIntegration;
 
@@ -52,7 +55,7 @@ impl HarnessIntegration for OpenCodeIntegration {
             Box::new(SkillsDirectory::new(|paths| &paths.skills_dir)),
             Box::new(CommandsDirectory::new(
                 |paths| &paths.commands_dir,
-                CommandMode::RecursiveSymlink,
+                CommandMode::RecursiveCopy,
             )),
             Box::new(SubagentsDirectory::new(
                 |paths| &paths.agents_dir,
@@ -62,19 +65,55 @@ impl HarnessIntegration for OpenCodeIntegration {
                 JsonConfigFile::new(|paths| &paths.settings_file).label("OpenCode settings JSON"),
                 OpenCodeMcpCodec,
             )),
+            Box::new(
+                SettingsPreferences::new(
+                    JsonConfigFile::new(|paths| &paths.settings_file)
+                        .label("OpenCode settings JSON"),
+                )
+                .model(PreferenceBinding::JsonStringPointer { pointer: "/model" })
+                .permission(PreferenceBinding::Custom(Box::new(OpenCodePermissionCodec))),
+            ),
         ]
     }
+}
 
-    fn settings(&self) -> Option<Box<dyn crate::harness::artifact::HarnessSettings>> {
-        Some(Box::new(
-            SettingsPreferences::new(
-                JsonConfigFile::new(|paths| &paths.settings_file).label("OpenCode settings JSON"),
-            )
-            .model(PreferenceBinding::JsonPointer { pointer: "/model" })
-            .permission(PreferenceBinding::JsonPointer {
-                pointer: "/permissions",
-            }),
-        ))
+struct OpenCodePermissionCodec;
+
+impl PreferenceCodec for OpenCodePermissionCodec {
+    fn import(&self, config: &NativeConfig) -> Result<ImportedPreference> {
+        let permission = config
+            .json_object("OpenCode JSON config")?
+            .get("permission")
+            .cloned()
+            .unwrap_or_else(|| json!("default"));
+        validate_opencode_permission(&permission)?;
+        Ok(ImportedPreference::new(permission))
+    }
+
+    fn apply(
+        &self,
+        config: &mut NativeConfig,
+        profile: &ProfileRef,
+        _preference_kind: PreferenceKind,
+    ) -> Result<()> {
+        let permission = crate::profile::read_profile_config(&profile.path)?
+            .permission_preference(&profile.harness_id);
+        let Some(permission) = crate::harness::artifact::non_default_value(permission) else {
+            return Ok(());
+        };
+        validate_opencode_permission(&permission)?;
+        config
+            .json_object_mut("OpenCode JSON config")?
+            .insert("permission".to_string(), permission);
+        Ok(())
+    }
+}
+
+fn validate_opencode_permission(permission: &Value) -> Result<()> {
+    if permission == "default" || permission.is_object() {
+        Ok(())
+    } else {
+        anyhow::bail!("OpenCode permission preference must be an object or \"default\"")
     }
 }
 
@@ -86,7 +125,7 @@ impl SubagentCodec for OpenCodeSubagentCodec {
     }
 
     fn render(&self, agent: &SubAgent) -> Result<String> {
-        Ok(render_opencode_agent(agent)?.contents)
+        render_opencode_agent(agent)
     }
 
     fn should_import(&self, path: &Path) -> bool {
@@ -98,7 +137,22 @@ impl SubagentCodec for OpenCodeSubagentCodec {
             .file_stem()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow::anyhow!("invalid agent path {}", path.display()))?;
-        native_markdown_to_neutral(contents, fallback_name, "opencode")
+        parse_native_markdown_agent(
+            contents,
+            fallback_name,
+            "opencode",
+            NativeAgentParseOptions {
+                require_name: false,
+                permission_key: Some("permission"),
+                max_turns_key: Some("steps"),
+                role: Some(NativeAgentRole {
+                    key: "mode",
+                    accepted: "subagent",
+                    required: true,
+                }),
+            },
+            normalize_tool_permissions_with_allow_list,
+        )
     }
 }
 
@@ -106,11 +160,19 @@ struct OpenCodeMcpCodec;
 
 impl McpCodec for OpenCodeMcpCodec {
     fn import(&self, config: &NativeConfig) -> Result<Vec<McpDefinition>> {
-        import_opencode_mcps(json_config_object(config)?)
+        let document = config.json_object("OpenCode JSON config")?;
+        let definitions = import_opencode_mcps(document)?;
+        reject_opencode_mcp_tool_rules(
+            document,
+            definitions
+                .iter()
+                .map(|definition| definition.name.as_str()),
+        )?;
+        Ok(definitions)
     }
 
     fn apply(&self, config: &mut NativeConfig, definitions: &[McpDefinition]) -> Result<()> {
-        let document = json_config_object_mut(config)?;
+        let document = config.json_object_mut("OpenCode JSON config")?;
         document.remove("mcp");
         if !definitions.is_empty() {
             let mut servers = Map::new();
@@ -121,33 +183,52 @@ impl McpCodec for OpenCodeMcpCodec {
         }
         Ok(())
     }
+
+    fn preflight_apply(&self, config: &NativeConfig, definitions: &[McpDefinition]) -> Result<()> {
+        crate::profile::mcp::reject_native_reference_literals(definitions, "OpenCode", |value| {
+            contains_opencode_substitution(value)
+        })?;
+        reject_opencode_direct_substitutions(definitions)?;
+        let document = config.json_object("OpenCode JSON config")?;
+        let native = import_opencode_mcps(document)?;
+        let names = native
+            .iter()
+            .chain(definitions)
+            .map(|definition| definition.name.as_str());
+        reject_opencode_mcp_tool_rules(document, names)?;
+        Ok(())
+    }
 }
 
-fn render_opencode_agent(agent: &SubAgent) -> Result<RenderedAgent> {
-    let mut map = serde_yaml::Mapping::new();
-    map.insert(yaml_key("name"), agent.name.clone().into());
+fn render_opencode_agent(agent: &SubAgent) -> Result<String> {
+    let mut map = crate::yaml::Mapping::new();
     map.insert(yaml_key("description"), agent.description.clone().into());
     map.insert(yaml_key("mode"), "subagent".into());
     if let Some(model) = select_harness_value(agent.model.as_ref(), "opencode") {
         map.insert(yaml_key("model"), model.clone());
     }
     if let Some(tools) = agent.tools.as_ref() {
-        map.insert(yaml_key("tools"), tools_to_bool_map(tools));
+        map.insert(yaml_key("permission"), tools.clone());
     }
     if let Some(permission) = select_harness_value(agent.permission.as_ref(), "opencode") {
         map.insert(yaml_key("permission"), permission.clone());
     }
     if let Some(max_turns) = agent.max_turns {
         map.insert(
-            yaml_key("maxTurns"),
-            serde_yaml::Value::Number(max_turns.into()),
+            yaml_key("steps"),
+            crate::yaml::Value::Number(max_turns.into()),
         );
     }
     merge_harness_override(&mut map, agent, "opencode")?;
-    Ok(RenderedAgent {
-        relative_path: std::path::PathBuf::from(format!("{}.md", agent.name)),
-        contents: render_native_markdown(map, &agent.body)?,
-    })
+    if map
+        .get(yaml_key("mode"))
+        .and_then(crate::yaml::Value::as_str)
+        != Some("subagent")
+    {
+        anyhow::bail!("OpenCode agent {} must have mode subagent", agent.name);
+    }
+    validate_merged_markdown_agent(&map, "OpenCode", false, "steps")?;
+    render_native_markdown(map, &agent.body)
 }
 
 #[cfg(test)]
@@ -173,132 +254,26 @@ fn import_opencode_agents(path: &Path) -> Result<Option<Vec<ImportedFile>>> {
             .ok_or_else(|| {
                 anyhow::anyhow!("invalid agent path {}", file.relative_path.display())
             })?;
-        let neutral = native_markdown_to_neutral(&text, fallback_name, "opencode")?;
+        let neutral = parse_native_markdown_agent(
+            &text,
+            fallback_name,
+            "opencode",
+            NativeAgentParseOptions {
+                require_name: false,
+                permission_key: Some("permission"),
+                max_turns_key: Some("steps"),
+                role: Some(NativeAgentRole {
+                    key: "mode",
+                    accepted: "subagent",
+                    required: true,
+                }),
+            },
+            normalize_tool_permissions_with_allow_list,
+        )?;
         imported.push(sub_agent_import_file(&neutral));
     }
     imported.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(Some(imported))
-}
-
-fn native_markdown_to_neutral(
-    text: &str,
-    fallback_name: &str,
-    harness_id: &str,
-) -> Result<SubAgent> {
-    let (frontmatter, body) = split_markdown_frontmatter(text)?;
-    let mut map = serde_yaml::from_str::<serde_yaml::Mapping>(frontmatter)?;
-    let name = remove_string(&mut map, "name")?.unwrap_or_else(|| fallback_name.to_string());
-    let description = remove_string(&mut map, "description")?
-        .ok_or_else(|| anyhow::anyhow!("native agent is missing description"))?;
-    let body = body.trim().to_string();
-    let model = harness_scoped_value(harness_id, remove_value(&mut map, "model"));
-    let tools = remove_value(&mut map, "tools").map(normalize_tools_for_profile);
-    let permission = harness_scoped_value(
-        harness_id,
-        remove_value(&mut map, "permission").or_else(|| remove_value(&mut map, "permissionMode")),
-    );
-    let max_turns = remove_value(&mut map, "maxTurns")
-        .or_else(|| remove_value(&mut map, "max_turns"))
-        .and_then(|value| value.as_u64());
-    remove_value(&mut map, "mode");
-    remove_value(&mut map, "kind");
-    let mut harness = BTreeMap::new();
-    if !map.is_empty() {
-        harness.insert(harness_id.to_string(), serde_yaml::Value::Mapping(map));
-    }
-    Ok(SubAgent {
-        name,
-        description,
-        model,
-        tools,
-        permission,
-        max_turns,
-        harness,
-        body,
-    })
-}
-
-fn render_native_markdown(map: serde_yaml::Mapping, body: &str) -> Result<String> {
-    let yaml = serde_yaml::to_string(&map)?;
-    Ok(format!(
-        "---\n{}---\n{}\n",
-        yaml.strip_prefix("---\n").unwrap_or(&yaml),
-        body
-    ))
-}
-
-fn merge_harness_override(
-    map: &mut serde_yaml::Mapping,
-    agent: &SubAgent,
-    harness_id: &str,
-) -> Result<()> {
-    let Some(serde_yaml::Value::Mapping(override_map)) = agent.harness.get(harness_id) else {
-        return Ok(());
-    };
-    for (key, value) in override_map {
-        if !matches!(key, serde_yaml::Value::String(_)) {
-            anyhow::bail!("{harness_id} harness override keys must be strings");
-        }
-        map.insert(key.clone(), value.clone());
-    }
-    Ok(())
-}
-
-fn tools_to_bool_map(value: &serde_yaml::Value) -> serde_yaml::Value {
-    match value {
-        serde_yaml::Value::Mapping(map) => {
-            let mut out = serde_yaml::Mapping::new();
-            for (key, value) in map {
-                out.insert(key.clone(), serde_yaml::Value::Bool(tool_is_allowed(value)));
-            }
-            serde_yaml::Value::Mapping(out)
-        }
-        other => other.clone(),
-    }
-}
-
-fn normalize_tools_for_profile(value: serde_yaml::Value) -> serde_yaml::Value {
-    match value {
-        serde_yaml::Value::Mapping(map) => {
-            let mut out = serde_yaml::Mapping::new();
-            for (key, value) in map {
-                let normalized = match value {
-                    serde_yaml::Value::Bool(true) => serde_yaml::Value::String("allow".to_string()),
-                    serde_yaml::Value::Bool(false) => serde_yaml::Value::String("deny".to_string()),
-                    other => other,
-                };
-                out.insert(key, normalized);
-            }
-            serde_yaml::Value::Mapping(out)
-        }
-        serde_yaml::Value::Sequence(items) => {
-            let mut out = serde_yaml::Mapping::new();
-            for item in items {
-                if let Some(tool) = item.as_str() {
-                    out.insert(
-                        yaml_key(tool),
-                        serde_yaml::Value::String("allow".to_string()),
-                    );
-                }
-            }
-            serde_yaml::Value::Mapping(out)
-        }
-        other => other,
-    }
-}
-
-fn tool_is_allowed(value: &serde_yaml::Value) -> bool {
-    match value {
-        serde_yaml::Value::Bool(value) => *value,
-        serde_yaml::Value::String(value) => {
-            matches!(value.as_str(), "allow" | "allowed" | "true" | "yes")
-        }
-        _ => false,
-    }
-}
-
-fn yaml_key(key: &str) -> serde_yaml::Value {
-    serde_yaml::Value::String(key.to_string())
 }
 
 fn import_opencode_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefinition>> {
@@ -314,12 +289,30 @@ fn import_opencode_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefiniti
         let Some(table) = item.as_object() else {
             anyhow::bail!("OpenCode MCP server {name} must be an object");
         };
-        let enabled = table
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+        let enabled = match table.get("enabled") {
+            Some(Value::Bool(value)) => *value,
+            Some(_) => anyhow::bail!("OpenCode MCP server {name} enabled must be a boolean"),
+            None => true,
+        };
 
-        let mcp_type = table.get("type").and_then(Value::as_str).unwrap_or("local");
+        let mcp_type = match table.get("type") {
+            Some(Value::String(value)) => value.as_str(),
+            Some(_) => anyhow::bail!("OpenCode MCP server {name} type must be a string"),
+            None => "local",
+        };
+        let allowed: &[&str] = if mcp_type == "local" {
+            &["type", "command", "environment", "enabled"]
+        } else {
+            &["type", "url", "headers", "enabled"]
+        };
+        if let Some(field) = table
+            .keys()
+            .find(|field| !allowed.contains(&field.as_str()))
+        {
+            anyhow::bail!(
+                "OpenCode MCP server {name} uses unsupported field {field}; import or replacement would lose native security settings"
+            );
+        }
 
         if mcp_type == "local" {
             let command_array = table
@@ -344,15 +337,23 @@ fn import_opencode_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefiniti
 
             let command = command_array[0].clone();
             let args = command_array[1..].to_vec();
+            if command_array
+                .iter()
+                .any(|value| contains_opencode_substitution(value))
+            {
+                anyhow::bail!("OpenCode MCP {name} command contains native substitution syntax");
+            }
 
-            let env = if let Some(Value::Object(env_obj)) = table.get("environment") {
+            let env = if let Some(environment) = table.get("environment") {
+                let Some(env_obj) = environment.as_object() else {
+                    anyhow::bail!("OpenCode MCP environment must be an object");
+                };
                 let mut map = BTreeMap::new();
                 for (k, v) in env_obj {
-                    if let Some(s) = v.as_str() {
-                        map.insert(k.clone(), s.to_string());
-                    } else {
+                    let Some(s) = v.as_str() else {
                         anyhow::bail!("OpenCode MCP environment values must be strings");
-                    }
+                    };
+                    map.insert(k.clone(), parse_opencode_env(s)?);
                 }
                 json!(map)
             } else {
@@ -369,12 +370,18 @@ fn import_opencode_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefiniti
             }));
         } else if mcp_type == "remote" {
             let url = table.get("url").and_then(Value::as_str).unwrap_or("");
+            if contains_opencode_substitution(url) {
+                anyhow::bail!("OpenCode MCP {name} URL contains native substitution syntax");
+            }
 
-            let headers = if let Some(Value::Object(headers_obj)) = table.get("headers") {
+            let headers = if let Some(headers) = table.get("headers") {
+                let Some(headers_obj) = headers.as_object() else {
+                    anyhow::bail!("OpenCode MCP headers must be an object");
+                };
                 let mut map = BTreeMap::new();
                 for (k, v) in headers_obj {
                     if let Some(s) = v.as_str() {
-                        map.insert(k.clone(), s.to_string());
+                        map.insert(k.clone(), parse_opencode_env(s)?);
                     } else {
                         anyhow::bail!("OpenCode MCP headers values must be strings");
                     }
@@ -399,23 +406,86 @@ fn import_opencode_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefiniti
     crate::profile::mcp::parse_mcp_definitions(&serde_json::to_string(&servers)?)
 }
 
-fn json_config_object(config: &NativeConfig) -> Result<&Map<String, Value>> {
-    let NativeConfig::Json(Value::Object(document)) = config else {
-        anyhow::bail!("OpenCode JSON config must be an object");
-    };
-    Ok(document)
+fn reject_opencode_mcp_tool_rules<'a>(
+    document: &Map<String, Value>,
+    names: impl Iterator<Item = &'a str>,
+) -> Result<()> {
+    let names = names.collect::<Vec<_>>();
+    let mut rule_sets = Vec::new();
+    for key in ["tools", "permission"] {
+        if let Some(value) = document.get(key) {
+            rule_sets.push((key.to_string(), value));
+        }
+    }
+    if let Some(agents) = document.get("agent") {
+        let agents = agents
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("OpenCode agent setting must be an object"))?;
+        for (agent, value) in agents {
+            let agent = value
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("OpenCode agent {agent} must be an object"))?;
+            for key in ["tools", "permission"] {
+                if let Some(value) = agent.get(key) {
+                    rule_sets.push((format!("agent.{key}"), value));
+                }
+            }
+        }
+    }
+    for (location, rules) in rule_sets {
+        let rules = rules
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("OpenCode {location} rules must be an object"))?;
+        for pattern in rules.keys() {
+            let affects_managed = names
+                .iter()
+                .any(|name| glob_can_match_prefix(pattern, &format!("{name}_")));
+            if affects_managed {
+                anyhow::bail!(
+                    "OpenCode MCP tool rule {pattern} in {location} cannot be represented safely"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
-fn json_config_object_mut(config: &mut NativeConfig) -> Result<&mut Map<String, Value>> {
-    let NativeConfig::Json(value) = config else {
-        anyhow::bail!("OpenCode JSON config must be an object");
-    };
-    if !value.is_object() {
-        *value = Value::Object(Map::new());
+fn glob_can_match_prefix(pattern: &str, prefix: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let mut states = std::collections::BTreeSet::from([0usize]);
+    add_glob_epsilon_states(pattern, &mut states);
+    for byte in prefix.bytes() {
+        let mut next = std::collections::BTreeSet::new();
+        for state in &states {
+            match pattern.get(*state) {
+                Some(b'*') => {
+                    next.insert(*state);
+                }
+                Some(b'?') => {
+                    next.insert(state + 1);
+                }
+                Some(expected) if *expected == byte => {
+                    next.insert(state + 1);
+                }
+                _ => {}
+            }
+        }
+        add_glob_epsilon_states(pattern, &mut next);
+        states = next;
+        if states.is_empty() {
+            return false;
+        }
     }
-    value
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("OpenCode JSON config must be an object"))
+    !states.is_empty()
+}
+
+fn add_glob_epsilon_states(pattern: &[u8], states: &mut std::collections::BTreeSet<usize>) {
+    let mut pending = states.iter().copied().collect::<Vec<_>>();
+    while let Some(state) = pending.pop() {
+        if pattern.get(state) == Some(&b'*') && states.insert(state + 1) {
+            pending.push(state + 1);
+        }
+    }
 }
 
 impl McpDefinition {
@@ -430,19 +500,73 @@ impl McpDefinition {
                 map.insert("command".to_string(), json!(cmd_array));
 
                 if !stdio.env.is_empty() {
-                    map.insert("environment".to_string(), json!(stdio.env));
+                    map.insert(
+                        "environment".to_string(),
+                        json!(render_opencode_env(&stdio.env)),
+                    );
                 }
             }
             McpTransport::Http(http) => {
                 map.insert("type".to_string(), json!("remote"));
                 map.insert("url".to_string(), json!(http.url));
                 if !http.headers.is_empty() {
-                    map.insert("headers".to_string(), json!(http.headers));
+                    map.insert(
+                        "headers".to_string(),
+                        json!(render_opencode_env(&http.headers)),
+                    );
                 }
             }
         }
         Ok(Value::Object(map))
     }
+}
+
+fn parse_opencode_env(value: &str) -> Result<McpValue> {
+    if let Some(name) = value
+        .strip_prefix("{env:")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        McpValue::env(name)
+    } else if contains_opencode_substitution(value) {
+        anyhow::bail!("OpenCode MCP value contains unrepresentable native substitution syntax")
+    } else {
+        Ok(McpValue::literal(value))
+    }
+}
+
+fn contains_opencode_substitution(value: &str) -> bool {
+    value.contains("{env:") || value.contains("{file:")
+}
+
+fn reject_opencode_direct_substitutions(definitions: &[McpDefinition]) -> Result<()> {
+    for definition in definitions {
+        let values: Vec<&str> = match &definition.transport {
+            McpTransport::Stdio(stdio) => std::iter::once(stdio.command.as_str())
+                .chain(stdio.args.iter().map(String::as_str))
+                .collect(),
+            McpTransport::Http(http) => vec![http.url.as_str()],
+        };
+        if values.into_iter().any(contains_opencode_substitution) {
+            anyhow::bail!(
+                "OpenCode MCP server {} contains a literal that matches native substitution syntax",
+                definition.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn render_opencode_env(values: &BTreeMap<String, McpValue>) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .map(|(key, value)| {
+            let value = match value {
+                McpValue::Literal(value) => value.clone(),
+                McpValue::Env(name) => format!("{{env:{name}}}"),
+            };
+            (key.clone(), value)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -487,7 +611,7 @@ mod tests {
         fn setup_native_config_for_import(&self, paths: &HarnessConfigPaths) {
             fs::write(&paths.settings_file, r#"{
   "model": "gpt-imported",
-  "permissions": "on-request",
+  "permission": {"edit": "ask"},
   "mcp": {
     "local": {"command":["server"]},
     "remote": {"type": "remote", "url": "https://mcp.example", "headers": {"Authorization": "$TOKEN"}}
@@ -508,13 +632,16 @@ mod tests {
         fn setup_drift_native_config(&self, paths: &HarnessConfigPaths) {
             fs::write(
                 &paths.settings_file,
-                r#"{"model": "drift-model", "permissions": "drift-perm"}"#,
+                r#"{"model": "drift-model", "permission": {"edit": "deny"}}"#,
             )
             .unwrap();
         }
         fn assert_drift_saved(&self, config: &ProfileConfig) {
             assert_eq!(config.model_preference("opencode"), "drift-model");
-            assert_eq!(config.permission_preference("opencode"), "drift-perm");
+            assert_eq!(
+                config.permission_preference("opencode"),
+                serde_json::json!({"edit": "deny"})
+            );
         }
         fn write_profile_config(&self, profile: &Path) {
             crate::integrations::test_suite::template::write_config(
@@ -523,14 +650,15 @@ mod tests {
   "name": "work",
   "description": "",
   "models": {"opencode": "gpt-5.2"},
-  "permissions": {"opencode": "on-request"}
+  "permissions": {"opencode": {"edit": "ask"}}
 }"#,
             );
         }
         fn assert_applied_native_config(&self, paths: &HarnessConfigPaths) {
             let config = fs::read_to_string(&paths.settings_file).unwrap();
             assert!(config.contains("gpt-5.2"));
-            assert!(config.contains("on-request"));
+            assert!(config.contains(r#""permission""#));
+            assert!(config.contains("ask"));
             let mcp = fs::read_to_string(&paths.mcp_file).unwrap();
             assert!(mcp.contains("local"));
             assert!(mcp.contains("server"));
@@ -578,7 +706,7 @@ Implement the change carefully.
                 .model
                 .as_ref()
                 .and_then(|model| model.get("opencode"))
-                .and_then(serde_yaml::Value::as_str),
+                .and_then(crate::yaml::Value::as_str),
             Some("gpt-5.2")
         );
         assert!(agent
@@ -591,7 +719,7 @@ Implement the change carefully.
                 .tools
                 .as_ref()
                 .and_then(|tools| tools.get("edit"))
-                .and_then(serde_yaml::Value::as_str),
+                .and_then(crate::yaml::Value::as_str),
             Some("allow")
         );
         assert_eq!(
@@ -599,7 +727,7 @@ Implement the change carefully.
                 .tools
                 .as_ref()
                 .and_then(|tools| tools.get("shell"))
-                .and_then(serde_yaml::Value::as_str),
+                .and_then(crate::yaml::Value::as_str),
             Some("deny")
         );
         assert!(agent
@@ -634,5 +762,107 @@ tools:
         assert_eq!(agent.name, "coder");
         assert_eq!(agent.description, "Writes focused Rust changes");
         assert_eq!(agent.body, "");
+    }
+
+    #[test]
+    fn renders_current_opencode_agent_fields() {
+        let agent = SubAgent {
+            name: "reviewer".to_string(),
+            description: "Reviews code".to_string(),
+            model: None,
+            tools: Some(crate::yaml::from_str("edit: deny\nbash: ask").unwrap()),
+            permission: None,
+            max_turns: Some(5),
+            harness: BTreeMap::new(),
+            body: "Review carefully.".to_string(),
+        };
+
+        let rendered = render_opencode_agent(&agent).unwrap();
+
+        assert!(!rendered.contains("name:"));
+        assert!(!rendered.contains("tools:"));
+        assert!(rendered.contains("permission:"));
+        assert!(rendered.contains("steps: 5"));
+    }
+
+    #[test]
+    fn opencode_rejects_blank_description_override_after_merge() {
+        let mut harness = BTreeMap::new();
+        harness.insert(
+            "opencode".to_string(),
+            crate::yaml::from_str("description: ''").unwrap(),
+        );
+        let agent = SubAgent {
+            name: "reviewer".to_string(),
+            description: "Reviews".to_string(),
+            model: None,
+            tools: None,
+            permission: None,
+            max_turns: None,
+            harness,
+            body: String::new(),
+        };
+        assert!(render_opencode_agent(&agent).is_err());
+    }
+
+    #[test]
+    fn opencode_mcp_environment_references_round_trip() {
+        let definitions = crate::profile::mcp::parse_mcp_definitions(
+            r#"[{"name":"x","transport":"stdio","command":"x","env":{"TOKEN":{"env":"TOKEN"}}}]"#,
+        )
+        .unwrap();
+        let mut config = NativeConfig::Json(json!({}));
+        OpenCodeMcpCodec.apply(&mut config, &definitions).unwrap();
+        assert_eq!(OpenCodeMcpCodec.import(&config).unwrap(), definitions);
+    }
+
+    #[test]
+    fn opencode_rejects_malformed_mcp_and_tool_security_rules() {
+        let malformed = NativeConfig::Json(json!({"mcp":{"x":{"type":false}}}));
+        assert!(OpenCodeMcpCodec.import(&malformed).is_err());
+        let restricted = NativeConfig::Json(json!({
+            "mcp":{"server":{"type":"local","command":["x"]}},
+            "tools":{"server_*":false}
+        }));
+        assert!(OpenCodeMcpCodec.import(&restricted).is_err());
+        let definitions = crate::profile::mcp::parse_mcp_definitions(
+            r#"[{"name":"x","transport":"stdio","command":"x","env":{"TOKEN":"{env:TOKEN}"}}]"#,
+        )
+        .unwrap();
+        assert!(OpenCodeMcpCodec
+            .preflight_apply(&NativeConfig::Json(json!({})), &definitions)
+            .is_err());
+        for document in [
+            json!({"mcp":{"server":{"type":"local","command":["x"]}},"permission":{"server_*":"deny"}}),
+            json!({"mcp":{"server":{"type":"local","command":["x"]}},"tools":{"server_?":"deny"}}),
+            json!({"mcp":{"server":{"type":"local","command":["x"]}},"agent":{"reviewer":{"permission":{"server_tool":"deny"}}}}),
+        ] {
+            assert!(OpenCodeMcpCodec
+                .import(&NativeConfig::Json(document))
+                .is_err());
+        }
+        for document in [
+            json!({"mcp":{"server":{"type":"local","command":["x"]}},"permission":{"bash*":"ask"}}),
+            json!({"mcp":{"server":{"type":"local","command":["x"]}},"agent":{"reviewer":{"tools":{"other_*":false}}}}),
+        ] {
+            assert!(OpenCodeMcpCodec
+                .import(&NativeConfig::Json(document))
+                .is_ok());
+        }
+        for value in ["Bearer {env:TOKEN}", "{file:/tmp/token}"] {
+            let native =
+                json!({"mcp":{"x":{"type":"local","command":["x"],"environment":{"TOKEN":value}}}});
+            assert!(OpenCodeMcpCodec
+                .import(&NativeConfig::Json(native))
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn opencode_custom_permission_verifies_effective_value() {
+        let config = NativeConfig::Json(json!({"permission":{"edit":"deny"}}));
+        assert!(OpenCodePermissionCodec
+            .verify(&config, json!({"edit":"allow"}))
+            .is_err());
     }
 }

@@ -10,12 +10,7 @@ Thumbs.db
 .codex/
 .claude/
 .gemini/
-.tickets/
-cmt
-tkt
-loop
 PLAN.md
-PROMPT.md
 
 # Rust
 target/

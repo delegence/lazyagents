@@ -5,7 +5,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use crate::harness::artifact::{
-    merge_profile_import, ArtifactContext, HarnessArtifact, HarnessSettings,
+    merge_profile_import, ArtifactContext, ArtifactKind, HarnessArtifact,
 };
 use crate::harness::drift::DriftReport;
 use crate::harness::fs::detect_binary;
@@ -72,16 +72,25 @@ pub struct ProfileImport {
     pub permission_preference: ImportedPreference,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ImportedDirectory {
     pub name: String,
+    pub unix_mode: Option<u32>,
     pub files: Vec<ImportedFile>,
+    pub directories: Vec<ImportedDirectoryEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ImportedDirectoryEntry {
+    pub relative_path: PathBuf,
+    pub unix_mode: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ImportedFile {
     pub relative_path: PathBuf,
     pub contents: Vec<u8>,
+    pub unix_mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,24 +135,29 @@ pub trait HarnessIntegration {
         self.kind().display_name()
     }
     fn supports_skills(&self) -> bool {
-        true
+        self.supports_artifact(ArtifactKind::Skills)
     }
     fn supports_commands(&self) -> bool {
-        true
+        self.supports_artifact(ArtifactKind::Commands)
     }
     fn supports_mcp(&self) -> bool {
-        true
+        self.supports_artifact(ArtifactKind::Mcp)
     }
     fn supports_subagents(&self) -> bool {
-        true
+        self.supports_artifact(ArtifactKind::Subagents)
     }
     fn default_config_dir(&self, env: &AppEnvironment) -> PathBuf;
     fn paths_from_config_dir(&self, config_dir: PathBuf) -> Result<HarnessConfigPaths>;
+    fn paths_from_custom_config_dir(&self, config_dir: PathBuf) -> Result<HarnessConfigPaths> {
+        self.paths_from_config_dir(config_dir)
+    }
     fn artifacts(&self) -> Vec<Box<dyn HarnessArtifact>> {
         Vec::new()
     }
-    fn settings(&self) -> Option<Box<dyn HarnessSettings>> {
-        None
+    fn supports_artifact(&self, kind: ArtifactKind) -> bool {
+        self.artifacts()
+            .iter()
+            .any(|artifact| artifact.kind() == kind)
     }
     fn detect(&self, env: &AppEnvironment) -> Result<HarnessDetection> {
         Ok(detect_binary(env, self.kind().binary_name()))
@@ -156,80 +170,67 @@ pub trait HarnessIntegration {
         for artifact in self.artifacts() {
             extend_unique_surfaces(&mut surfaces, artifact.surfaces(paths));
         }
-        if let Some(settings) = self.settings() {
-            extend_unique_surfaces(&mut surfaces, settings.surfaces(paths));
-        }
         surfaces
     }
-    fn preflight(&self, profile: &ProfileRef) -> Result<()> {
-        let paths = self.paths_from_config_dir(PathBuf::new())?;
-        let ctx = self.artifact_context(None, &paths);
-        for artifact in self.artifacts() {
+    fn preflight(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
+        let ctx = self.artifact_context(paths);
+        for artifact in self.checked_artifacts()? {
             artifact.preflight(&ctx, profile)?;
-        }
-        if let Some(settings) = self.settings() {
-            settings.preflight(&ctx, profile)?;
         }
         Ok(())
     }
     fn detect_drift(&self, active: &ProfileRef, paths: &HarnessConfigPaths) -> Result<DriftReport> {
-        let ctx = self.artifact_context(None, paths);
+        let ctx = self.artifact_context(paths);
         let mut items = Vec::new();
-        for artifact in self.artifacts() {
+        for artifact in self.checked_artifacts()? {
             items.extend(artifact.detect_drift(&ctx, active)?);
-        }
-        if let Some(settings) = self.settings() {
-            items.extend(settings.detect_drift(&ctx, active)?);
         }
         Ok(DriftReport { items })
     }
     fn import_from_harness(&self, paths: &HarnessConfigPaths) -> Result<ProfileImport> {
-        let ctx = self.artifact_context(None, paths);
+        let ctx = self.artifact_context(paths);
         let mut import = ProfileImport::default();
-        for artifact in self.artifacts() {
+        for artifact in self.checked_artifacts()? {
             merge_profile_import(&mut import, artifact.import(&ctx)?);
-        }
-        if let Some(settings) = self.settings() {
-            merge_profile_import(&mut import, settings.import(&ctx)?);
         }
         Ok(import)
     }
     fn apply(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
         std::fs::create_dir_all(&paths.config_dir)?;
-        let ctx = self.artifact_context(None, paths);
-        for artifact in self.artifacts() {
+        let ctx = self.artifact_context(paths);
+        for artifact in self.checked_artifacts()? {
             artifact.apply(&ctx, profile)?;
-        }
-        if let Some(settings) = self.settings() {
-            settings.apply(&ctx, profile)?;
         }
         Ok(())
     }
     fn verify(&self, profile: &ProfileRef, paths: &HarnessConfigPaths) -> Result<()> {
-        let ctx = self.artifact_context(None, paths);
-        for artifact in self.artifacts() {
+        let ctx = self.artifact_context(paths);
+        for artifact in self.checked_artifacts()? {
             artifact.verify(&ctx, profile)?;
-        }
-        if let Some(settings) = self.settings() {
-            settings.verify(&ctx, profile)?;
         }
         Ok(())
     }
 
-    fn artifact_context<'a>(
-        &'a self,
-        env: Option<&'a AppEnvironment>,
-        paths: &'a HarnessConfigPaths,
-    ) -> ArtifactContext<'a> {
-        let context = ArtifactContext {
-            env,
-            kind: self.kind(),
+    fn artifact_context<'a>(&'a self, paths: &'a HarnessConfigPaths) -> ArtifactContext<'a> {
+        ArtifactContext {
             display_name: self.display_name(),
             paths,
-        };
-        let _ = context.env;
-        let _ = context.kind;
-        context
+        }
+    }
+
+    fn checked_artifacts(&self) -> Result<Vec<Box<dyn HarnessArtifact>>> {
+        let artifacts = self.artifacts();
+        let mut kinds = std::collections::BTreeSet::new();
+        for artifact in &artifacts {
+            if !kinds.insert(artifact.kind()) {
+                anyhow::bail!(
+                    "{} declares more than one {:?} artifact",
+                    self.kind(),
+                    artifact.kind()
+                );
+            }
+        }
+        Ok(artifacts)
     }
 }
 
@@ -247,7 +248,7 @@ fn extend_unique_surfaces(surfaces: &mut Vec<ManagedSurface>, additions: Vec<Man
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::artifact::{ArtifactContext, HarnessArtifact, HarnessSettings};
+    use crate::harness::artifact::{ArtifactContext, ArtifactKind, HarnessArtifact};
     use crate::harness::drift::DriftItem;
     use crate::harness::managed::ManagedSurface;
     use crate::profile::ProfileName;
@@ -274,6 +275,14 @@ mod tests {
     }
 
     impl HarnessArtifact for RecordingArtifact {
+        fn kind(&self) -> ArtifactKind {
+            match self.name {
+                "first" => ArtifactKind::Instructions,
+                "second" => ArtifactKind::Skills,
+                _ => ArtifactKind::Settings,
+            }
+        }
+
         fn surfaces(&self, _paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
             vec![ManagedSurface::file(&self.surface)]
         }
@@ -325,10 +334,9 @@ mod tests {
         }
     }
 
-    impl HarnessSettings for RecordingArtifact {}
-
     struct DummyIntegration {
         events: Rc<RefCell<Vec<String>>>,
+        duplicate_settings: bool,
     }
 
     impl HarnessIntegration for DummyIntegration {
@@ -353,17 +361,18 @@ mod tests {
         }
 
         fn artifacts(&self) -> Vec<Box<dyn HarnessArtifact>> {
-            vec![
+            let mut artifacts: Vec<Box<dyn HarnessArtifact>> = vec![
                 Box::new(RecordingArtifact::new("first", self.events.clone())),
                 Box::new(RecordingArtifact::new("second", self.events.clone())),
-            ]
-        }
-
-        fn settings(&self) -> Option<Box<dyn HarnessSettings>> {
-            Some(Box::new(RecordingArtifact::new(
-                "settings",
-                self.events.clone(),
-            )))
+                Box::new(RecordingArtifact::new("settings", self.events.clone())),
+            ];
+            if self.duplicate_settings {
+                artifacts.push(Box::new(RecordingArtifact::new(
+                    "settings-copy",
+                    self.events.clone(),
+                )));
+            }
+            artifacts
         }
     }
 
@@ -376,10 +385,11 @@ mod tests {
     }
 
     #[test]
-    fn default_lifecycle_runs_artifacts_then_settings_in_declared_order() {
+    fn default_lifecycle_runs_artifacts_in_declared_order() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let integration = DummyIntegration {
             events: events.clone(),
+            duplicate_settings: false,
         };
         let paths = integration
             .paths_from_config_dir(tempfile::tempdir().unwrap().path().join("config"))
@@ -389,7 +399,7 @@ mod tests {
         let surfaces = integration.managed_surfaces(&paths);
         assert_eq!(surfaces.len(), 3);
 
-        integration.preflight(&profile).unwrap();
+        integration.preflight(&profile, &paths).unwrap();
         assert_eq!(
             events.borrow().as_slice(),
             ["first:preflight", "second:preflight", "settings:preflight"]
@@ -426,5 +436,22 @@ mod tests {
                 "settings:verify",
             ]
         );
+    }
+
+    #[test]
+    fn duplicate_artifact_kinds_are_rejected() {
+        let integration = DummyIntegration {
+            events: Rc::new(RefCell::new(Vec::new())),
+            duplicate_settings: true,
+        };
+        let paths = integration
+            .paths_from_config_dir(tempfile::tempdir().unwrap().path().join("config"))
+            .unwrap();
+
+        let error = integration.preflight(&profile_ref(), &paths).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("declares more than one Settings artifact"));
     }
 }

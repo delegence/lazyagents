@@ -30,13 +30,94 @@ pub enum McpTransport {
 pub struct StdioMcp {
     pub command: String,
     pub args: Vec<String>,
-    pub env: BTreeMap<String, String>,
+    pub env: BTreeMap<String, McpValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpMcp {
     pub url: String,
-    pub headers: BTreeMap<String, String>,
+    pub headers: BTreeMap<String, McpValue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpValue {
+    Literal(String),
+    Env(String),
+}
+
+pub(crate) fn reject_native_reference_literals(
+    definitions: &[McpDefinition],
+    harness: &str,
+    is_reference: impl Fn(&str) -> bool,
+) -> Result<()> {
+    for definition in definitions {
+        let values = match &definition.transport {
+            McpTransport::Stdio(stdio) => &stdio.env,
+            McpTransport::Http(http) => &http.headers,
+        };
+        if let Some((key, McpValue::Literal(value))) = values
+            .iter()
+            .find(|(_, value)| matches!(value, McpValue::Literal(text) if is_reference(text)))
+        {
+            anyhow::bail!(
+                "{harness} MCP server {} value {key} is a literal that matches native environment-reference syntax: {value}",
+                definition.name
+            );
+        }
+    }
+    Ok(())
+}
+
+impl McpValue {
+    pub fn literal(value: impl Into<String>) -> Self {
+        Self::Literal(value.into())
+    }
+
+    pub fn env(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            anyhow::bail!("environment variable name {name:?} is invalid");
+        }
+        Ok(Self::Env(name))
+    }
+}
+
+impl Serialize for McpValue {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Literal(value) => serializer.serialize_str(value),
+            Self::Env(name) => {
+                let mut map = BTreeMap::new();
+                map.insert("env", name);
+                map.serialize(serializer)
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for McpValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum RawValue {
+            Literal(String),
+            Env { env: String },
+        }
+        match RawValue::deserialize(deserializer)? {
+            RawValue::Literal(value) => Ok(Self::Literal(value)),
+            RawValue::Env { env } => McpValue::env(env).map_err(serde::de::Error::custom),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,10 +130,10 @@ struct RawMcpDefinition {
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
-    env: BTreeMap<String, String>,
+    env: BTreeMap<String, McpValue>,
     url: Option<String>,
     #[serde(default)]
-    headers: BTreeMap<String, String>,
+    headers: BTreeMap<String, McpValue>,
 }
 
 pub fn read_mcp_definitions(profile_path: &Path) -> Result<Vec<McpDefinition>> {
@@ -189,11 +270,11 @@ pub fn canonical_mcp_json(definitions: &[McpDefinition]) -> Result<String> {
         #[serde(skip_serializing_if = "Vec::is_empty")]
         args: Vec<&'a str>,
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        env: &'a BTreeMap<String, String>,
+        env: &'a BTreeMap<String, McpValue>,
         #[serde(skip_serializing_if = "Option::is_none")]
         url: Option<&'a str>,
         #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-        headers: &'a BTreeMap<String, String>,
+        headers: &'a BTreeMap<String, McpValue>,
     }
 
     let mut definitions = definitions.iter().collect::<Vec<_>>();
@@ -232,8 +313,8 @@ pub fn canonical_mcp_json(definitions: &[McpDefinition]) -> Result<String> {
     }
 }
 
-fn empty_headers() -> &'static BTreeMap<String, String> {
-    static EMPTY: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
+fn empty_headers() -> &'static BTreeMap<String, McpValue> {
+    static EMPTY: std::sync::OnceLock<BTreeMap<String, McpValue>> = std::sync::OnceLock::new();
     EMPTY.get_or_init(BTreeMap::new)
 }
 

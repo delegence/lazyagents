@@ -1,13 +1,13 @@
+use crate::yaml::{Mapping, Value};
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use serde_yaml::{Mapping, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::file_system::write_text_atomic;
 use crate::harness::drift::DriftItem;
 use crate::harness::integration::ImportedFile;
-use crate::harness::managed::write_text_atomic;
 
 #[derive(Debug, Clone)]
 pub struct SubAgent {
@@ -112,18 +112,50 @@ pub(crate) fn collect_rendered_agent_drift(
     items: &mut Vec<DriftItem>,
 ) -> Result<()> {
     let mut expected = BTreeSet::new();
+    match fs::symlink_metadata(target_dir) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        Ok(_) => {
+            items.push(DriftItem {
+                surface: "agents".to_string(),
+                detail: format!("{} has the wrong type", target_dir.display()),
+            });
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect {}", target_dir.display()))
+        }
+    }
     for agent in agents {
         expected.insert(agent.relative_path.clone());
         let target = target_dir.join(&agent.relative_path);
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                items.push(DriftItem {
+                    surface: "agents".to_string(),
+                    detail: format!("{} has the wrong type", target.display()),
+                });
+                continue;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                items.push(DriftItem {
+                    surface: "agents".to_string(),
+                    detail: format!("{} is missing", target.display()),
+                });
+                continue;
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to inspect {}", target.display()))
+            }
+        }
         match fs::read_to_string(&target) {
             Ok(actual) if actual == agent.contents => {}
             Ok(_) => items.push(DriftItem {
                 surface: "agents".to_string(),
                 detail: format!("{} does not match active profile", target.display()),
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => items.push(DriftItem {
-                surface: "agents".to_string(),
-                detail: format!("{} is missing", target.display()),
             }),
             Err(error) => {
                 return Err(error).with_context(|| format!("failed to read {}", target.display()))
@@ -151,6 +183,7 @@ pub fn sub_agent_import_file(agent: &SubAgent) -> ImportedFile {
     ImportedFile {
         relative_path: PathBuf::from(format!("{}.md", agent.name)),
         contents: sub_agent_to_markdown(agent).into_bytes(),
+        unix_mode: None,
     }
 }
 
@@ -189,13 +222,13 @@ pub fn sub_agent_to_markdown(agent: &SubAgent) -> String {
             Value::Mapping(harness),
         );
     }
-    let yaml = serde_yaml::to_string(&map).unwrap_or_default();
+    let yaml = crate::yaml::to_string(&map).unwrap_or_default();
     format!("---\n{}---\n{}\n", trim_yaml_header(&yaml), agent.body)
 }
 
 pub fn parse_sub_agent(text: &str) -> Result<SubAgent> {
     let (frontmatter, body) = split_markdown_frontmatter(text)?;
-    let frontmatter: AgentFrontmatter = serde_yaml::from_str(frontmatter)?;
+    let frontmatter: AgentFrontmatter = crate::yaml::from_str(frontmatter)?;
     let body = body.trim().to_string();
     validate_agent_name(&frontmatter.name)?;
     if frontmatter.description.trim().is_empty() {
@@ -211,6 +244,213 @@ pub fn parse_sub_agent(text: &str) -> Result<SubAgent> {
         harness: frontmatter.harness,
         body,
     })
+}
+
+pub fn parse_native_markdown_agent(
+    text: &str,
+    fallback_name: &str,
+    harness_id: &str,
+    options: NativeAgentParseOptions<'_>,
+    normalize_tools: impl FnOnce(Value) -> Value,
+) -> Result<SubAgent> {
+    let (frontmatter, body) = split_markdown_frontmatter(text)?;
+    let mut map = crate::yaml::from_str::<Mapping>(frontmatter)?;
+    let name = match remove_string(&mut map, "name")? {
+        Some(name) => name,
+        None if options.require_name => anyhow::bail!("native agent is missing name"),
+        None => fallback_name.to_string(),
+    };
+    let description = remove_string(&mut map, "description")?
+        .ok_or_else(|| anyhow::anyhow!("native agent is missing description"))?;
+    validate_agent_name(&name)?;
+    if description.trim().is_empty() {
+        anyhow::bail!("native agent description cannot be empty");
+    }
+    let model = harness_scoped_value(harness_id, remove_value(&mut map, "model"));
+    let tools = remove_value(&mut map, "tools").map(normalize_tools);
+    let permission = harness_scoped_value(
+        harness_id,
+        options
+            .permission_key
+            .and_then(|key| remove_value(&mut map, key)),
+    );
+    let max_turns =
+        match options
+            .max_turns_key
+            .and_then(|key| remove_value(&mut map, key).map(|value| (key, value)))
+        {
+            Some((key, value)) => Some(value.as_u64().ok_or_else(|| {
+                anyhow::anyhow!("native agent {key} must be an unsigned integer")
+            })?),
+            None => None,
+        };
+    if let Some(role) = options.role {
+        match remove_string(&mut map, role.key)? {
+            Some(value) if value == role.accepted => {}
+            Some(value) => anyhow::bail!(
+                "native agent {} {value} is incompatible with neutral sub-agents",
+                role.key
+            ),
+            None if role.required => {
+                anyhow::bail!("native agent must set {} to {}", role.key, role.accepted)
+            }
+            None => {}
+        }
+    }
+
+    let mut harness = BTreeMap::new();
+    if !map.is_empty() {
+        harness.insert(harness_id.to_string(), Value::Mapping(map));
+    }
+    Ok(SubAgent {
+        name,
+        description,
+        model,
+        tools,
+        permission,
+        max_turns,
+        harness,
+        body: body.trim().to_string(),
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NativeAgentRole<'a> {
+    pub key: &'a str,
+    pub accepted: &'a str,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NativeAgentParseOptions<'a> {
+    pub require_name: bool,
+    pub permission_key: Option<&'a str>,
+    pub max_turns_key: Option<&'a str>,
+    pub role: Option<NativeAgentRole<'a>>,
+}
+
+pub fn render_native_markdown(map: Mapping, body: &str) -> Result<String> {
+    let yaml = crate::yaml::to_string(&map)?;
+    Ok(format!(
+        "---\n{}---\n{}\n",
+        yaml.strip_prefix("---\n").unwrap_or(&yaml),
+        body
+    ))
+}
+
+pub(crate) fn validate_merged_markdown_agent(
+    map: &Mapping,
+    harness: &str,
+    require_name: bool,
+    max_turns_key: &str,
+) -> Result<()> {
+    if require_name {
+        let name = map
+            .get(yaml_key("name"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("{harness} agent name must be a string"))?;
+        validate_agent_name(name)?;
+    }
+    let description = map
+        .get(yaml_key("description"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("{harness} agent description must be a string"))?;
+    if description.trim().is_empty() {
+        anyhow::bail!("{harness} agent description must not be blank");
+    }
+    if let Some(value) = map.get(yaml_key(max_turns_key)) {
+        if value.as_u64().is_none() {
+            anyhow::bail!("{harness} agent {max_turns_key} must be an unsigned integer");
+        }
+    }
+    Ok(())
+}
+
+pub fn merge_harness_override(map: &mut Mapping, agent: &SubAgent, harness_id: &str) -> Result<()> {
+    let override_map = match agent.harness.get(harness_id) {
+        Some(Value::Mapping(override_map)) => override_map,
+        Some(_) => anyhow::bail!("{harness_id} harness override must be an object"),
+        None => return Ok(()),
+    };
+    for (key, value) in override_map {
+        if !matches!(key, Value::String(_)) {
+            anyhow::bail!("{harness_id} harness override keys must be strings");
+        }
+        map.insert(key.clone(), value.clone());
+    }
+    Ok(())
+}
+
+pub fn tools_to_allow_list(value: &Value) -> Value {
+    match value {
+        Value::Mapping(map) => Value::Sequence(
+            map.iter()
+                .filter_map(|(key, value)| {
+                    let key = key.as_str()?;
+                    tool_is_allowed(value).then(|| Value::String(key.to_string()))
+                })
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+pub fn normalize_tool_permissions(value: Value) -> Value {
+    match value {
+        Value::Mapping(map) => Value::Mapping(
+            map.into_iter()
+                .map(|(key, value)| {
+                    let value = match value {
+                        Value::Bool(true) => Value::String("allow".to_string()),
+                        Value::Bool(false) => Value::String("deny".to_string()),
+                        other => other,
+                    };
+                    (key, value)
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+pub fn normalize_tool_permissions_with_allow_list(value: Value) -> Value {
+    match value {
+        Value::Sequence(items) => Value::Mapping(
+            items
+                .into_iter()
+                .filter_map(|item| {
+                    item.as_str()
+                        .map(|tool| (yaml_key(tool), Value::String("allow".to_string())))
+                })
+                .collect(),
+        ),
+        other => normalize_tool_permissions(other),
+    }
+}
+
+pub fn tool_is_allowed(value: &Value) -> bool {
+    match value {
+        Value::Bool(value) => *value,
+        Value::String(value) => matches!(value.as_str(), "allow" | "allowed" | "true" | "yes"),
+        _ => false,
+    }
+}
+
+pub fn yaml_key(key: &str) -> Value {
+    Value::String(key.to_string())
+}
+
+pub fn validate_lowercase_agent_slug(name: &str, harness: &str, extra: &[u8]) -> Result<()> {
+    let valid = !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'-' || extra.contains(&byte));
+    if !valid {
+        anyhow::bail!(
+            "{harness} agent name {name} contains characters unsupported by that harness"
+        );
+    }
+    Ok(())
 }
 
 fn validate_agent_name(name: &str) -> Result<()> {
@@ -279,7 +519,7 @@ pub fn remove_string(map: &mut Mapping, key: &str) -> Result<Option<String>> {
 }
 
 pub fn format_yaml_value(value: &Value) -> String {
-    serde_yaml::to_string(value)
+    crate::yaml::to_string(value)
         .unwrap_or_else(|_| "<unprintable>".to_string())
         .trim()
         .to_string()
@@ -390,6 +630,49 @@ description: Reviews code
     }
 
     #[test]
+    fn native_agent_role_and_turn_limit_are_not_silently_changed() {
+        let primary = "---\ndescription: Test\nmode: primary\nsteps: 2\n---\nBody\n";
+        let error = parse_native_markdown_agent(
+            primary,
+            "test",
+            "opencode",
+            NativeAgentParseOptions {
+                require_name: false,
+                permission_key: None,
+                max_turns_key: Some("steps"),
+                role: Some(NativeAgentRole {
+                    key: "mode",
+                    accepted: "subagent",
+                    required: true,
+                }),
+            },
+            |value| value,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("incompatible"));
+
+        let malformed = "---\ndescription: Test\nmode: subagent\nsteps: many\n---\nBody\n";
+        let error = parse_native_markdown_agent(
+            malformed,
+            "test",
+            "opencode",
+            NativeAgentParseOptions {
+                require_name: false,
+                permission_key: None,
+                max_turns_key: Some("steps"),
+                role: Some(NativeAgentRole {
+                    key: "mode",
+                    accepted: "subagent",
+                    required: true,
+                }),
+            },
+            |value| value,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unsigned integer"));
+    }
+
+    #[test]
     fn sub_agent_markdown_round_trips_core_fields() {
         let agent = SubAgent {
             name: "reviewer".to_string(),
@@ -439,5 +722,22 @@ description: Reviews code
             let agent = parse_sub_agent(&markdown).unwrap();
             assert_eq!(agent.name, name);
         }
+    }
+
+    #[test]
+    fn present_non_object_harness_override_is_rejected() {
+        let mut harness = BTreeMap::new();
+        harness.insert("claude".to_string(), Value::String("bad".to_string()));
+        let agent = SubAgent {
+            name: "reviewer".to_string(),
+            description: "Reviews".to_string(),
+            model: None,
+            tools: None,
+            permission: None,
+            max_turns: None,
+            harness,
+            body: String::new(),
+        };
+        assert!(merge_harness_override(&mut Mapping::new(), &agent, "claude").is_err());
     }
 }

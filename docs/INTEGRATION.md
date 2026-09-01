@@ -9,7 +9,7 @@ The goal is that a new harness is added as one concrete integration file plus sm
 Keep the dependency direction intact:
 
 - `src/profile/` owns profile names, config, neutral MCP parsing, validation, summaries, and profile filesystem storage.
-- `src/harness/` owns generic harness primitives and mechanics: harness type/instance values, `HarnessIntegration`, config paths, managed surfaces, drift report types, skill and command helpers, transactional apply, backup/rollback, symlink helpers, and atomic writes.
+- `src/harness/` owns generic harness primitives and mechanics: harness type/instance values, `HarnessIntegration`, config paths, managed surfaces, drift report types, skill and command helpers, transactional apply, backup/rollback, managed copy helpers, legacy symlink import helpers, and atomic writes.
 - `src/integrations/` owns concrete harness implementations. Put one harness per file.
 - `src/app/` owns product workflows and composition, including the built-in harness registry.
 - `src/cli/` owns terminal-specific parsing, prompts, rendering, and `$EDITOR` execution.
@@ -64,7 +64,7 @@ impl HarnessIntegration for ExampleIntegration {
             Box::new(SkillsDirectory::new(|paths| &paths.skills_dir)),
             Box::new(CommandsDirectory::new(
                 |paths| &paths.commands_dir,
-                CommandMode::RecursiveSymlink,
+                CommandMode::RecursiveCopy,
             )),
             Box::new(SubagentsDirectory::new(
                 |paths| &paths.agents_dir,
@@ -74,20 +74,17 @@ impl HarnessIntegration for ExampleIntegration {
                 JsonConfigFile::new(|paths| &paths.mcp_file),
                 ExampleMcpCodec,
             )),
+            Box::new(
+                SettingsPreferences::new(JsonConfigFile::new(|paths| &paths.settings_file))
+                    .model(PreferenceBinding::JsonStringPointer { pointer: "/model" })
+                    .permission(PreferenceBinding::JsonStringPointer { pointer: "/permission" }),
+            ),
         ]
-    }
-
-    fn settings(&self) -> Option<Box<dyn HarnessSettings>> {
-        Some(Box::new(
-            SettingsPreferences::new(JsonConfigFile::new(|paths| &paths.settings_file))
-                .model(PreferenceBinding::JsonPointer { pointer: "/model" })
-                .permission(PreferenceBinding::JsonPointer { pointer: "/permissions" }),
-        ))
     }
 }
 ```
 
-Most harnesses should not implement lifecycle orchestration directly. The default `HarnessIntegration` methods detect the binary, derive paths, concatenate managed surfaces, run preflight, detect drift, import, apply, and verify by walking the declared artifacts and settings in order. Override a lifecycle method only when a harness has genuinely unusual behavior and document why in the integration file.
+Most harnesses should not implement lifecycle orchestration directly. The default `HarnessIntegration` methods detect the binary, derive paths, concatenate managed surfaces, run preflight, detect drift, import, apply, and verify by walking the declared artifacts in order. Declare settings as the final artifact when they share a native config file with MCPs. Override a lifecycle method only when a harness has genuinely unusual behavior and document why in the integration file.
 
 Use existing integrations as models:
 
@@ -175,11 +172,11 @@ Return the new `HarnessKind` variant. This is the harness type, not necessarily 
 
 ### `supports_skills`, `supports_commands`, `supports_mcp`, and `supports_subagents`
 
-Return `false` for any profile artifact type the harness cannot represent. Unsupported artifact types are ignored by the integration: do not apply, verify, drift-check, import, or clear them. The defaults are `true` for existing harnesses.
+These capabilities are derived from the typed artifacts returned by `artifacts()`. Omit any profile artifact type the harness cannot represent. Unsupported artifact types are ignored by the integration: they are not applied, verified, drift-checked, imported, or cleared.
 
-For MCP specifically, returning `false` also tells app-layer drift setup not to validate the active profile's `mcps.json` for this harness.
+For MCP specifically, omitting `McpConfig` also tells app-layer drift setup not to validate the active profile's `mcps.json` for this harness.
 
-For sub-agents specifically, returning `false` tells app-layer drift setup not to validate active profile sub-agent definitions for this harness.
+For sub-agents specifically, omitting `SubagentsDirectory` tells app-layer drift setup not to validate active profile sub-agent definitions for this harness.
 
 ### `detect`
 
@@ -261,12 +258,12 @@ Apply a profile to the harness after shared transaction code has captured backup
 Rules:
 
 - create missing config directories
-- write profile instructions directly and symlink supported valid skills/command files from the resolved profile paths
+- write profile instructions directly and copy supported valid skills/command files from the resolved profile paths
 - render neutral sub-agents into native files, when the harness supports native sub-agents
 - patch native config files, preserving unrelated keys
 - translate neutral MCP definitions into native format, when the harness supports native MCP
 - honor `"default"` model/permission values by not mutating those native keys
-- write native config atomically with `write_text_atomic`
+- write native config atomically with `crate::file_system::write_text_atomic`
 
 Do not update lazyagents state here. State is app-layer behavior.
 
@@ -278,7 +275,7 @@ Verification failures trigger rollback. Keep errors clear and path-specific.
 
 ## Artifact Support And MCP Rules
 
-Skill, command, sub-agent, and MCP support are optional per harness. If the harness has no native support for one of these artifact types, the integration should not apply, verify, drift-check, import, or clear it. Returning `agents: None` from `import_from_harness` preserves existing profile sub-agents during `--save-changes` and `create --harness`. Returning `mcp_definitions: None` from `import_from_harness` preserves existing profile MCPs during those same workflows.
+Skill, command, sub-agent, and MCP support are optional per harness. If the harness has no native support for one of these artifact types, the integration should not apply, verify, drift-check, import, or clear it. Returning `agents: None` from `import_from_harness` preserves existing profile sub-agents during `--save-changes` and `new --harness`. Returning `mcp_definitions: None` from `import_from_harness` preserves existing profile MCPs during those same workflows.
 
 For harnesses with native MCP support, use `crate::profile::mcp::read_mcp_definitions` to parse profile MCP definitions.
 
@@ -287,9 +284,11 @@ Current neutral transports:
 - `stdio`
 - `http`
 
-HTTP MCP URLs must start with `http://` or `https://`. Disabled MCP entries are validated and emitted to native config as disabled entries. If a harness supports native MCP but cannot represent a specific MCP definition, apply must fail so rollback can restore the previous harness state.
+HTTP MCP URLs must start with `http://` or `https://`. Disabled MCP entries are emitted only when the native global schema supports them. If a harness cannot represent a definition, preflight must fail before backup. Claude is the current disabled-state exception because its disablement lists are project-specific.
 
-When a native MCP format separates literal HTTP headers from environment-backed headers, preserve the neutral contract by round-tripping values like `"$TOKEN"` as environment references.
+Reject native forms that the neutral contract cannot preserve. Current rejected forms include Gemini SSE and mixed transports, Gemini and OpenCode compound or embedded substitution syntax, OpenCode global or per-agent MCP tool restrictions, Codex duplicate `env`/`env_vars` or header sources, Codex noncanonical approval-policy shapes, and malformed Claude or Codex MCP `args`. A plain string that activates native environment or file substitution is not a neutral literal and must fail in preflight.
+
+Plain neutral strings are literal. Environment references use `{"env":"NAME"}` and must round trip through native reference syntax. Reject native fields that would lose authentication, security, timeout, working-directory, or tool-restriction meaning.
 
 ## Native Config Rules
 
@@ -305,7 +304,7 @@ When a harness uses compound native settings for a single profile preference, do
 
 Do not implement backup, rollback, or active state updates inside integrations.
 
-Do not implement locking inside integrations. Mutating product workflows acquire the lazyagents home lock before they call integration code.
+Do not implement locking inside integrations. Command entry points acquire the LazyAgents home lock before any workflow that can mutate data or recover an interrupted profile transaction.
 
 The flow is:
 
@@ -336,8 +335,8 @@ cargo test
 Before considering the integration done, confirm:
 
 - explicit `use --harness <new>` fails when the binary is not detected
-- `use --all` applies only when the harness is detected
-- `create --harness <new>` imports without mutating harness state
+- `use --all` applies only when the harness is detected and applies one instance per shared native config alias group
+- `new --harness <new>` imports without mutating harness state
 - applying an empty profile clears stale skills, commands, and supported MCPs
 - applying invalid MCP config fails without updating state for harnesses that support MCP, and is ignored by harnesses that do not
 - apply failure rolls back managed files and native config

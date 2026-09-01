@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum HarnessKind {
@@ -100,23 +100,10 @@ pub struct HarnessInstance {
 }
 
 impl HarnessInstance {
-    pub fn alias_key(&self) -> (HarnessKind, PathBuf) {
-        (self.kind, normalize_path_lexically(&self.config_dir))
+    pub fn alias_key(&self) -> anyhow::Result<(HarnessKind, PathBuf)> {
+        Ok((
+            self.kind,
+            crate::file_system::resolve_path_identity(&self.config_dir)?,
+        ))
     }
-}
-
-pub fn normalize_path_lexically(path: &Path) -> PathBuf {
-    use std::path::Component;
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
 }

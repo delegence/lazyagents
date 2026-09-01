@@ -27,6 +27,11 @@ macro_rules! define_standard_harness_tests {
         }
 
         #[test]
+        fn test_rollback_restores_active_profile_without_drift() {
+            $crate::integrations::test_suite::template::test_rollback_restores_active_profile_without_drift(&<$adapter>::default());
+        }
+
+        #[test]
         fn test_import_reads_managed_state_and_dereferences_symlinks() {
             $crate::integrations::test_suite::template::test_import_reads_managed_state_and_dereferences_symlinks(&<$adapter>::default());
         }
@@ -145,9 +150,14 @@ pub mod template {
         .unwrap();
     }
 
-    pub fn assert_symlink_to(link: PathBuf, target: PathBuf) {
-        assert!(link.is_symlink(), "not a symlink: {}", link.display());
-        assert_eq!(fs::read_link(&link).unwrap(), target);
+    pub fn assert_copied_file(target: PathBuf, source: PathBuf) {
+        assert!(target.is_file(), "not a regular file: {}", target.display());
+        assert!(
+            !target.is_symlink(),
+            "managed copy must not be a symlink: {}",
+            target.display()
+        );
+        assert_eq!(fs::read(&target).unwrap(), fs::read(&source).unwrap());
     }
 
     pub fn assert_instructions_applied(target: PathBuf, profile: &Path) {
@@ -178,6 +188,9 @@ pub mod template {
         }
         fn supports_mcp(&self) -> bool {
             self.integration().supports_mcp()
+        }
+        fn supports_disabled_mcp(&self) -> bool {
+            true
         }
         fn supports_nested_commands(&self) -> bool;
 
@@ -214,7 +227,7 @@ pub mod template {
             profile: &Path,
             relative: &str,
         ) {
-            assert_symlink_to(
+            assert_copied_file(
                 paths.commands_dir.join(relative),
                 profile.join("commands").join(relative),
             );
@@ -231,7 +244,7 @@ pub mod template {
         }
     }
 
-    fn use_profile_for_test<A: HarnessTestAdapter>(
+    pub fn use_profile_for_test<A: HarnessTestAdapter>(
         adapter: &A,
         fixture: &HarnessTestFixture,
         profile: &str,
@@ -288,14 +301,31 @@ pub mod template {
 
         let integration = adapter.integration();
         use_profile_for_test(adapter, &fixture, "full", DriftDecision::DiscardChanges).unwrap();
-        use_profile_for_test(adapter, &fixture, "empty", DriftDecision::DiscardChanges).unwrap();
-
         let paths = integration.paths(&fixture.env).unwrap();
         if adapter.supports_skills() {
-            assert!(fs::read_dir(&paths.skills_dir).unwrap().next().is_none());
+            fs::write(paths.skills_dir.join("writer/.hidden"), "keep").unwrap();
         }
         if adapter.supports_commands() {
-            assert!(fs::read_dir(&paths.commands_dir).unwrap().next().is_none());
+            fs::create_dir_all(paths.commands_dir.join("local-only")).unwrap();
+            fs::write(paths.commands_dir.join("local-only/.hidden"), "keep").unwrap();
+        }
+
+        use_profile_for_test(adapter, &fixture, "empty", DriftDecision::DiscardChanges).unwrap();
+
+        if adapter.supports_skills() {
+            assert_eq!(
+                fs::read_to_string(paths.skills_dir.join("writer/.hidden")).unwrap(),
+                "keep"
+            );
+            assert!(!paths.skills_dir.join("writer/SKILL.md").exists());
+            assert!(!crate::harness::fs::has_visible_entries(&paths.skills_dir).unwrap());
+        }
+        if adapter.supports_commands() {
+            assert_eq!(
+                fs::read_to_string(paths.commands_dir.join("local-only/.hidden")).unwrap(),
+                "keep"
+            );
+            assert!(!crate::harness::fs::has_visible_entries(&paths.commands_dir).unwrap());
         }
         if adapter.supports_mcp() {
             adapter.assert_mcp_cleared(&paths);
@@ -402,7 +432,7 @@ pub mod template {
             fs::read_to_string(&paths.instruction_target).unwrap(),
             "previous instructions"
         );
-        assert!(!fs::symlink_metadata(&paths.instruction_target)
+        assert!(fs::symlink_metadata(&paths.instruction_target)
             .unwrap()
             .file_type()
             .is_symlink());
@@ -414,6 +444,47 @@ pub mod template {
         }
         adapter.assert_native_settings_preserved(&paths);
         assert!(!fixture.home.join("state.json").exists());
+    }
+
+    pub fn test_rollback_restores_active_profile_without_drift<A: HarnessTestAdapter>(adapter: &A) {
+        if !adapter.supports_mcp() {
+            return;
+        }
+
+        let fixture = HarnessTestFixture::new(adapter.bin_name());
+        let active = fixture.profile("active");
+        add_skill(&active, "writer");
+        add_command(&active, "plan.md");
+        let target = fixture.profile("target");
+        fs::write(
+            target.join("mcps.json"),
+            r#"[{"name":"bad","transport":"stdio"}]"#,
+        )
+        .unwrap();
+
+        use_profile_for_test(adapter, &fixture, "active", DriftDecision::DiscardChanges).unwrap();
+        let error =
+            use_profile_for_test(adapter, &fixture, "target", DriftDecision::DiscardChanges)
+                .unwrap_err();
+        assert!(format!("{error:#}").contains("requires command"));
+
+        let integration = adapter.integration();
+        let paths = integration.paths(&fixture.env).unwrap();
+        let drift = integration
+            .detect_drift(
+                &ProfileRef {
+                    name: ProfileName::parse("active").unwrap(),
+                    path: active,
+                    harness_id: integration.instance_id().to_string(),
+                },
+                &paths,
+            )
+            .unwrap();
+        assert!(
+            drift.is_clean(),
+            "rollback should restore a drift-clean active profile, got {:?}",
+            drift.items
+        );
     }
 
     pub fn test_import_reads_managed_state_and_dereferences_symlinks<A: HarnessTestAdapter>(
@@ -606,15 +677,19 @@ pub mod template {
         add_command(&profile, "plan.md");
         adapter.write_profile_config(&profile);
 
-        fs::write(
-            profile.join("mcps.json"),
+        let mcp_profile = if adapter.supports_disabled_mcp() {
             r#"[
-  {"name":"local","transport":"stdio","command":"server","args":["--x"],"env":{"TOKEN":"$TOKEN"}},
-  {"name":"remote","transport":"http","url":"https://mcp.example","headers":{"Authorization":"$TOKEN","X-Literal":"abc"}},
+  {"name":"local","transport":"stdio","command":"server","args":["--x"],"env":{"TOKEN":{"env":"TOKEN"}}},
+  {"name":"remote","transport":"http","url":"https://mcp.example","headers":{"Authorization":{"env":"TOKEN"},"X-Literal":"abc"}},
   {"name":"disabled","enabled":false,"transport":"stdio","command":"draft-server"}
-]"#,
-        )
-        .unwrap();
+]"#
+        } else {
+            r#"[
+  {"name":"local","transport":"stdio","command":"server","args":["--x"],"env":{"TOKEN":{"env":"TOKEN"}}},
+  {"name":"remote","transport":"http","url":"https://mcp.example","headers":{"Authorization":{"env":"TOKEN"},"X-Literal":"abc"}}
+]"#
+        };
+        fs::write(profile.join("mcps.json"), mcp_profile).unwrap();
 
         let integration = adapter.integration();
         let paths = integration.paths(&fixture.env).unwrap();
@@ -625,9 +700,9 @@ pub mod template {
 
         assert_instructions_applied(paths.instruction_target.clone(), &profile);
         if adapter.supports_skills() {
-            assert_symlink_to(
-                paths.skills_dir.join("writer"),
-                profile.join("skills").join("writer"),
+            assert_copied_file(
+                paths.skills_dir.join("writer/SKILL.md"),
+                profile.join("skills/writer/SKILL.md"),
             );
         }
         if adapter.supports_commands() {
@@ -653,6 +728,29 @@ pub mod template {
 
         let state_str = fs::read_to_string(fixture.home.join("state.json")).unwrap();
         assert!(state_str.contains(&format!("\"{}\": \"work\"", integration.instance_id())));
+
+        if adapter.supports_skills() {
+            fs::write(paths.skills_dir.join("writer/SKILL.md"), "native edit").unwrap();
+            assert_eq!(
+                fs::read_to_string(profile.join("skills/writer/SKILL.md")).unwrap(),
+                "",
+                "editing a harness copy must not edit the profile"
+            );
+            let drift = integration
+                .detect_drift(
+                    &ProfileRef {
+                        name: ProfileName::parse("work").unwrap(),
+                        path: profile,
+                        harness_id: integration.instance_id().to_string(),
+                    },
+                    &paths,
+                )
+                .unwrap();
+            assert!(
+                !drift.is_clean(),
+                "editing a copied skill should produce drift"
+            );
+        }
     }
 
     pub fn test_nested_commands_behavior<A: HarnessTestAdapter>(adapter: &A) {

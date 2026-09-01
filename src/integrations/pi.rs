@@ -2,8 +2,9 @@ use anyhow::Result;
 use serde_json::{json, Map, Value};
 
 use crate::harness::artifact::{
-    CommandMode, CommandsDirectory, HarnessArtifact, InstructionFile, JsonConfigFile, NativeConfig,
-    PreferenceBinding, PreferenceCodec, PreferenceKind, SettingsPreferences, SkillsDirectory,
+    non_default_string, CommandMode, CommandsDirectory, HarnessArtifact, InstructionFile,
+    JsonConfigFile, NativeConfig, PreferenceBinding, PreferenceCodec, PreferenceKind,
+    SettingsPreferences, SkillsDirectory,
 };
 use crate::harness::integration::{
     AppEnvironment, HarnessConfigPaths, HarnessIntegration, ImportedPreference, ProfileRef,
@@ -15,14 +16,6 @@ pub struct PiIntegration;
 impl HarnessIntegration for PiIntegration {
     fn kind(&self) -> HarnessKind {
         HarnessKind::Pi
-    }
-
-    fn supports_mcp(&self) -> bool {
-        false
-    }
-
-    fn supports_subagents(&self) -> bool {
-        false
     }
 
     fn default_config_dir(&self, env: &AppEnvironment) -> std::path::PathBuf {
@@ -47,18 +40,15 @@ impl HarnessIntegration for PiIntegration {
             Box::new(SkillsDirectory::new(|paths| &paths.skills_dir)),
             Box::new(CommandsDirectory::new(
                 |paths| &paths.commands_dir,
-                CommandMode::FlatSymlink,
+                CommandMode::FlatCopy,
             )),
+            Box::new(
+                SettingsPreferences::new(
+                    JsonConfigFile::new(|paths| &paths.settings_file).label("Pi settings JSON"),
+                )
+                .model(PreferenceBinding::Custom(Box::new(PiModelCodec))),
+            ),
         ]
-    }
-
-    fn settings(&self) -> Option<Box<dyn crate::harness::artifact::HarnessSettings>> {
-        Some(Box::new(
-            SettingsPreferences::new(
-                JsonConfigFile::new(|paths| &paths.settings_file).label("Pi settings JSON"),
-            )
-            .model(PreferenceBinding::Custom(Box::new(PiModelCodec))),
-        ))
     }
 }
 
@@ -67,7 +57,7 @@ struct PiModelCodec;
 impl PreferenceCodec for PiModelCodec {
     fn import(&self, config: &NativeConfig) -> Result<ImportedPreference> {
         Ok(ImportedPreference::new(import_pi_model_preference(
-            json_config_object(config)?,
+            config.json_object("Pi JSON config")?,
         )))
     }
 
@@ -82,7 +72,24 @@ impl PreferenceCodec for PiModelCodec {
             profile_config.model_preference(&profile.harness_id),
             "Pi model preference",
         )? {
-            patch_pi_model_preference(json_config_object_mut(config)?, &model);
+            patch_pi_model_preference(config.json_object_mut("Pi JSON config")?, &model);
+        }
+        Ok(())
+    }
+
+    fn verify(&self, config: &NativeConfig, expected: Value) -> Result<()> {
+        let Some(expected) = non_default_string(expected, "Pi model preference")? else {
+            return Ok(());
+        };
+        let settings = config.json_object("Pi JSON config")?;
+        let actual_model = settings.get("defaultModel").and_then(Value::as_str);
+        if let Some((provider, model)) = qualified_pi_model(&expected) {
+            let actual_provider = settings.get("defaultProvider").and_then(Value::as_str);
+            if actual_provider != Some(provider) || actual_model != Some(model) {
+                anyhow::bail!("applied Pi model preference does not match the profile");
+            }
+        } else if actual_model != Some(expected.as_str()) {
+            anyhow::bail!("applied Pi model preference does not match the profile");
         }
         Ok(())
     }
@@ -98,42 +105,19 @@ fn import_pi_model_preference(settings: &Map<String, Value>) -> Value {
     }
 }
 
-fn json_config_object(config: &NativeConfig) -> Result<&Map<String, Value>> {
-    let NativeConfig::Json(Value::Object(document)) = config else {
-        anyhow::bail!("Pi JSON config must be an object");
-    };
-    Ok(document)
-}
-
-fn json_config_object_mut(config: &mut NativeConfig) -> Result<&mut Map<String, Value>> {
-    let NativeConfig::Json(value) = config else {
-        anyhow::bail!("Pi JSON config must be an object");
-    };
-    if !value.is_object() {
-        *value = Value::Object(Map::new());
-    }
-    value
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("Pi JSON config must be an object"))
-}
-
 fn patch_pi_model_preference(document: &mut Map<String, Value>, model: &str) {
-    if let Some((provider, model)) = model.split_once('/') {
-        if !provider.trim().is_empty() && !model.trim().is_empty() {
-            document.insert("defaultProvider".to_string(), json!(provider));
-            document.insert("defaultModel".to_string(), json!(model));
-            return;
-        }
+    if let Some((provider, model)) = qualified_pi_model(model) {
+        document.insert("defaultProvider".to_string(), json!(provider));
+        document.insert("defaultModel".to_string(), json!(model));
+        return;
     }
     document.insert("defaultModel".to_string(), json!(model));
 }
 
-fn non_default_string(value: Value, label: &str) -> Result<Option<String>> {
-    match value {
-        Value::String(value) if value == "default" => Ok(None),
-        Value::String(value) => Ok(Some(value)),
-        other => anyhow::bail!("{label} must be a string, got {other}"),
-    }
+fn qualified_pi_model(value: &str) -> Option<(&str, &str)> {
+    value
+        .split_once('/')
+        .filter(|(provider, model)| !provider.trim().is_empty() && !model.trim().is_empty())
 }
 
 #[cfg(test)]
@@ -231,5 +215,45 @@ mod tests {
 
         assert_eq!(document.get("defaultProvider"), Some(&json!("anthropic")));
         assert_eq!(document.get("defaultModel"), Some(&json!("gpt-5")));
+    }
+
+    #[test]
+    fn slash_edge_models_use_the_same_apply_and_verify_semantics() {
+        for model in ["/model", "provider/", "plain", "provider/model"] {
+            let mut document = serde_json::Map::new();
+            document.insert("defaultProvider".to_string(), json!("existing"));
+            patch_pi_model_preference(&mut document, model);
+            PiModelCodec
+                .verify(&NativeConfig::Json(Value::Object(document)), json!(model))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn profile_use_verifies_plain_model_with_existing_provider() {
+        use crate::app::use_profile::DriftDecision;
+        use crate::integrations::test_suite::template::{use_profile_for_test, HarnessTestFixture};
+
+        let adapter = PiAdapter;
+        let fixture = HarnessTestFixture::new("pi");
+        let profile = fixture.profile("work");
+        crate::integrations::test_suite::template::write_config(
+            &profile,
+            r#"{"name":"work","models":{"pi":"gpt-5"}}"#,
+        );
+        let paths = adapter.integration().paths(&fixture.env).unwrap();
+        fs::create_dir_all(&paths.config_dir).unwrap();
+        fs::write(
+            &paths.settings_file,
+            r#"{"defaultProvider":"anthropic","defaultModel":"old"}"#,
+        )
+        .unwrap();
+
+        use_profile_for_test(&adapter, &fixture, "work", DriftDecision::DiscardChanges).unwrap();
+
+        let applied: Value =
+            serde_json::from_str(&fs::read_to_string(paths.settings_file).unwrap()).unwrap();
+        assert_eq!(applied["defaultProvider"], "anthropic");
+        assert_eq!(applied["defaultModel"], "gpt-5");
     }
 }

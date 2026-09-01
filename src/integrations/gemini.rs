@@ -6,9 +6,12 @@ use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 use toml_edit::{value, DocumentMut, Item};
 
+use crate::file_system::write_text_atomic;
 use crate::harness::agents::{
-    harness_scoped_value, remove_string, remove_value, select_harness_value,
-    split_markdown_frontmatter, RenderedAgent, SubAgent,
+    merge_harness_override, normalize_tool_permissions_with_allow_list,
+    parse_native_markdown_agent, render_native_markdown, select_harness_value, tools_to_allow_list,
+    validate_lowercase_agent_slug, validate_merged_markdown_agent, yaml_key,
+    NativeAgentParseOptions, NativeAgentRole, SubAgent,
 };
 use crate::harness::artifact::{
     CommandCodec, CommandMode, CommandsDirectory, HarnessArtifact, InstructionFile, JsonConfigFile,
@@ -17,13 +20,12 @@ use crate::harness::artifact::{
 };
 use crate::harness::commands::profile_commands_recursive;
 use crate::harness::drift::DriftItem;
-use crate::harness::fs::import_files_recursive;
+use crate::harness::fs::import_files_recursive_filtered;
 use crate::harness::integration::{
     AppEnvironment, HarnessConfigPaths, HarnessIntegration, ImportedFile, ProfileRef,
 };
 use crate::harness::kind::HarnessKind;
-use crate::harness::managed::write_text_atomic;
-use crate::profile::mcp::{McpDefinition, McpTransport};
+use crate::profile::mcp::{McpDefinition, McpTransport, McpValue};
 
 pub struct GeminiIntegration;
 
@@ -64,21 +66,18 @@ impl HarnessIntegration for GeminiIntegration {
                 JsonConfigFile::new(|paths| &paths.settings_file).label("Gemini settings JSON"),
                 GeminiMcpCodec,
             )),
+            Box::new(
+                SettingsPreferences::new(
+                    JsonConfigFile::new(|paths| &paths.settings_file).label("Gemini settings JSON"),
+                )
+                .model(PreferenceBinding::JsonStringPointer {
+                    pointer: "/model/name",
+                })
+                .permission(PreferenceBinding::JsonStringPointer {
+                    pointer: "/general/defaultApprovalMode",
+                }),
+            ),
         ]
-    }
-
-    fn settings(&self) -> Option<Box<dyn crate::harness::artifact::HarnessSettings>> {
-        Some(Box::new(
-            SettingsPreferences::new(
-                JsonConfigFile::new(|paths| &paths.settings_file).label("Gemini settings JSON"),
-            )
-            .model(PreferenceBinding::JsonPointer {
-                pointer: "/model/name",
-            })
-            .permission(PreferenceBinding::JsonPointer {
-                pointer: "/general/defaultApprovalMode",
-            }),
-        ))
     }
 }
 
@@ -112,7 +111,7 @@ impl SubagentCodec for GeminiSubagentCodec {
     }
 
     fn render(&self, agent: &SubAgent) -> Result<String> {
-        Ok(render_gemini_agent(agent)?.contents)
+        render_gemini_agent(agent)
     }
 
     fn should_import(&self, path: &Path) -> bool {
@@ -124,7 +123,24 @@ impl SubagentCodec for GeminiSubagentCodec {
             .file_stem()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow::anyhow!("invalid agent path {}", path.display()))?;
-        native_markdown_to_neutral(contents, fallback_name, "gemini")
+        let agent = parse_native_markdown_agent(
+            contents,
+            fallback_name,
+            "gemini",
+            NativeAgentParseOptions {
+                require_name: false,
+                permission_key: None,
+                max_turns_key: Some("max_turns"),
+                role: Some(NativeAgentRole {
+                    key: "kind",
+                    accepted: "local",
+                    required: false,
+                }),
+            },
+            normalize_tool_permissions_with_allow_list,
+        )?;
+        validate_lowercase_agent_slug(&agent.name, "Gemini", b"0123456789_")?;
+        Ok(agent)
     }
 }
 
@@ -132,11 +148,20 @@ struct GeminiMcpCodec;
 
 impl McpCodec for GeminiMcpCodec {
     fn import(&self, config: &NativeConfig) -> Result<Vec<McpDefinition>> {
-        import_gemini_mcps(json_config_object(config)?)
+        import_gemini_mcps(config.json_object("Gemini JSON config")?)
     }
 
     fn apply(&self, config: &mut NativeConfig, definitions: &[McpDefinition]) -> Result<()> {
-        patch_gemini_mcps(json_config_object_mut(config)?, definitions)
+        patch_gemini_mcps(config.json_object_mut("Gemini JSON config")?, definitions)
+    }
+
+    fn preflight_apply(&self, config: &NativeConfig, definitions: &[McpDefinition]) -> Result<()> {
+        crate::profile::mcp::reject_native_reference_literals(definitions, "Gemini", |value| {
+            contains_gemini_substitution(value)
+        })?;
+        reject_gemini_direct_substitutions(definitions)?;
+        import_gemini_mcps(config.json_object("Gemini JSON config")?)?;
+        Ok(())
     }
 }
 
@@ -229,18 +254,17 @@ fn import_gemini_commands(path: &Path) -> Result<Vec<ImportedFile>> {
     if !path.exists() {
         return Ok(commands);
     }
-    for file in import_files_recursive(path, path)? {
-        if file
-            .relative_path
+    for file in import_files_recursive_filtered(path, path, &|relative| {
+        relative
             .extension()
             .is_some_and(|extension| extension == "toml")
-        {
-            let command_path = path.join(&file.relative_path);
-            commands.push(ImportedFile {
-                relative_path: toml_command_to_markdown(&file.relative_path),
-                contents: read_gemini_command_prompt(&command_path)?.into_bytes(),
-            });
-        }
+    })? {
+        let command_path = path.join(&file.relative_path);
+        commands.push(ImportedFile {
+            relative_path: toml_command_to_markdown(&file.relative_path),
+            contents: read_gemini_command_prompt(&command_path)?.into_bytes(),
+            unix_mode: None,
+        });
     }
     commands.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
     Ok(commands)
@@ -271,8 +295,9 @@ fn toml_command_to_markdown(relative: &Path) -> PathBuf {
     path
 }
 
-fn render_gemini_agent(agent: &SubAgent) -> Result<RenderedAgent> {
-    let mut map = serde_yaml::Mapping::new();
+fn render_gemini_agent(agent: &SubAgent) -> Result<String> {
+    validate_lowercase_agent_slug(&agent.name, "Gemini", b"0123456789_")?;
+    let mut map = crate::yaml::Mapping::new();
     map.insert(yaml_key("name"), agent.name.clone().into());
     map.insert(yaml_key("description"), agent.description.clone().into());
     map.insert(yaml_key("kind"), "local".into());
@@ -282,146 +307,22 @@ fn render_gemini_agent(agent: &SubAgent) -> Result<RenderedAgent> {
     if let Some(tools) = agent.tools.as_ref() {
         map.insert(yaml_key("tools"), tools_to_allow_list(tools));
     }
-    if let Some(permission) = select_harness_value(agent.permission.as_ref(), "gemini") {
-        map.insert(yaml_key("permission"), permission.clone());
-    }
     if let Some(max_turns) = agent.max_turns {
         map.insert(
-            yaml_key("maxTurns"),
-            serde_yaml::Value::Number(max_turns.into()),
+            yaml_key("max_turns"),
+            crate::yaml::Value::Number(max_turns.into()),
         );
     }
     merge_harness_override(&mut map, agent, "gemini")?;
-    Ok(RenderedAgent {
-        relative_path: PathBuf::from(format!("{}.md", agent.name)),
-        contents: render_native_markdown(map, &agent.body)?,
-    })
-}
-
-fn native_markdown_to_neutral(
-    text: &str,
-    fallback_name: &str,
-    harness_id: &str,
-) -> Result<SubAgent> {
-    let (frontmatter, body) = split_markdown_frontmatter(text)?;
-    let mut map = serde_yaml::from_str::<serde_yaml::Mapping>(frontmatter)?;
-    let name = remove_string(&mut map, "name")?.unwrap_or_else(|| fallback_name.to_string());
-    let description = remove_string(&mut map, "description")?
-        .ok_or_else(|| anyhow::anyhow!("native agent is missing description"))?;
-    let body = body.trim().to_string();
-    let model = harness_scoped_value(harness_id, remove_value(&mut map, "model"));
-    let tools = remove_value(&mut map, "tools").map(normalize_tools_for_profile);
-    let permission = harness_scoped_value(
-        harness_id,
-        remove_value(&mut map, "permission").or_else(|| remove_value(&mut map, "permissionMode")),
-    );
-    let max_turns = remove_value(&mut map, "maxTurns")
-        .or_else(|| remove_value(&mut map, "max_turns"))
-        .and_then(|value| value.as_u64());
-    remove_value(&mut map, "kind");
-    remove_value(&mut map, "mode");
-    let mut harness = BTreeMap::new();
-    if !map.is_empty() {
-        harness.insert(harness_id.to_string(), serde_yaml::Value::Mapping(map));
+    if map
+        .get(yaml_key("kind"))
+        .and_then(crate::yaml::Value::as_str)
+        != Some("local")
+    {
+        anyhow::bail!("Gemini agent {} must have kind local", agent.name);
     }
-    Ok(SubAgent {
-        name,
-        description,
-        model,
-        tools,
-        permission,
-        max_turns,
-        harness,
-        body,
-    })
-}
-
-fn render_native_markdown(map: serde_yaml::Mapping, body: &str) -> Result<String> {
-    let yaml = serde_yaml::to_string(&map)?;
-    Ok(format!(
-        "---\n{}---\n{}\n",
-        yaml.strip_prefix("---\n").unwrap_or(&yaml),
-        body
-    ))
-}
-
-fn merge_harness_override(
-    map: &mut serde_yaml::Mapping,
-    agent: &SubAgent,
-    harness_id: &str,
-) -> Result<()> {
-    let Some(serde_yaml::Value::Mapping(override_map)) = agent.harness.get(harness_id) else {
-        return Ok(());
-    };
-    for (key, value) in override_map {
-        if !matches!(key, serde_yaml::Value::String(_)) {
-            anyhow::bail!("{harness_id} harness override keys must be strings");
-        }
-        map.insert(key.clone(), value.clone());
-    }
-    Ok(())
-}
-
-fn tools_to_allow_list(value: &serde_yaml::Value) -> serde_yaml::Value {
-    match value {
-        serde_yaml::Value::Mapping(map) => serde_yaml::Value::Sequence(
-            map.iter()
-                .filter_map(|(key, val)| {
-                    let key = key.as_str()?;
-                    if tool_is_allowed(val) {
-                        Some(serde_yaml::Value::String(key.to_string()))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-fn normalize_tools_for_profile(value: serde_yaml::Value) -> serde_yaml::Value {
-    match value {
-        serde_yaml::Value::Mapping(map) => {
-            let mut out = serde_yaml::Mapping::new();
-            for (key, value) in map {
-                let normalized = match value {
-                    serde_yaml::Value::Bool(true) => serde_yaml::Value::String("allow".to_string()),
-                    serde_yaml::Value::Bool(false) => serde_yaml::Value::String("deny".to_string()),
-                    other => other,
-                };
-                out.insert(key, normalized);
-            }
-            serde_yaml::Value::Mapping(out)
-        }
-        serde_yaml::Value::Sequence(items) => {
-            let mut out = serde_yaml::Mapping::new();
-            for item in items {
-                if let Some(tool) = item.as_str() {
-                    out.insert(
-                        yaml_key(tool),
-                        serde_yaml::Value::String("allow".to_string()),
-                    );
-                }
-            }
-            serde_yaml::Value::Mapping(out)
-        }
-        other => other,
-    }
-}
-
-fn tool_is_allowed(value: &serde_yaml::Value) -> bool {
-    match value {
-        serde_yaml::Value::Bool(value) => *value,
-        serde_yaml::Value::String(value) => {
-            matches!(value.as_str(), "allow" | "allowed" | "true" | "yes")
-        }
-        _ => false,
-    }
-}
-
-fn yaml_key(key: &str) -> serde_yaml::Value {
-    serde_yaml::Value::String(key.to_string())
+    validate_merged_markdown_agent(&map, "Gemini", true, "max_turns")?;
+    render_native_markdown(map, &agent.body)
 }
 
 fn set_nested_value(document: &mut Map<String, Value>, path: &[&str], value: Value) -> Result<()> {
@@ -443,6 +344,7 @@ fn set_nested_value(document: &mut Map<String, Value>, path: &[&str], value: Val
 
 fn import_gemini_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefinition>> {
     let mut servers = Vec::new();
+    let allowed = gemini_allowed_mcps(document)?;
     let excluded = gemini_excluded_mcps(document)?;
     let Some(mcp_servers) = document.get("mcpServers") else {
         return Ok(Vec::new());
@@ -455,21 +357,56 @@ fn import_gemini_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefinition
         let Some(table) = item.as_object() else {
             anyhow::bail!("Gemini MCP server {name} must be an object");
         };
-        let enabled = !excluded.contains(name);
-        if let Some(command) = table.get("command").and_then(Value::as_str) {
+        let enabled = allowed
+            .as_ref()
+            .is_none_or(|allowed| allowed.contains(name))
+            && !excluded.contains(name);
+        let allowed_fields = ["command", "args", "env", "httpUrl", "url", "headers"];
+        if let Some(field) = table
+            .keys()
+            .find(|field| !allowed_fields.contains(&field.as_str()))
+        {
+            anyhow::bail!(
+                "Gemini MCP server {name} uses unsupported field {field}; import or replacement would lose native security settings"
+            );
+        }
+        let command = table.get("command");
+        let http_url = table.get("httpUrl");
+        let sse_url = table.get("url");
+        if sse_url.is_some() {
+            anyhow::bail!(
+                "Gemini MCP server {name} uses SSE field url, which the neutral MCP schema cannot represent"
+            );
+        }
+        if command.is_some() && http_url.is_some() {
+            anyhow::bail!("Gemini MCP server {name} defines more than one transport");
+        }
+        if let Some(command) = command {
+            let command = command
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Gemini MCP {name} command must be a string"))?;
+            if contains_gemini_substitution(command) {
+                anyhow::bail!("Gemini MCP {name} command contains native substitution syntax");
+            }
+            let args = string_array(table.get("args"), "Gemini MCP args")?;
+            if args.iter().any(|value| contains_gemini_substitution(value)) {
+                anyhow::bail!("Gemini MCP {name} args contain native substitution syntax");
+            }
             servers.push(json!({
                 "name": name,
                 "enabled": enabled,
                 "transport": "stdio",
                 "command": command,
-                "args": string_array(table.get("args"), "Gemini MCP args")?,
+                "args": args,
                 "env": string_object(table.get("env"), "Gemini MCP env")?,
             }));
-        } else if let Some(url) = table
-            .get("httpUrl")
-            .or_else(|| table.get("url"))
-            .and_then(Value::as_str)
-        {
+        } else if let Some(url) = http_url {
+            let url = url
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Gemini MCP {name} httpUrl must be a string"))?;
+            if contains_gemini_substitution(url) {
+                anyhow::bail!("Gemini MCP {name} httpUrl contains native substitution syntax");
+            }
             servers.push(json!({
                 "name": name,
                 "enabled": enabled,
@@ -489,6 +426,11 @@ fn patch_gemini_mcps(
     document: &mut Map<String, Value>,
     definitions: &[McpDefinition],
 ) -> Result<()> {
+    let previous_names = document
+        .get("mcpServers")
+        .and_then(Value::as_object)
+        .map(|servers| servers.keys().cloned().collect::<BTreeSet<_>>())
+        .unwrap_or_default();
     document.remove("mcpServers");
     if !definitions.is_empty() {
         let mut servers = Map::new();
@@ -498,13 +440,30 @@ fn patch_gemini_mcps(
         document.insert("mcpServers".to_string(), Value::Object(servers));
     }
 
-    let managed_names = definitions
+    let mut managed_names = definitions
         .iter()
-        .map(|definition| definition.name.as_str())
+        .map(|definition| definition.name.clone())
         .collect::<BTreeSet<_>>();
+    managed_names.extend(previous_names);
+
+    if let Some(previous_allowed) = gemini_allowed_mcps(document)? {
+        let mut allowed = previous_allowed
+            .into_iter()
+            .filter(|name| !managed_names.contains(name))
+            .collect::<Vec<_>>();
+        allowed.extend(
+            definitions
+                .iter()
+                .filter(|definition| definition.enabled)
+                .map(|definition| definition.name.clone()),
+        );
+        allowed.sort();
+        allowed.dedup();
+        set_nested_value(document, &["mcp", "allowed"], json!(allowed))?;
+    }
     let mut excluded = gemini_excluded_mcps(document)?
         .into_iter()
-        .filter(|name| !managed_names.contains(name.as_str()))
+        .filter(|name| !managed_names.contains(name))
         .collect::<Vec<_>>();
     for definition in definitions {
         if !definition.enabled {
@@ -525,36 +484,34 @@ fn patch_gemini_mcps(
     Ok(())
 }
 
-fn json_config_object(config: &NativeConfig) -> Result<&Map<String, Value>> {
-    let NativeConfig::Json(Value::Object(document)) = config else {
-        anyhow::bail!("Gemini JSON config must be an object");
+fn gemini_allowed_mcps(document: &Map<String, Value>) -> Result<Option<BTreeSet<String>>> {
+    let mcp = gemini_mcp_settings(document)?;
+    let Some(allowed) = mcp.and_then(|mcp| mcp.get("allowed")) else {
+        return Ok(None);
     };
-    Ok(document)
-}
-
-fn json_config_object_mut(config: &mut NativeConfig) -> Result<&mut Map<String, Value>> {
-    let NativeConfig::Json(value) = config else {
-        anyhow::bail!("Gemini JSON config must be an object");
-    };
-    if !value.is_object() {
-        *value = Value::Object(Map::new());
-    }
-    value
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("Gemini JSON config must be an object"))
+    Ok(Some(
+        string_array(Some(allowed), "Gemini mcp.allowed")?
+            .into_iter()
+            .collect(),
+    ))
 }
 
 fn gemini_excluded_mcps(document: &Map<String, Value>) -> Result<BTreeSet<String>> {
-    let Some(excluded) = document
-        .get("mcp")
-        .and_then(Value::as_object)
-        .and_then(|mcp| mcp.get("excluded"))
-    else {
+    let mcp = gemini_mcp_settings(document)?;
+    let Some(excluded) = mcp.and_then(|mcp| mcp.get("excluded")) else {
         return Ok(BTreeSet::new());
     };
     Ok(string_array(Some(excluded), "Gemini mcp.excluded")?
         .into_iter()
         .collect())
+}
+
+fn gemini_mcp_settings(document: &Map<String, Value>) -> Result<Option<&Map<String, Value>>> {
+    match document.get("mcp") {
+        Some(Value::Object(value)) => Ok(Some(value)),
+        Some(_) => anyhow::bail!("Gemini mcp setting must be an object"),
+        None => Ok(None),
+    }
 }
 
 fn string_array(value: Option<&Value>, label: &str) -> Result<Vec<String>> {
@@ -575,7 +532,7 @@ fn string_array(value: Option<&Value>, label: &str) -> Result<Vec<String>> {
         .collect()
 }
 
-fn string_object(value: Option<&Value>, label: &str) -> Result<BTreeMap<String, String>> {
+fn string_object(value: Option<&Value>, label: &str) -> Result<BTreeMap<String, McpValue>> {
     let Some(value) = value else {
         return Ok(BTreeMap::new());
     };
@@ -585,12 +542,80 @@ fn string_object(value: Option<&Value>, label: &str) -> Result<BTreeMap<String, 
     object
         .iter()
         .map(|(key, value)| {
-            value
+            let value = value
                 .as_str()
-                .map(|value| (key.clone(), value.to_string()))
-                .ok_or_else(|| anyhow::anyhow!("{label} values must be strings"))
+                .ok_or_else(|| anyhow::anyhow!("{label} values must be strings"))?;
+            let parsed = parse_gemini_env(value)?;
+            Ok((key.clone(), parsed))
         })
         .collect()
+}
+
+fn parse_gemini_env(value: &str) -> Result<McpValue> {
+    let exact = value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+        .filter(|name| !name.contains(":-"))
+        .or_else(|| value.strip_prefix('$'));
+    if let Some(name) = exact {
+        return McpValue::env(name);
+    }
+    #[cfg(windows)]
+    if let Some(name) = value
+        .strip_prefix('%')
+        .and_then(|value| value.strip_suffix('%'))
+    {
+        return McpValue::env(name);
+    }
+    if contains_gemini_substitution(value) {
+        anyhow::bail!("Gemini MCP value contains unrepresentable native substitution syntax");
+    }
+    Ok(McpValue::literal(value))
+}
+
+fn contains_gemini_substitution(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    for index in 0..bytes.len() {
+        if bytes[index] == b'$'
+            && bytes
+                .get(index + 1)
+                .is_some_and(|next| *next == b'{' || next.is_ascii_alphanumeric() || *next == b'_')
+        {
+            return true;
+        }
+        #[cfg(windows)]
+        if bytes[index] == b'%' {
+            if let Some(end) = value[index + 1..].find('%') {
+                let name = &value[index + 1..index + 1 + end];
+                if !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn reject_gemini_direct_substitutions(definitions: &[McpDefinition]) -> Result<()> {
+    for definition in definitions {
+        let values: Vec<&str> = match &definition.transport {
+            McpTransport::Stdio(stdio) => std::iter::once(stdio.command.as_str())
+                .chain(stdio.args.iter().map(String::as_str))
+                .collect(),
+            McpTransport::Http(http) => vec![http.url.as_str()],
+        };
+        if values.into_iter().any(contains_gemini_substitution) {
+            anyhow::bail!(
+                "Gemini MCP server {} contains a literal that matches native substitution syntax",
+                definition.name
+            );
+        }
+    }
+    Ok(())
 }
 
 impl McpDefinition {
@@ -603,18 +628,34 @@ impl McpDefinition {
                     map.insert("args".to_string(), json!(stdio.args));
                 }
                 if !stdio.env.is_empty() {
-                    map.insert("env".to_string(), json!(stdio.env));
+                    map.insert("env".to_string(), json!(render_gemini_env(&stdio.env)));
                 }
             }
             McpTransport::Http(http) => {
                 map.insert("httpUrl".to_string(), json!(http.url));
                 if !http.headers.is_empty() {
-                    map.insert("headers".to_string(), json!(http.headers));
+                    map.insert(
+                        "headers".to_string(),
+                        json!(render_gemini_env(&http.headers)),
+                    );
                 }
             }
         }
         Ok(Value::Object(map))
     }
+}
+
+fn render_gemini_env(values: &BTreeMap<String, McpValue>) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .map(|(key, value)| {
+            let value = match value {
+                McpValue::Literal(value) => value.clone(),
+                McpValue::Env(name) => format!("${{{name}}}"),
+            };
+            (key.clone(), value)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -684,7 +725,7 @@ mod tests {
                 serde_json::json!("auto_edit")
             );
             let mcp = import.mcp_definitions.as_ref().unwrap();
-            assert!(mcp.contains("\"Authorization\": \"$TOKEN\""));
+            assert!(mcp.contains("\"env\": \"TOKEN\""));
             assert!(mcp.contains("\"enabled\": false"));
         }
         fn setup_native_command_for_import(&self, paths: &HarnessConfigPaths) {
@@ -763,6 +804,79 @@ mod tests {
     crate::define_standard_harness_tests!(GeminiAdapter);
 
     #[test]
+    fn gemini_allowlist_and_exclusion_define_effective_enabled_state() {
+        let document = json!({
+            "mcpServers": {
+                "enabled": {"command": "x"},
+                "conflict": {"command": "x"},
+                "not-allowed": {"command": "x"}
+            },
+            "mcp": {
+                "allowed": ["enabled", "conflict"],
+                "excluded": ["conflict"]
+            }
+        });
+        let imported = import_gemini_mcps(document.as_object().unwrap()).unwrap();
+        assert!(
+            imported
+                .iter()
+                .find(|mcp| mcp.name == "enabled")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !imported
+                .iter()
+                .find(|mcp| mcp.name == "conflict")
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !imported
+                .iter()
+                .find(|mcp| mcp.name == "not-allowed")
+                .unwrap()
+                .enabled
+        );
+    }
+
+    #[test]
+    fn gemini_rejects_sse_mixed_transports_and_active_literal_substitutions() {
+        for server in [
+            json!({"url":"https://example.com"}),
+            json!({"command":"x","httpUrl":"https://example.com"}),
+            json!({"url":"https://sse","httpUrl":"https://http"}),
+        ] {
+            let native = json!({"mcpServers":{"x":server}});
+            assert!(import_gemini_mcps(native.as_object().unwrap()).is_err());
+        }
+        for value in ["$TOKEN", "Bearer $TOKEN", "${TOKEN:-fallback}"] {
+            let native = json!({"mcpServers":{"x":{"command":"x","env":{"TOKEN":value}}}});
+            if matches!(value, "$TOKEN") {
+                let imported = import_gemini_mcps(native.as_object().unwrap()).unwrap();
+                assert!(matches!(
+                    &imported[0].transport,
+                    McpTransport::Stdio(stdio) if matches!(stdio.env["TOKEN"], McpValue::Env(_))
+                ));
+            } else {
+                assert!(import_gemini_mcps(native.as_object().unwrap()).is_err());
+            }
+        }
+        let windows = json!({"mcpServers":{"x":{"command":"x","env":{"TOKEN":"%TOKEN%"}}}});
+        let imported = import_gemini_mcps(windows.as_object().unwrap()).unwrap();
+        #[cfg(windows)]
+        assert!(matches!(
+            &imported[0].transport,
+            McpTransport::Stdio(stdio) if matches!(stdio.env["TOKEN"], McpValue::Env(_))
+        ));
+        #[cfg(not(windows))]
+        assert!(matches!(
+            &imported[0].transport,
+            McpTransport::Stdio(stdio) if matches!(stdio.env["TOKEN"], McpValue::Literal(_))
+        ));
+    }
+
+    #[test]
     fn imports_nested_toml_commands_as_markdown_commands() {
         let temp = tempfile::tempdir().unwrap();
         let commands = temp.path().join("commands");
@@ -777,5 +891,82 @@ mod tests {
 
         assert_eq!(imported[0].relative_path, PathBuf::from("git/commit.md"));
         assert_eq!(imported[0].contents, b"write commit");
+    }
+
+    #[test]
+    fn renders_current_gemini_agent_fields() {
+        let agent = SubAgent {
+            name: "reviewer_2".to_string(),
+            description: "Reviews code".to_string(),
+            model: None,
+            tools: None,
+            permission: Some(crate::yaml::Value::String("ignored".to_string())),
+            max_turns: Some(12),
+            harness: BTreeMap::new(),
+            body: "Review carefully.".to_string(),
+        };
+
+        let rendered = render_gemini_agent(&agent).unwrap();
+
+        assert!(rendered.contains("max_turns: 12"));
+        assert!(!rendered.contains("maxTurns"));
+        assert!(!rendered.contains("permission:"));
+    }
+
+    #[test]
+    fn gemini_rejects_malformed_agent_override_after_merge() {
+        let mut harness = BTreeMap::new();
+        harness.insert(
+            "gemini".to_string(),
+            crate::yaml::from_str("max_turns: bad").unwrap(),
+        );
+        let agent = SubAgent {
+            name: "reviewer".to_string(),
+            description: "Reviews".to_string(),
+            model: None,
+            tools: None,
+            permission: None,
+            max_turns: None,
+            harness,
+            body: String::new(),
+        };
+        assert!(render_gemini_agent(&agent).is_err());
+    }
+
+    #[test]
+    fn gemini_import_rejects_names_the_renderer_cannot_emit() {
+        assert!(GeminiSubagentCodec
+            .parse(
+                Path::new("Reviewer.md"),
+                "---\ndescription: Reviews\nkind: local\n---\nBody\n"
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn gemini_mcp_environment_references_round_trip() {
+        let definitions = crate::profile::mcp::parse_mcp_definitions(
+            r#"[{"name":"x","transport":"stdio","command":"x","env":{"TOKEN":{"env":"TOKEN"}}}]"#,
+        )
+        .unwrap();
+        let mut config = NativeConfig::Json(json!({}));
+        GeminiMcpCodec.apply(&mut config, &definitions).unwrap();
+        assert_eq!(GeminiMcpCodec.import(&config).unwrap(), definitions);
+    }
+
+    #[test]
+    fn gemini_rejects_malformed_mcp_root_and_ambiguous_literals() {
+        for value in [json!("bad"), json!([]), json!(false), Value::Null] {
+            assert!(GeminiMcpCodec
+                .import(&NativeConfig::Json(json!({"mcp":value})))
+                .is_err());
+        }
+        let definitions = crate::profile::mcp::parse_mcp_definitions(
+            r#"[{"name":"x","transport":"stdio","command":"x","env":{"TOKEN":"${TOKEN}"}}]"#,
+        )
+        .unwrap();
+        assert!(GeminiMcpCodec
+            .preflight_apply(&NativeConfig::Json(json!({})), &definitions)
+            .is_err());
     }
 }

@@ -1,8 +1,8 @@
 use anyhow::Result;
 
-use crate::app::create_profile::{merge_shared_agent_skills, remove_imported_shared_skills};
+use crate::app::create_profile::{with_shared_skill_rollback, SharedSkillTransaction};
 use crate::app::harness_registry::HarnessRegistry;
-use crate::app::state::LazyagentsState;
+use crate::app::state::{active_profile_for_aliases, LazyagentsState};
 use crate::harness::apply::{
     apply_profile_to_harness_with_commit, ProfileUseResult, ProfileUseStatus,
 };
@@ -76,7 +76,7 @@ pub fn use_profile_workflow(
             let decision = match request.drift_decision {
                 Some(decision) => decision,
                 None => {
-                    let active = active_drift(integration.as_ref(), env, store)?;
+                    let active = active_drift(registry, integration.as_ref(), env, store)?;
                     if active.drift.is_clean() {
                         DriftDecision::DiscardChanges
                     } else {
@@ -113,7 +113,7 @@ pub fn use_profile_workflow(
             if request.drift_decision.is_none() {
                 let mut drifted = Vec::new();
                 for integration in &detected {
-                    let active = active_drift(integration.as_ref(), env, store)?;
+                    let active = active_drift(registry, integration.as_ref(), env, store)?;
                     if !active.drift.is_clean() {
                         drifted.push(HarnessDrift {
                             display_name: integration.display_name().to_string(),
@@ -170,9 +170,9 @@ fn apply_one(
 
     let state_path = env.lazyagents_home.join("state.json");
     let mut state = LazyagentsState::load(&state_path)?;
-    let active_profile = state
-        .active_profiles
-        .get(integration.instance_id())
+    let aliases = registry.aliases_for(env, integration)?;
+    let active_profile = active_profile_for_aliases(&state, &aliases)?
+        .as_ref()
         .map(|name| active_profile_for_drift(integration, store, name))
         .transpose()?;
     let drift = match active_profile.as_ref() {
@@ -180,6 +180,7 @@ fn apply_one(
         None => DriftReport::clean(),
     };
 
+    let mut shared_transaction = None;
     if !drift.is_clean() {
         match decision {
             DriftDecision::Cancel => {
@@ -189,28 +190,49 @@ fn apply_one(
                     alias_updates: Vec::new(),
                     profile: profile.clone(),
                     status: ProfileUseStatus::CancelledForDrift,
+                    warnings: Vec::new(),
                 });
             }
             DriftDecision::DiscardChanges => {}
             DriftDecision::SaveChanges => {
                 let mut imported = integration.import_from_harness(&paths)?;
-                let shared_skills = merge_shared_agent_skills(&mut imported.skills, env)?;
+                let shared_skills = SharedSkillTransaction::prepare(&mut imported.skills, env)?;
                 if let Some(active) = active_profile.as_ref() {
-                    store.apply_import(&active.name, integration.instance_id(), imported)?;
-                    remove_imported_shared_skills(&shared_skills)?;
+                    if let Err(error) =
+                        store.apply_import(&active.name, integration.instance_id(), imported)
+                    {
+                        return Err(with_shared_skill_rollback(error, shared_skills));
+                    }
+                    shared_transaction = Some(shared_skills);
                 }
             }
         }
     }
 
-    apply_profile_to_harness_with_commit(integration, env, store, profile, || {
-        for alias in registry.aliases_for(env, integration)? {
-            state.active_profiles.insert(alias, profile.clone());
-        }
-        state.save(&state_path)
-    })?;
-    let alias_updates = registry
-        .aliases_for(env, integration)?
+    if let Err(error) =
+        apply_profile_to_harness_with_commit(integration, env, store, profile, || {
+            for alias in &aliases {
+                state.active_profiles.insert(alias.clone(), profile.clone());
+            }
+            state.save(&state_path)
+        })
+    {
+        return Err(match shared_transaction {
+            Some(transaction) => with_shared_skill_rollback(error, transaction),
+            None => error,
+        });
+    }
+    let warnings = shared_transaction
+        .map(SharedSkillTransaction::commit)
+        .and_then(Result::err)
+        .map(|error| {
+            format!(
+                "profile use committed, but imported shared-skill cleanup failed: {error}; do not retry the profile switch"
+            )
+        })
+        .into_iter()
+        .collect();
+    let alias_updates = aliases
         .into_iter()
         .filter(|alias| alias != integration.instance_id())
         .collect();
@@ -220,6 +242,7 @@ fn apply_one(
         alias_updates,
         profile: profile.clone(),
         status: ProfileUseStatus::Applied,
+        warnings,
     })
 }
 
@@ -229,15 +252,16 @@ struct ActiveDrift {
 }
 
 fn active_drift(
+    registry: &dyn HarnessRegistry,
     integration: &dyn HarnessIntegration,
     env: &AppEnvironment,
     store: &ProfileStore,
 ) -> Result<ActiveDrift> {
     let paths = integration.paths(env)?;
     let state = LazyagentsState::load(&env.lazyagents_home.join("state.json"))?;
-    let active_profile = state
-        .active_profiles
-        .get(integration.instance_id())
+    let aliases = registry.aliases_for(env, integration)?;
+    let active_profile = active_profile_for_aliases(&state, &aliases)?
+        .as_ref()
         .map(|name| active_profile_for_drift(integration, store, name))
         .transpose()?;
     match active_profile.as_ref() {
@@ -295,8 +319,11 @@ fn detected_integrations(
     env: &AppEnvironment,
 ) -> Result<Vec<Box<dyn HarnessIntegration>>> {
     let mut detected = Vec::new();
+    let mut seen_aliases = std::collections::BTreeSet::new();
     for integration in registry.all(env)? {
-        if matches!(integration.detect(env)?, HarnessDetection::Detected { .. }) {
+        if matches!(integration.detect(env)?, HarnessDetection::Detected { .. })
+            && seen_aliases.insert(integration.instance().alias_key()?)
+        {
             detected.push(integration);
         }
     }
@@ -320,6 +347,7 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeIntegration {
+        id: String,
         kind: HarnessKind,
         root: PathBuf,
         detected: bool,
@@ -334,6 +362,7 @@ mod tests {
     impl FakeIntegration {
         fn new(kind: HarnessKind, root: PathBuf) -> Self {
             Self {
+                id: kind.id().to_string(),
                 kind,
                 root,
                 detected: true,
@@ -344,6 +373,11 @@ mod tests {
                 supports_subagents: true,
                 import_called: Cell::new(false),
             }
+        }
+
+        fn with_id(mut self, id: &str) -> Self {
+            self.id = id.to_string();
+            self
         }
 
         fn without_mcp(mut self) -> Self {
@@ -385,6 +419,20 @@ mod tests {
     impl HarnessIntegration for FakeIntegration {
         fn kind(&self) -> HarnessKind {
             self.kind
+        }
+
+        fn instance(&self) -> crate::harness::kind::HarnessInstance {
+            crate::harness::kind::HarnessInstance {
+                id: crate::harness::kind::HarnessInstanceId::parse(&self.id).unwrap(),
+                kind: self.kind,
+                display_name: self.id.clone(),
+                binary: "fake".to_string(),
+                config_dir: self.root.clone(),
+            }
+        }
+
+        fn instance_id(&self) -> &str {
+            &self.id
         }
 
         fn default_config_dir(&self, _env: &AppEnvironment) -> PathBuf {
@@ -433,7 +481,7 @@ mod tests {
             ]
         }
 
-        fn preflight(&self, _profile: &ProfileRef) -> Result<()> {
+        fn preflight(&self, _profile: &ProfileRef, _paths: &HarnessConfigPaths) -> Result<()> {
             Ok(())
         }
 
@@ -715,6 +763,58 @@ mod tests {
     }
 
     #[test]
+    fn shared_skill_quarantine_restores_on_apply_failure_and_retry_succeeds() {
+        let fixture = Fixture::new();
+        fixture.profile("active");
+        fixture.profile("target");
+        fixture.write_state(r#"{"active_profiles":{"codex":"active"}}"#);
+        let shared = fixture.env.user_home.join(".agents/skills/shared");
+        fs::create_dir_all(&shared).unwrap();
+        fs::write(shared.join("SKILL.md"), "shared").unwrap();
+
+        let failing = FakeCatalog {
+            integrations: vec![
+                FakeIntegration::new(HarnessKind::Codex, fixture.harness("codex"))
+                    .with_drift()
+                    .fail_apply(),
+            ],
+        };
+        assert!(use_profile_workflow(
+            &failing,
+            &fixture.env,
+            &fixture.store,
+            UseProfileRequest {
+                profile: ProfileName::parse("target").unwrap(),
+                target: UseProfileTarget::Harness("codex".to_string()),
+                drift_decision: Some(DriftDecision::SaveChanges)
+            },
+        )
+        .is_err());
+        assert_eq!(
+            fs::read_to_string(shared.join("SKILL.md")).unwrap(),
+            "shared"
+        );
+
+        let retry = FakeCatalog {
+            integrations: vec![
+                FakeIntegration::new(HarnessKind::Codex, fixture.harness("codex")).with_drift(),
+            ],
+        };
+        assert!(use_profile_workflow(
+            &retry,
+            &fixture.env,
+            &fixture.store,
+            UseProfileRequest {
+                profile: ProfileName::parse("target").unwrap(),
+                target: UseProfileTarget::Harness("codex".to_string()),
+                drift_decision: Some(DriftDecision::SaveChanges)
+            },
+        )
+        .is_ok());
+        assert!(!shared.exists());
+    }
+
+    #[test]
     fn state_save_failure_rolls_back_harness_surfaces() {
         let fixture = Fixture::new();
         fixture.profile("work");
@@ -804,6 +904,52 @@ mod tests {
         let state = LazyagentsState::load(&fixture.home.join("state.json")).unwrap();
         assert_eq!(state.active_profiles.get("codex").unwrap().as_str(), "work");
         assert!(!state.active_profiles.contains_key("claude"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn use_all_applies_shared_native_config_once() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = Fixture::new();
+        fixture.profile("work");
+        let physical = fixture.harness("shared-codex");
+        fs::create_dir_all(&physical).unwrap();
+        let first = fixture.harness("first-link");
+        let second = fixture.harness("second-link");
+        symlink(&physical, &first).unwrap();
+        symlink(&physical, &second).unwrap();
+        let registry = FakeCatalog {
+            integrations: vec![
+                FakeIntegration::new(HarnessKind::Codex, first.join("missing")).with_id("codex"),
+                FakeIntegration::new(HarnessKind::Codex, second.join("missing"))
+                    .with_id("codex-max"),
+            ],
+        };
+
+        let outcome = use_profile_workflow(
+            &registry,
+            &fixture.env,
+            &fixture.store,
+            UseProfileRequest {
+                profile: ProfileName::parse("work").unwrap(),
+                target: UseProfileTarget::All,
+                drift_decision: Some(DriftDecision::DiscardChanges),
+            },
+        )
+        .unwrap();
+
+        let UseProfileOutcome::All(results) = outcome else {
+            panic!("expected all result");
+        };
+        assert_eq!(results.applied.len(), 1);
+        assert_eq!(results.applied[0].harness, "codex");
+        assert_eq!(results.applied[0].alias_updates, ["codex-max"]);
+
+        let state = LazyagentsState::load(&fixture.home.join("state.json")).unwrap();
+        assert_eq!(state.active_profiles.len(), 2);
+        assert_eq!(state.active_profiles["codex"].as_str(), "work");
+        assert_eq!(state.active_profiles["codex-max"].as_str(), "work");
     }
 
     struct Fixture {

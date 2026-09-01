@@ -13,10 +13,11 @@ use crate::app::doctor::{
 };
 use crate::app::edit_profile::edit_profile_path;
 use crate::app::harness_registry::{
-    reset_settings, settings_path, BuiltInHarnessRegistry, HarnessRegistry,
+    ensure_settings, reset_settings, settings_path, BuiltInHarnessRegistry, HarnessRegistry,
 };
 use crate::app::inspect_profile::inspect_profile;
-use crate::app::state::{LazyagentsHomeLock, LazyagentsState};
+use crate::app::state::{active_profile_for_aliases, LazyagentsHomeLock, LazyagentsState};
+use crate::app::unset_profile::{unset_profile_workflow, UnsetProfileResult, UnsetProfileTarget};
 use crate::app::use_profile::{
     use_profile_workflow, DriftDecision, HarnessDrift, UseProfileOutcome, UseProfileRequest,
     UseProfileTarget,
@@ -26,7 +27,7 @@ use crate::harness::drift::DriftReport;
 use crate::harness::integration::{AppEnvironment, HarnessIntegration, ProfileRef};
 use crate::profile::{LazyagentsHome, ProfileName, ProfileStore};
 
-use args::{Cli, Command, UseTarget};
+use args::{Cli, Command, UnsetTarget, UseTarget};
 use render::{
     mcp_summary_count, render_artifact_status, render_json_value, render_path, render_path_in_text,
     render_string_list, render_validation_issues,
@@ -35,303 +36,430 @@ use render::{
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
     let home = LazyagentsHome::resolve()?;
-    let runtime_env = AppEnvironment::resolve(home.path().to_path_buf())?;
-    let home_path = home.path().to_path_buf();
-    let store = ProfileStore::new(home);
-    let registry = BuiltInHarnessRegistry;
+    let ctx = CliContext {
+        runtime_env: AppEnvironment::resolve(home.path().to_path_buf())?,
+        home_path: home.path().to_path_buf(),
+        store: ProfileStore::new(home),
+        registry: BuiltInHarnessRegistry,
+    };
 
     match cli.command {
-        None => {
-            Cli::command().print_help()?;
-            println!();
+        None => print_help()?,
+        Some(Command::Doctor) => {
+            let _lock = LazyagentsHomeLock::acquire(&ctx.home_path)?;
+            print_doctor(&ctx.runtime_env, &ctx.store)?
         }
-        Some(Command::Doctor) => print_doctor(&runtime_env, &store)?,
-        Some(Command::Settings(settings)) => match settings.command {
-            args::SettingsCommand::Reset(args) => {
-                let path = settings_path(&runtime_env);
-                if path.exists() && !args.yes && !confirm_settings_reset(&path)? {
-                    println!("Settings reset cancelled");
-                    return Ok(());
-                }
-                let _lock = LazyagentsHomeLock::acquire(&home_path)?;
-                let path = reset_settings(&runtime_env)?;
-                println!("Reset settings at {}", render_path(&path));
-            }
-        },
-        Some(Command::Create(args)) => {
-            let profile = ProfileName::parse(args.name)?;
-            let harness = args
-                .harness
-                .as_deref()
-                .map(|id| registry.require_id(&runtime_env, id))
-                .transpose()?;
-            let _lock = LazyagentsHomeLock::acquire(&home_path)?;
-            match create_profile(&registry, &runtime_env, &store, profile, harness)? {
-                CreateProfileResult::Created { profile, path } => {
-                    println!("Created profile {profile} at {}", path.display());
-                }
-                CreateProfileResult::Imported {
-                    profile,
-                    harness,
-                    path,
-                } => {
-                    println!(
-                        "Created profile {profile} from {harness} at {}",
-                        path.display()
-                    );
-                }
-            }
-        }
-        Some(Command::Show(args)) => {
-            let profile = ProfileName::parse(args.name)?;
-            let summary = inspect_profile(&store, &profile)?;
-            println!(
-                "Profile:  {} ({})",
-                summary
-                    .display_name
-                    .as_deref()
-                    .unwrap_or(summary.name.as_str()),
-                summary.name
-            );
-            println!("Location: {}", render_path(&summary.path));
-            if let Some(description) = summary
-                .description
-                .as_deref()
-                .filter(|description| !description.is_empty())
-            {
-                println!("Description: {description}");
-            }
-            println!();
-            println!("Resources:");
-            println!(
-                " Skills ({}): {}",
-                summary.valid_skills.len(),
-                render_resource_list(&summary.valid_skills)
-            );
-            println!(
-                " Commands ({}): {}",
-                summary.commands.len(),
-                render_resource_list(&summary.commands)
-            );
-            println!(
-                " Sub-agents ({}): {}",
-                summary.agents.len(),
-                render_resource_list(&summary.agents)
-            );
-            println!(
-                " MCPs ({}): {}",
-                mcp_summary_count(&summary.mcp_summary),
-                render_mcp_resource_list(&summary.mcp_summary)
-            );
-            println!();
-            println!("Preferences:");
-            println!(
-                " Model: {}",
-                render_preferences(&registry, &runtime_env, &summary.models)?
-            );
-            println!(
-                " Permission: {}",
-                render_preferences(&registry, &runtime_env, &summary.permissions)?
-            );
-            println!();
-            println!(
-                "Instructions: {}",
-                render_artifact_status(&summary.instruction_source)
-            );
-
-            let has_ignored = !summary.ignored_skills.is_empty()
-                || !summary.ignored_command_files.is_empty()
-                || !summary.ignored_agent_files.is_empty();
-            if has_ignored || !summary.validation_issues.is_empty() {
-                println!("\nIssues:");
-                if !summary.ignored_skills.is_empty() {
-                    println!(
-                        "Ignored Skill files: {}",
-                        render_string_list(&summary.ignored_skills)
-                    );
-                }
-                if !summary.ignored_command_files.is_empty() {
-                    println!(
-                        "Ignored Command files: {}",
-                        render_string_list(&summary.ignored_command_files)
-                    );
-                }
-                if !summary.ignored_agent_files.is_empty() {
-                    println!(
-                        "Ignored Sub-agent files: {}",
-                        render_string_list(&summary.ignored_agent_files)
-                    );
-                }
-                let other_issues = summary
-                    .validation_issues
-                    .into_iter()
-                    .filter(|issue| !is_rendered_ignored_artifact_issue(issue))
-                    .collect::<Vec<_>>();
-                if !other_issues.is_empty() {
-                    print!("{}", render_validation_issues(&other_issues));
-                }
-            }
-
-            let drift_reports = profile_drift_reports(&registry, &runtime_env, &store, &profile)?;
-            if !drift_reports.is_empty() {
-                println!();
-                for (index, (harness, drift)) in drift_reports.into_iter().enumerate() {
-                    if index > 0 {
-                        println!();
-                    }
-                    if index == 0 {
-                        println!("Changes:");
-                    }
-                    println!(" {}:", harness);
-                    print_drift_report(&drift, "  ", None);
-                }
-            }
-        }
-        Some(Command::Edit(args)) => {
-            let path = edit_profile_path(&store, &args.name)?;
-            if !open_editor_or_print_path(&path)? {
-                println!("{}", path.display());
-            }
-        }
-        Some(Command::Delete(args)) => {
-            ProfileName::parse(args.name.clone())?;
-            if !args.yes && !confirm_delete(&args.name)? {
-                println!("Delete cancelled");
-                return Ok(());
-            }
-            let _lock = LazyagentsHomeLock::acquire(&home_path)?;
-            let path = crate::app::delete_profile::delete_profile(
-                &registry,
-                &runtime_env,
-                &store,
-                &args.name,
-            )?;
-            println!("Deleted profile {} at {}", args.name, path.display());
-        }
-        Some(Command::Use(args)) => {
-            let requested_profile = ProfileName::parse(args.profile.clone())?;
-            args.validate()?;
-            let _lock = LazyagentsHomeLock::acquire(&home_path)?;
-            match args.target() {
-                UseTarget::Harness(harness_id) => {
-                    let id = registry.require_id(&runtime_env, &harness_id)?;
-                    let outcome = use_profile_workflow(
-                        &registry,
-                        &runtime_env,
-                        &store,
-                        UseProfileRequest {
-                            profile: requested_profile.clone(),
-                            target: UseProfileTarget::Harness(id.clone()),
-                            drift_decision: args.drift_decision(),
-                        },
-                    )?;
-                    let result = match outcome {
-                        UseProfileOutcome::Applied(result) => result,
-                        UseProfileOutcome::NeedsSingleHarnessDriftDecision {
-                            display_name,
-                            profile: active_profile,
-                            drift,
-                        } => {
-                            let decision = prompt_single_drift_decision(
-                                &display_name,
-                                &active_profile,
-                                &drift,
-                            )?;
-                            match use_profile_workflow(
-                                &registry,
-                                &runtime_env,
-                                &store,
-                                UseProfileRequest {
-                                    profile: requested_profile.clone(),
-                                    target: UseProfileTarget::Harness(id),
-                                    drift_decision: Some(decision),
-                                },
-                            )? {
-                                UseProfileOutcome::Applied(result) => result,
-                                _ => unreachable!(
-                                    "drift decision should complete single harness use"
-                                ),
-                            }
-                        }
-                        _ => unreachable!("single harness request returned all-harness outcome"),
-                    };
-                    match result.status {
-                        ProfileUseStatus::Applied => {
-                            println!(
-                                "Used profile {} with {}",
-                                result.profile, result.display_name
-                            );
-                            if !result.alias_updates.is_empty() {
-                                println!(
-                                    "Also marked {} active because they share configDir with {}",
-                                    result.alias_updates.join(", "),
-                                    result.harness
-                                );
-                            }
-                        }
-                        ProfileUseStatus::CancelledForDrift => {
-                            println!("Profile switch for {} cancelled", result.display_name);
-                        }
-                    }
-                }
-                UseTarget::All => {
-                    let outcome = use_profile_workflow(
-                        &registry,
-                        &runtime_env,
-                        &store,
-                        UseProfileRequest {
-                            profile: requested_profile.clone(),
-                            target: UseProfileTarget::All,
-                            drift_decision: args.drift_decision(),
-                        },
-                    )?;
-                    let results = match outcome {
-                        UseProfileOutcome::All(results) => results,
-                        UseProfileOutcome::NeedsAllHarnessDriftDecision { harnesses } => {
-                            let names = harnesses
-                                .iter()
-                                .map(|drift| drift.display_name.as_str())
-                                .collect::<Vec<_>>();
-                            if !prompt_all_drift_discard(&harnesses)? {
-                                anyhow::bail!("Profile switch for {} cancelled", names.join(", "));
-                            }
-                            match use_profile_workflow(
-                                &registry,
-                                &runtime_env,
-                                &store,
-                                UseProfileRequest {
-                                    profile: requested_profile.clone(),
-                                    target: UseProfileTarget::All,
-                                    drift_decision: Some(DriftDecision::DiscardChanges),
-                                },
-                            )? {
-                                UseProfileOutcome::All(results) => results,
-                                _ => {
-                                    unreachable!("discard decision should complete all harness use")
-                                }
-                            }
-                        }
-                        _ => unreachable!("all-harness request returned single-harness outcome"),
-                    };
-
-                    let mut summary = Vec::new();
-                    for res in results.applied {
-                        summary.push(format!("✅ {} applied", res.display_name));
-                    }
-                    for (_harness, display_name, e) in results.failures {
-                        summary.push(format!("❌ {} failed: {}", display_name, e));
-                    }
-
-                    println!("\nSummary:");
-                    for line in summary {
-                        println!("{}", line);
-                    }
-                }
-            }
-        }
+        Some(Command::Settings(args)) => run_settings(&ctx, args)?,
+        Some(Command::New(args)) => run_new(&ctx, args)?,
+        Some(Command::Show(args)) => run_show(&ctx, args)?,
+        Some(Command::Edit(args)) => run_edit(&ctx, args)?,
+        Some(Command::Delete(args)) => run_delete(&ctx, args)?,
+        Some(Command::Use(args)) => run_use(&ctx, args)?,
+        Some(Command::Unset(args)) => run_unset(&ctx, args)?,
     }
 
     Ok(())
+}
+
+struct CliContext {
+    runtime_env: AppEnvironment,
+    home_path: std::path::PathBuf,
+    store: ProfileStore,
+    registry: BuiltInHarnessRegistry,
+}
+
+fn acquire_mutation_lock(ctx: &CliContext) -> Result<LazyagentsHomeLock> {
+    let lock = LazyagentsHomeLock::acquire(&ctx.home_path)?;
+    crate::app::create_profile::recover_shared_skill_cleanup(&ctx.runtime_env)?;
+    Ok(lock)
+}
+
+fn print_help() -> Result<()> {
+    Cli::command().print_help()?;
+    println!();
+    Ok(())
+}
+
+fn run_settings(ctx: &CliContext, settings: args::SettingsArgs) -> Result<()> {
+    match settings.command {
+        args::SettingsCommand::Edit => {
+            let _lock = acquire_mutation_lock(ctx)?;
+            let path = ensure_settings(&ctx.runtime_env)?;
+            if !open_editor_or_print_path(&path)? {
+                println!("{}", render_path(&path));
+            }
+        }
+        args::SettingsCommand::Reset(args) => {
+            let path = settings_path(&ctx.runtime_env);
+            if path.exists() && !args.yes && !confirm_settings_reset(&path)? {
+                println!("Settings reset cancelled");
+                return Ok(());
+            }
+            let _lock = acquire_mutation_lock(ctx)?;
+            let path = reset_settings(&ctx.runtime_env)?;
+            println!("Reset settings at {}", render_path(&path));
+        }
+    }
+    Ok(())
+}
+
+fn run_new(ctx: &CliContext, args: args::NewArgs) -> Result<()> {
+    let profile = ProfileName::parse(args.name)?;
+    let harness = args
+        .harness
+        .as_deref()
+        .map(|id| ctx.registry.require_id(&ctx.runtime_env, id))
+        .transpose()?;
+    let _lock = acquire_mutation_lock(ctx)?;
+    match create_profile(
+        &ctx.registry,
+        &ctx.runtime_env,
+        &ctx.store,
+        profile,
+        harness,
+    )? {
+        CreateProfileResult::Created { profile, path } => {
+            println!("Created profile {profile} at {}", path.display());
+        }
+        CreateProfileResult::Imported {
+            profile,
+            harness,
+            path,
+            cleanup_warning,
+        } => {
+            println!(
+                "Created profile {profile} from {harness} at {}",
+                path.display()
+            );
+            if let Some(warning) = cleanup_warning {
+                eprintln!("Warning: {warning}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_show(ctx: &CliContext, args: args::ProfileArg) -> Result<()> {
+    let _lock = LazyagentsHomeLock::acquire(&ctx.home_path)?;
+    let profile = ProfileName::parse(args.name)?;
+    let summary = inspect_profile(&ctx.store, &profile)?;
+    println!(
+        "Profile:  {} ({})",
+        summary
+            .display_name
+            .as_deref()
+            .unwrap_or(summary.name.as_str()),
+        summary.name
+    );
+    println!("Location: {}", render_path(&summary.path));
+    if let Some(description) = summary
+        .description
+        .as_deref()
+        .filter(|description| !description.is_empty())
+    {
+        println!("Description: {description}");
+    }
+    println!();
+    println!("Resources:");
+    println!(
+        " Skills ({}): {}",
+        summary.valid_skills.len(),
+        render_resource_list(&summary.valid_skills)
+    );
+    println!(
+        " Commands ({}): {}",
+        summary.commands.len(),
+        render_resource_list(&summary.commands)
+    );
+    println!(
+        " Sub-agents ({}): {}",
+        summary.agents.len(),
+        render_resource_list(&summary.agents)
+    );
+    println!(
+        " MCPs ({}): {}",
+        mcp_summary_count(&summary.mcp_summary),
+        render_mcp_resource_list(&summary.mcp_summary)
+    );
+    println!();
+    println!("Preferences:");
+    println!(
+        " Model: {}",
+        render_preferences(&ctx.registry, &ctx.runtime_env, &summary.models)?
+    );
+    println!(
+        " Permission: {}",
+        render_preferences(&ctx.registry, &ctx.runtime_env, &summary.permissions)?
+    );
+    println!();
+    println!(
+        "Instructions: {}",
+        render_artifact_status(&summary.instruction_source)
+    );
+
+    let has_ignored = !summary.ignored_skills.is_empty()
+        || !summary.ignored_command_files.is_empty()
+        || !summary.ignored_agent_files.is_empty();
+    if has_ignored || !summary.validation_issues.is_empty() {
+        println!("\nIssues:");
+        if !summary.ignored_skills.is_empty() {
+            println!(
+                "Ignored Skill files: {}",
+                render_string_list(&summary.ignored_skills)
+            );
+        }
+        if !summary.ignored_command_files.is_empty() {
+            println!(
+                "Ignored Command files: {}",
+                render_string_list(&summary.ignored_command_files)
+            );
+        }
+        if !summary.ignored_agent_files.is_empty() {
+            println!(
+                "Ignored Sub-agent files: {}",
+                render_string_list(&summary.ignored_agent_files)
+            );
+        }
+        let other_issues = summary
+            .validation_issues
+            .into_iter()
+            .filter(|issue| !is_rendered_ignored_artifact_issue(issue))
+            .collect::<Vec<_>>();
+        if !other_issues.is_empty() {
+            print!("{}", render_validation_issues(&other_issues));
+        }
+    }
+
+    let drift_reports =
+        profile_drift_reports(&ctx.registry, &ctx.runtime_env, &ctx.store, &profile)?;
+    if !drift_reports.is_empty() {
+        println!();
+        for (index, (harness, drift)) in drift_reports.into_iter().enumerate() {
+            if index > 0 {
+                println!();
+            }
+            if index == 0 {
+                println!("Changes:");
+            }
+            println!(" {harness}:");
+            print_drift_report(&drift, "  ", None);
+        }
+    }
+    Ok(())
+}
+
+fn run_edit(ctx: &CliContext, args: args::ProfileArg) -> Result<()> {
+    let _lock = acquire_mutation_lock(ctx)?;
+    let path = edit_profile_path(&ctx.store, &args.name)?;
+    if !open_editor_or_print_path(&path)? {
+        println!("{}", path.display());
+    }
+    Ok(())
+}
+
+fn run_delete(ctx: &CliContext, args: args::DeleteArgs) -> Result<()> {
+    {
+        let _lock = acquire_mutation_lock(ctx)?;
+        crate::app::delete_profile::deletable_profile_path(
+            &ctx.registry,
+            &ctx.runtime_env,
+            &ctx.store,
+            &args.name,
+        )?;
+    }
+    if !args.yes && !confirm_delete(&args.name)? {
+        println!("Delete cancelled");
+        return Ok(());
+    }
+    let _lock = acquire_mutation_lock(ctx)?;
+    let path = crate::app::delete_profile::delete_profile(
+        &ctx.registry,
+        &ctx.runtime_env,
+        &ctx.store,
+        &args.name,
+    )?;
+    println!("Deleted profile {} at {}", args.name, path.display());
+    Ok(())
+}
+
+fn run_use(ctx: &CliContext, args: args::UseArgs) -> Result<()> {
+    let requested_profile = ProfileName::parse(args.profile.clone())?;
+    args.validate()?;
+    let _lock = acquire_mutation_lock(ctx)?;
+    match args.target() {
+        UseTarget::Harness(harness_id) => run_use_one(ctx, &args, requested_profile, harness_id),
+        UseTarget::All => run_use_all(ctx, &args, requested_profile),
+    }
+}
+
+fn run_use_one(
+    ctx: &CliContext,
+    args: &args::UseArgs,
+    requested_profile: ProfileName,
+    harness_id: String,
+) -> Result<()> {
+    let id = ctx.registry.require_id(&ctx.runtime_env, &harness_id)?;
+    let outcome = use_profile_workflow(
+        &ctx.registry,
+        &ctx.runtime_env,
+        &ctx.store,
+        UseProfileRequest {
+            profile: requested_profile.clone(),
+            target: UseProfileTarget::Harness(id.clone()),
+            drift_decision: args.drift_decision(),
+        },
+    )?;
+    let result = match outcome {
+        UseProfileOutcome::Applied(result) => result,
+        UseProfileOutcome::NeedsSingleHarnessDriftDecision {
+            display_name,
+            profile: active_profile,
+            drift,
+        } => {
+            let decision = prompt_single_drift_decision(&display_name, &active_profile, &drift)?;
+            match use_profile_workflow(
+                &ctx.registry,
+                &ctx.runtime_env,
+                &ctx.store,
+                UseProfileRequest {
+                    profile: requested_profile,
+                    target: UseProfileTarget::Harness(id),
+                    drift_decision: Some(decision),
+                },
+            )? {
+                UseProfileOutcome::Applied(result) => result,
+                _ => unreachable!("drift decision should complete single harness use"),
+            }
+        }
+        _ => unreachable!("single harness request returned all-harness outcome"),
+    };
+    match result.status {
+        ProfileUseStatus::Applied => {
+            println!(
+                "Used profile {} with {}",
+                result.profile, result.display_name
+            );
+            if !result.alias_updates.is_empty() {
+                println!(
+                    "Also marked {} active because they share configDir with {}",
+                    result.alias_updates.join(", "),
+                    result.harness
+                );
+            }
+            for warning in &result.warnings {
+                eprintln!("Warning: {warning}");
+            }
+        }
+        ProfileUseStatus::CancelledForDrift => {
+            println!("Profile switch for {} cancelled", result.display_name);
+        }
+    }
+    Ok(())
+}
+
+fn run_use_all(
+    ctx: &CliContext,
+    args: &args::UseArgs,
+    requested_profile: ProfileName,
+) -> Result<()> {
+    let outcome = use_profile_workflow(
+        &ctx.registry,
+        &ctx.runtime_env,
+        &ctx.store,
+        UseProfileRequest {
+            profile: requested_profile.clone(),
+            target: UseProfileTarget::All,
+            drift_decision: args.drift_decision(),
+        },
+    )?;
+    let results = match outcome {
+        UseProfileOutcome::All(results) => results,
+        UseProfileOutcome::NeedsAllHarnessDriftDecision { harnesses } => {
+            let names = harnesses
+                .iter()
+                .map(|drift| drift.display_name.as_str())
+                .collect::<Vec<_>>();
+            if !prompt_all_drift_discard(&harnesses)? {
+                anyhow::bail!("Profile switch for {} cancelled", names.join(", "));
+            }
+            match use_profile_workflow(
+                &ctx.registry,
+                &ctx.runtime_env,
+                &ctx.store,
+                UseProfileRequest {
+                    profile: requested_profile,
+                    target: UseProfileTarget::All,
+                    drift_decision: Some(DriftDecision::DiscardChanges),
+                },
+            )? {
+                UseProfileOutcome::All(results) => results,
+                _ => unreachable!("discard decision should complete all harness use"),
+            }
+        }
+        _ => unreachable!("all-harness request returned single-harness outcome"),
+    };
+
+    let failure_count = results.failures.len();
+    println!("\nSummary:");
+    for result in results.applied {
+        println!("✅ {} applied", result.display_name);
+        for warning in result.warnings {
+            println!("⚠️  {warning}");
+        }
+    }
+    for (_harness, display_name, error) in results.failures {
+        println!("❌ {display_name} failed: {error}");
+    }
+    if failure_count > 0 {
+        anyhow::bail!("profile switch failed for {failure_count} harness(es)");
+    }
+    Ok(())
+}
+
+fn run_unset(ctx: &CliContext, args: args::UnsetArgs) -> Result<()> {
+    args.validate()?;
+    let (target, inactive_name) = match args.target() {
+        UnsetTarget::Harness(id) => {
+            let id = ctx.registry.require_id(&ctx.runtime_env, &id)?;
+            let display_name = ctx
+                .registry
+                .get(&ctx.runtime_env, &id)?
+                .expect("validated harness id must resolve")
+                .display_name()
+                .to_string();
+            (UnsetProfileTarget::Harness(id), Some(display_name))
+        }
+        UnsetTarget::All => (UnsetProfileTarget::All, None),
+    };
+    let _lock = acquire_mutation_lock(ctx)?;
+    let results = unset_profile_workflow(&ctx.registry, &ctx.runtime_env, target)?;
+    if results.is_empty() {
+        match inactive_name {
+            Some(display_name) => {
+                println!("No active profile for {display_name}; harness files were left unchanged")
+            }
+            None => println!("No active profiles; harness files were left unchanged"),
+        }
+    } else {
+        for result in results {
+            print_unset_result(&result);
+        }
+    }
+    Ok(())
+}
+
+fn print_unset_result(result: &UnsetProfileResult) {
+    println!(
+        "Deactivated profile {} for {}; harness files were left unchanged",
+        result.profile, result.display_name
+    );
+    if !result.alias_updates.is_empty() {
+        println!(
+            "Also deactivated {} because they share configDir with {}",
+            result.alias_updates.join(", "),
+            result.harness
+        );
+    }
 }
 
 fn render_resource_list(values: &[String]) -> String {
@@ -351,11 +479,20 @@ fn render_mcp_resource_list(summary: &crate::profile::McpSummary) -> String {
 }
 
 fn is_rendered_ignored_artifact_issue(issue: &crate::profile::validation::ValidationIssue) -> bool {
+    use crate::profile::validation::ValidationCategory;
+
     matches!(
-        (issue.category.as_str(), issue.message.as_str()),
-        ("Skills", "ignored skill directory or missing SKILL.md")
-            | ("Commands", "ignored non-markdown command file")
-            | ("Sub-agents", "ignored non-markdown sub-agent file")
+        (issue.category, issue.message.as_str()),
+        (
+            ValidationCategory::Skills,
+            "ignored skill directory or missing SKILL.md"
+        ) | (
+            ValidationCategory::Commands,
+            "ignored non-markdown command file"
+        ) | (
+            ValidationCategory::Subagents,
+            "ignored non-markdown sub-agent file"
+        )
     )
 }
 
@@ -388,7 +525,8 @@ fn profile_drift_reports(
     let state = LazyagentsState::load(&runtime_env.lazyagents_home.join("state.json"))?;
     let mut reports = Vec::new();
     for integration in registry.all(runtime_env)? {
-        if state.active_profiles.get(integration.instance_id()) != Some(profile) {
+        let aliases = registry.aliases_for(runtime_env, integration.as_ref())?;
+        if active_profile_for_aliases(&state, &aliases)?.as_ref() != Some(profile) {
             continue;
         }
         if !matches!(
@@ -655,6 +793,9 @@ fn print_profile_doctor(report: &DoctorReport) {
     };
 
     println!("{} Profiles{suffix}", report.profiles.marker);
+    if report.profiles.lines.is_empty() {
+        println!("   No profiles yet. Create one with: lazyagents new <profile-name>");
+    }
     for line in &report.profiles.lines {
         println!("{line}");
     }

@@ -5,19 +5,21 @@ use anyhow::Result;
 use serde_json::{json, Map, Value};
 
 use crate::harness::agents::{
-    harness_scoped_value, remove_string, remove_value, select_harness_value,
-    split_markdown_frontmatter, RenderedAgent, SubAgent,
+    merge_harness_override, normalize_tool_permissions, parse_native_markdown_agent,
+    render_native_markdown, select_harness_value, tools_to_allow_list,
+    validate_lowercase_agent_slug, validate_merged_markdown_agent, NativeAgentParseOptions,
+    SubAgent,
 };
 use crate::harness::artifact::{
-    CommandMode, CommandsDirectory, HarnessArtifact, InstructionFile, JsonConfigFile, McpCodec,
-    McpConfig, NativeConfig, PreferenceBinding, PreferenceCodec, PreferenceKind,
-    SettingsPreferences, SkillsDirectory, SubagentCodec, SubagentsDirectory,
+    non_default_value, CommandMode, CommandsDirectory, HarnessArtifact, InstructionFile,
+    JsonConfigFile, McpCodec, McpConfig, NativeConfig, PreferenceBinding, PreferenceCodec,
+    PreferenceKind, SettingsPreferences, SkillsDirectory, SubagentCodec, SubagentsDirectory,
 };
 use crate::harness::integration::{
     AppEnvironment, HarnessConfigPaths, HarnessIntegration, ImportedPreference, ProfileRef,
 };
 use crate::harness::kind::HarnessKind;
-use crate::profile::mcp::{McpDefinition, McpTransport};
+use crate::profile::mcp::{McpDefinition, McpTransport, McpValue};
 
 pub struct ClaudeIntegration;
 
@@ -31,15 +33,10 @@ impl HarnessIntegration for ClaudeIntegration {
     }
 
     fn paths_from_config_dir(&self, config_dir: std::path::PathBuf) -> Result<HarnessConfigPaths> {
-        let mcp_file_name = config_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| format!("{name}.json"))
-            .unwrap_or_else(|| ".claude.json".to_string());
         let mcp_file = config_dir
             .parent()
             .unwrap_or_else(|| std::path::Path::new(""))
-            .join(mcp_file_name);
+            .join(".claude.json");
         Ok(HarnessConfigPaths {
             instruction_target: config_dir.join("CLAUDE.md"),
             skills_dir: config_dir.join("skills"),
@@ -51,13 +48,22 @@ impl HarnessIntegration for ClaudeIntegration {
         })
     }
 
+    fn paths_from_custom_config_dir(
+        &self,
+        config_dir: std::path::PathBuf,
+    ) -> Result<HarnessConfigPaths> {
+        let mut paths = self.paths_from_config_dir(config_dir.clone())?;
+        paths.mcp_file = config_dir.join(".claude.json");
+        Ok(paths)
+    }
+
     fn artifacts(&self) -> Vec<Box<dyn HarnessArtifact>> {
         vec![
             Box::new(InstructionFile::new(|paths| &paths.instruction_target)),
             Box::new(SkillsDirectory::new(|paths| &paths.skills_dir)),
             Box::new(CommandsDirectory::new(
                 |paths| &paths.commands_dir,
-                CommandMode::RecursiveSymlink,
+                CommandMode::RecursiveCopy,
             )),
             Box::new(SubagentsDirectory::new(
                 |paths| &paths.agents_dir,
@@ -67,19 +73,14 @@ impl HarnessIntegration for ClaudeIntegration {
                 JsonConfigFile::new(|paths| &paths.mcp_file).label("Claude MCP JSON"),
                 ClaudeMcpCodec,
             )),
+            Box::new(
+                SettingsPreferences::new(
+                    JsonConfigFile::new(|paths| &paths.settings_file).label("Claude settings JSON"),
+                )
+                .model(PreferenceBinding::JsonStringPointer { pointer: "/model" })
+                .permission(PreferenceBinding::Custom(Box::new(ClaudePermissionCodec))),
+            ),
         ]
-    }
-
-    fn settings(&self) -> Option<Box<dyn crate::harness::artifact::HarnessSettings>> {
-        Some(Box::new(
-            SettingsPreferences::new(
-                JsonConfigFile::new(|paths| &paths.settings_file).label("Claude settings JSON"),
-            )
-            .model(PreferenceBinding::JsonPointer {
-                pointer: "/primaryModel",
-            })
-            .permission(PreferenceBinding::Custom(Box::new(ClaudePermissionCodec))),
-        ))
     }
 }
 
@@ -91,7 +92,7 @@ impl SubagentCodec for ClaudeSubagentCodec {
     }
 
     fn render(&self, agent: &SubAgent) -> Result<String> {
-        Ok(render_claude_agent(agent)?.contents)
+        render_claude_agent(agent)
     }
 
     fn should_import(&self, path: &Path) -> bool {
@@ -103,7 +104,20 @@ impl SubagentCodec for ClaudeSubagentCodec {
             .file_stem()
             .and_then(|name| name.to_str())
             .ok_or_else(|| anyhow::anyhow!("invalid agent path {}", path.display()))?;
-        native_markdown_to_neutral(contents, fallback_name, "claude", true)
+        let agent = parse_native_markdown_agent(
+            contents,
+            fallback_name,
+            "claude",
+            NativeAgentParseOptions {
+                require_name: true,
+                permission_key: Some("permissionMode"),
+                max_turns_key: Some("maxTurns"),
+                role: None,
+            },
+            normalize_tool_permissions,
+        )?;
+        validate_lowercase_agent_slug(&agent.name, "Claude", &[])?;
+        Ok(agent)
     }
 }
 
@@ -111,11 +125,11 @@ struct ClaudeMcpCodec;
 
 impl McpCodec for ClaudeMcpCodec {
     fn import(&self, config: &NativeConfig) -> Result<Vec<McpDefinition>> {
-        import_claude_mcps(json_config_object(config)?)
+        import_claude_mcps(config.json_object("Claude JSON config")?)
     }
 
     fn apply(&self, config: &mut NativeConfig, definitions: &[McpDefinition]) -> Result<()> {
-        let document = json_config_object_mut(config)?;
+        let document = config.json_object_mut("Claude JSON config")?;
         document.remove("mcpServers");
         if !definitions.is_empty() {
             let mut servers = Map::new();
@@ -126,6 +140,21 @@ impl McpCodec for ClaudeMcpCodec {
         }
         Ok(())
     }
+
+    fn preflight_apply(&self, config: &NativeConfig, definitions: &[McpDefinition]) -> Result<()> {
+        if let Some(definition) = definitions.iter().find(|definition| !definition.enabled) {
+            anyhow::bail!(
+                "Claude cannot apply disabled MCP server {} to global configuration; Claude only supports disabledMcpServers in project settings",
+                definition.name
+            );
+        }
+        crate::profile::mcp::reject_native_reference_literals(definitions, "Claude", |value| {
+            contains_claude_expansion(value)
+        })?;
+        reject_claude_untyped_expansions(definitions)?;
+        import_claude_mcps(config.json_object("Claude JSON config")?)?;
+        Ok(())
+    }
 }
 
 struct ClaudePermissionCodec;
@@ -133,7 +162,8 @@ struct ClaudePermissionCodec;
 impl PreferenceCodec for ClaudePermissionCodec {
     fn import(&self, config: &NativeConfig) -> Result<ImportedPreference> {
         Ok(ImportedPreference::new(
-            json_config_object(config)?
+            config
+                .json_object("Claude JSON config")?
                 .get("permissions")
                 .cloned()
                 .unwrap_or_else(|| json!("default")),
@@ -150,14 +180,37 @@ impl PreferenceCodec for ClaudePermissionCodec {
         if let Some(permission) =
             non_default_value(profile_config.permission_preference(&profile.harness_id))
         {
-            patch_claude_permissions(json_config_object_mut(config)?, permission)?;
+            patch_claude_permissions(config.json_object_mut("Claude JSON config")?, permission)?;
+        }
+        Ok(())
+    }
+
+    fn verify(&self, config: &NativeConfig, expected: Value) -> Result<()> {
+        let Some(expected) = non_default_value(expected) else {
+            return Ok(());
+        };
+        let permissions = config
+            .json_object("Claude JSON config")?
+            .get("permissions")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let actual = match &expected {
+            Value::String(_) => permissions
+                .get("defaultMode")
+                .cloned()
+                .unwrap_or(Value::Null),
+            _ => permissions,
+        };
+        if actual != expected {
+            anyhow::bail!("applied Claude permission preference does not match the profile");
         }
         Ok(())
     }
 }
 
-fn render_claude_agent(agent: &SubAgent) -> Result<RenderedAgent> {
-    let mut map = serde_yaml::Mapping::new();
+fn render_claude_agent(agent: &SubAgent) -> Result<String> {
+    validate_lowercase_agent_slug(&agent.name, "Claude", &[])?;
+    let mut map = crate::yaml::Mapping::new();
     map.insert("name".into(), agent.name.clone().into());
     map.insert("description".into(), agent.description.clone().into());
     if let Some(model) = select_harness_value(agent.model.as_ref(), "claude") {
@@ -172,129 +225,12 @@ fn render_claude_agent(agent: &SubAgent) -> Result<RenderedAgent> {
     if let Some(max_turns) = agent.max_turns {
         map.insert(
             "maxTurns".into(),
-            serde_yaml::Value::Number(max_turns.into()),
+            crate::yaml::Value::Number(max_turns.into()),
         );
     }
     merge_harness_override(&mut map, agent, "claude")?;
-    Ok(RenderedAgent {
-        relative_path: std::path::PathBuf::from(format!("{}.md", agent.name)),
-        contents: render_native_markdown(map, &agent.body)?,
-    })
-}
-
-fn native_markdown_to_neutral(
-    text: &str,
-    fallback_name: &str,
-    harness_id: &str,
-    require_name: bool,
-) -> Result<SubAgent> {
-    let (frontmatter, body) = split_markdown_frontmatter(text)?;
-    let mut map = serde_yaml::from_str::<serde_yaml::Mapping>(frontmatter)?;
-    let name = match remove_string(&mut map, "name")? {
-        Some(name) => name,
-        None if require_name => anyhow::bail!("native agent is missing name"),
-        None => fallback_name.to_string(),
-    };
-    let description = remove_string(&mut map, "description")?
-        .ok_or_else(|| anyhow::anyhow!("native agent is missing description"))?;
-    let body = body.trim().to_string();
-    let model = harness_scoped_value(harness_id, remove_value(&mut map, "model"));
-    let tools = remove_value(&mut map, "tools").map(normalize_tools_for_profile);
-    let permission = harness_scoped_value(
-        harness_id,
-        remove_value(&mut map, "permission").or_else(|| remove_value(&mut map, "permissionMode")),
-    );
-    let max_turns = remove_value(&mut map, "maxTurns")
-        .or_else(|| remove_value(&mut map, "max_turns"))
-        .and_then(|value| value.as_u64());
-    remove_value(&mut map, "mode");
-    remove_value(&mut map, "kind");
-    let mut harness = BTreeMap::new();
-    if !map.is_empty() {
-        harness.insert(harness_id.to_string(), serde_yaml::Value::Mapping(map));
-    }
-    Ok(SubAgent {
-        name,
-        description,
-        model,
-        tools,
-        permission,
-        max_turns,
-        harness,
-        body,
-    })
-}
-
-fn render_native_markdown(map: serde_yaml::Mapping, body: &str) -> Result<String> {
-    let yaml = serde_yaml::to_string(&map)?;
-    Ok(format!(
-        "---\n{}---\n{}\n",
-        yaml.strip_prefix("---\n").unwrap_or(&yaml),
-        body
-    ))
-}
-
-fn merge_harness_override(
-    map: &mut serde_yaml::Mapping,
-    agent: &SubAgent,
-    harness_id: &str,
-) -> Result<()> {
-    let Some(serde_yaml::Value::Mapping(override_map)) = agent.harness.get(harness_id) else {
-        return Ok(());
-    };
-    for (key, value) in override_map {
-        if !matches!(key, serde_yaml::Value::String(_)) {
-            anyhow::bail!("{harness_id} harness override keys must be strings");
-        }
-        map.insert(key.clone(), value.clone());
-    }
-    Ok(())
-}
-
-fn tools_to_allow_list(value: &serde_yaml::Value) -> serde_yaml::Value {
-    match value {
-        serde_yaml::Value::Mapping(map) => serde_yaml::Value::Sequence(
-            map.iter()
-                .filter_map(|(key, val)| {
-                    let key = key.as_str()?;
-                    if tool_is_allowed(val) {
-                        Some(serde_yaml::Value::String(key.to_string()))
-                    } else {
-                        None
-                    }
-                })
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-fn normalize_tools_for_profile(value: serde_yaml::Value) -> serde_yaml::Value {
-    match value {
-        serde_yaml::Value::Mapping(map) => {
-            let mut out = serde_yaml::Mapping::new();
-            for (key, value) in map {
-                let normalized = match value {
-                    serde_yaml::Value::Bool(true) => serde_yaml::Value::String("allow".to_string()),
-                    serde_yaml::Value::Bool(false) => serde_yaml::Value::String("deny".to_string()),
-                    other => other,
-                };
-                out.insert(key, normalized);
-            }
-            serde_yaml::Value::Mapping(out)
-        }
-        other => other,
-    }
-}
-
-fn tool_is_allowed(value: &serde_yaml::Value) -> bool {
-    match value {
-        serde_yaml::Value::Bool(value) => *value,
-        serde_yaml::Value::String(value) => {
-            matches!(value.as_str(), "allow" | "allowed" | "true" | "yes")
-        }
-        _ => false,
-    }
+    validate_merged_markdown_agent(&map, "Claude", true, "maxTurns")?;
+    render_native_markdown(map, &agent.body)
 }
 
 fn import_claude_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefinition>> {
@@ -310,36 +246,58 @@ fn import_claude_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefinition
         let Some(table) = item.as_object() else {
             anyhow::bail!("Claude MCP server {name} must be an object");
         };
-        let enabled = table
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
-
-        let mcp_type = table.get("type").and_then(Value::as_str).unwrap_or("stdio");
+        let mcp_type = match table.get("type") {
+            Some(Value::String(value)) => value.as_str(),
+            Some(_) => anyhow::bail!("Claude MCP server {name} type must be a string"),
+            None => "stdio",
+        };
+        let allowed: &[&str] = if mcp_type == "stdio" {
+            &["type", "command", "args", "env"]
+        } else {
+            &["type", "url", "headers"]
+        };
+        if let Some(field) = table
+            .keys()
+            .find(|field| !allowed.contains(&field.as_str()))
+        {
+            anyhow::bail!(
+                "Claude MCP server {name} uses unsupported field {field}; import or replacement would lose native security settings"
+            );
+        }
 
         if mcp_type == "stdio" {
             let command = table.get("command").and_then(Value::as_str).unwrap_or("");
-            let args = table
-                .get("args")
-                .and_then(Value::as_array)
-                .map(|array| {
-                    array
-                        .iter()
-                        .map(|value| {
-                            value.as_str().map(str::to_string).ok_or_else(|| {
-                                anyhow::anyhow!("Claude MCP {name} args must be strings")
-                            })
+            if contains_claude_expansion(command) {
+                anyhow::bail!(
+                    "Claude MCP {name} command contains an unrepresentable environment expansion"
+                );
+            }
+            let args = match table.get("args") {
+                None => Vec::new(),
+                Some(Value::Array(array)) => array
+                    .iter()
+                    .map(|value| {
+                        value.as_str().map(str::to_string).ok_or_else(|| {
+                            anyhow::anyhow!("Claude MCP {name} args must be strings")
                         })
-                        .collect::<Result<Vec<_>>>()
-                })
-                .transpose()?
-                .unwrap_or_default();
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                Some(_) => anyhow::bail!("Claude MCP {name} args must be an array"),
+            };
+            if args.iter().any(|value| contains_claude_expansion(value)) {
+                anyhow::bail!(
+                    "Claude MCP {name} args contain an unrepresentable environment expansion"
+                );
+            }
 
-            let env = if let Some(Value::Object(env_obj)) = table.get("env") {
+            let env = if let Some(env) = table.get("env") {
+                let Some(env_obj) = env.as_object() else {
+                    anyhow::bail!("Claude MCP env must be an object");
+                };
                 let mut map = BTreeMap::new();
                 for (k, v) in env_obj {
                     if let Some(s) = v.as_str() {
-                        map.insert(k.clone(), s.to_string());
+                        map.insert(k.clone(), parse_braced_env(s)?);
                     } else {
                         anyhow::bail!("Claude MCP env values must be strings");
                     }
@@ -351,7 +309,7 @@ fn import_claude_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefinition
 
             servers.push(json!({
                 "name": name,
-                "enabled": enabled,
+                "enabled": true,
                 "transport": "stdio",
                 "command": command,
                 "args": args,
@@ -359,12 +317,20 @@ fn import_claude_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefinition
             }));
         } else if mcp_type == "http" {
             let url = table.get("url").and_then(Value::as_str).unwrap_or("");
+            if contains_claude_expansion(url) {
+                anyhow::bail!(
+                    "Claude MCP {name} URL contains an unrepresentable environment expansion"
+                );
+            }
 
-            let headers = if let Some(Value::Object(headers_obj)) = table.get("headers") {
+            let headers = if let Some(headers) = table.get("headers") {
+                let Some(headers_obj) = headers.as_object() else {
+                    anyhow::bail!("Claude MCP headers must be an object");
+                };
                 let mut map = BTreeMap::new();
                 for (k, v) in headers_obj {
                     if let Some(s) = v.as_str() {
-                        map.insert(k.clone(), s.to_string());
+                        map.insert(k.clone(), parse_braced_env(s)?);
                     } else {
                         anyhow::bail!("Claude MCP headers values must be strings");
                     }
@@ -376,7 +342,7 @@ fn import_claude_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefinition
 
             servers.push(json!({
                 "name": name,
-                "enabled": enabled,
+                "enabled": true,
                 "transport": "http",
                 "url": url,
                 "headers": headers,
@@ -387,32 +353,6 @@ fn import_claude_mcps(document: &Map<String, Value>) -> Result<Vec<McpDefinition
     }
 
     crate::profile::mcp::parse_mcp_definitions(&serde_json::to_string(&servers)?)
-}
-
-fn non_default_value(value: Value) -> Option<Value> {
-    match value {
-        Value::String(ref string_val) if string_val == "default" => None,
-        other => Some(other),
-    }
-}
-
-fn json_config_object(config: &NativeConfig) -> Result<&Map<String, Value>> {
-    let NativeConfig::Json(Value::Object(document)) = config else {
-        anyhow::bail!("Claude JSON config must be an object");
-    };
-    Ok(document)
-}
-
-fn json_config_object_mut(config: &mut NativeConfig) -> Result<&mut Map<String, Value>> {
-    let NativeConfig::Json(value) = config else {
-        anyhow::bail!("Claude JSON config must be an object");
-    };
-    if !value.is_object() {
-        *value = Value::Object(Map::new());
-    }
-    value
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("Claude JSON config must be an object"))
 }
 
 fn patch_claude_permissions(document: &mut Map<String, Value>, preference: Value) -> Result<()> {
@@ -441,7 +381,6 @@ fn patch_claude_permissions(document: &mut Map<String, Value>, preference: Value
 impl McpDefinition {
     fn to_claude_value(&self) -> Result<Value> {
         let mut map = Map::new();
-        map.insert("enabled".to_string(), json!(self.enabled));
         match &self.transport {
             McpTransport::Stdio(stdio) => {
                 map.insert("type".to_string(), json!("stdio"));
@@ -450,19 +389,90 @@ impl McpDefinition {
                     map.insert("args".to_string(), json!(stdio.args));
                 }
                 if !stdio.env.is_empty() {
-                    map.insert("env".to_string(), json!(stdio.env));
+                    map.insert("env".to_string(), json!(render_braced_env(&stdio.env)));
                 }
             }
             McpTransport::Http(http) => {
                 map.insert("type".to_string(), json!("http"));
                 map.insert("url".to_string(), json!(http.url));
                 if !http.headers.is_empty() {
-                    map.insert("headers".to_string(), json!(http.headers));
+                    map.insert(
+                        "headers".to_string(),
+                        json!(render_braced_env(&http.headers)),
+                    );
                 }
             }
         }
         Ok(Value::Object(map))
     }
+}
+
+fn parse_braced_env(value: &str) -> Result<McpValue> {
+    if let Some(name) = value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+    {
+        McpValue::env(name)
+    } else if contains_claude_expansion(value) {
+        anyhow::bail!("Claude MCP value contains an embedded or default environment expansion that the neutral schema cannot represent")
+    } else {
+        Ok(McpValue::literal(value))
+    }
+}
+
+fn contains_claude_expansion(value: &str) -> bool {
+    let mut remaining = value;
+    while let Some(start) = remaining.find("${") {
+        remaining = &remaining[start + 2..];
+        let Some(end) = remaining.find('}') else {
+            return false;
+        };
+        let expression = &remaining[..end];
+        let name = expression
+            .split_once(":-")
+            .map_or(expression, |(name, _)| name);
+        if !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return true;
+        }
+        remaining = &remaining[end + 1..];
+    }
+    false
+}
+
+fn reject_claude_untyped_expansions(definitions: &[McpDefinition]) -> Result<()> {
+    for definition in definitions {
+        let invalid = match &definition.transport {
+            McpTransport::Stdio(stdio) => {
+                contains_claude_expansion(&stdio.command)
+                    || stdio
+                        .args
+                        .iter()
+                        .any(|value| contains_claude_expansion(value))
+            }
+            McpTransport::Http(http) => contains_claude_expansion(&http.url),
+        };
+        if invalid {
+            anyhow::bail!("Claude MCP server {} contains an environment expansion outside a typed env or header value", definition.name);
+        }
+    }
+    Ok(())
+}
+
+fn render_braced_env(values: &BTreeMap<String, McpValue>) -> BTreeMap<String, String> {
+    values
+        .iter()
+        .map(|(key, value)| {
+            let value = match value {
+                McpValue::Literal(value) => value.clone(),
+                McpValue::Env(name) => format!("${{{name}}}"),
+            };
+            (key.clone(), value)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -497,6 +507,9 @@ mod tests {
         fn supports_nested_commands(&self) -> bool {
             true
         }
+        fn supports_disabled_mcp(&self) -> bool {
+            false
+        }
         fn write_existing_native_settings(&self, paths: &HarnessConfigPaths) {
             fs::write(&paths.settings_file, r#"{"theme": "dark"}"#).unwrap();
         }
@@ -507,7 +520,7 @@ mod tests {
         fn setup_native_config_for_import(&self, paths: &HarnessConfigPaths) {
             fs::write(
                 &paths.settings_file,
-                r#"{"primaryModel": "opus", "permissions": {"defaultMode": "acceptEdits"}}"#,
+                r#"{"model": "opus", "permissions": {"defaultMode": "acceptEdits"}}"#,
             )
             .unwrap();
             fs::write(
@@ -535,7 +548,7 @@ mod tests {
         fn setup_drift_native_config(&self, paths: &HarnessConfigPaths) {
             fs::write(
                 &paths.settings_file,
-                r#"{"primaryModel": "drift-model", "permissions": {"defaultMode": "drift-perm"}}"#,
+                r#"{"model": "drift-model", "permissions": {"defaultMode": "drift-perm"}}"#,
             )
             .unwrap();
         }
@@ -564,10 +577,111 @@ mod tests {
             let mcp = fs::read_to_string(&paths.mcp_file).unwrap();
             assert!(mcp.contains("local"));
             assert!(mcp.contains("server"));
-            assert!(mcp.contains("disabled"));
-            assert!(mcp.contains(r#""enabled": false"#));
+            assert!(!mcp.contains(r#""enabled""#));
         }
     }
 
     crate::define_standard_harness_tests!(ClaudeAdapter);
+
+    #[test]
+    fn default_and_custom_mcp_paths_are_distinct() {
+        let temp = tempfile::tempdir().unwrap();
+        let env = AppEnvironment {
+            lazyagents_home: temp.path().join("lazyagents"),
+            user_home: temp.path().join("user"),
+            path_entries: Vec::new(),
+        };
+        assert_eq!(
+            ClaudeIntegration.paths(&env).unwrap().mcp_file,
+            env.user_home.join(".claude.json")
+        );
+        let custom = temp.path().join("claude.work.v2");
+        assert_eq!(
+            ClaudeIntegration
+                .paths_from_custom_config_dir(custom.clone())
+                .unwrap()
+                .mcp_file,
+            custom.join(".claude.json")
+        );
+    }
+
+    #[test]
+    fn disabled_and_unsupported_claude_mcps_are_rejected() {
+        let disabled = crate::profile::mcp::parse_mcp_definitions(
+            r#"[{"name":"off","enabled":false,"transport":"stdio","command":"x"}]"#,
+        )
+        .unwrap();
+        assert!(ClaudeMcpCodec
+            .preflight_apply(&NativeConfig::Json(json!({})), &disabled)
+            .unwrap_err()
+            .to_string()
+            .contains("disabledMcpServers"));
+
+        let error = import_claude_mcps(
+            json!({"mcpServers":{"x":{"command":"x","oauth":{}}}})
+                .as_object()
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unsupported field oauth"));
+    }
+
+    #[test]
+    fn claude_mcp_environment_references_round_trip() {
+        let definitions = crate::profile::mcp::parse_mcp_definitions(
+            r#"[{"name":"x","transport":"stdio","command":"x","env":{"TOKEN":{"env":"TOKEN"},"LITERAL":"$TOKEN"}}]"#,
+        )
+        .unwrap();
+        let mut config = NativeConfig::Json(json!({}));
+        ClaudeMcpCodec.apply(&mut config, &definitions).unwrap();
+        assert_eq!(ClaudeMcpCodec.import(&config).unwrap(), definitions);
+        let NativeConfig::Json(config) = config else {
+            unreachable!()
+        };
+        assert_eq!(config["mcpServers"]["x"]["env"]["TOKEN"], "${TOKEN}");
+        assert_eq!(config["mcpServers"]["x"]["env"]["LITERAL"], "$TOKEN");
+    }
+
+    #[test]
+    fn claude_rejects_malformed_mcp_types_and_ambiguous_literals() {
+        assert!(import_claude_mcps(
+            json!({"mcpServers":{"x":{"type":false}}})
+                .as_object()
+                .unwrap()
+        )
+        .is_err());
+        let definitions = crate::profile::mcp::parse_mcp_definitions(
+            r#"[{"name":"x","transport":"stdio","command":"x","env":{"TOKEN":"${TOKEN}"}}]"#,
+        )
+        .unwrap();
+        assert!(ClaudeMcpCodec
+            .preflight_apply(&NativeConfig::Json(json!({})), &definitions)
+            .is_err());
+        for value in ["Bearer ${TOKEN}", "${TOKEN:-fallback}"] {
+            let native = json!({"mcpServers":{"x":{"command":"x","env":{"TOKEN":value}}}});
+            assert!(import_claude_mcps(native.as_object().unwrap()).is_err());
+        }
+        for args in [json!("--flag"), json!({"flag":true}), json!(null)] {
+            let native = json!({"mcpServers":{"x":{"command":"x","args":args}}});
+            assert!(import_claude_mcps(native.as_object().unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn claude_import_rejects_names_the_renderer_cannot_emit() {
+        assert!(ClaudeSubagentCodec
+            .parse(
+                Path::new("Reviewer.md"),
+                "---\nname: Reviewer\ndescription: Reviews\n---\nBody\n"
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn claude_custom_permission_verifies_effective_value() {
+        let config = NativeConfig::Json(json!({"permissions":{"defaultMode":"deny"}}));
+        assert!(ClaudePermissionCodec
+            .verify(&config, json!("allow"))
+            .is_err());
+    }
 }

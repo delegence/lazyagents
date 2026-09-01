@@ -9,33 +9,42 @@ use crate::harness::agents::{
     verify_rendered_agents, RenderedAgent, SubAgent,
 };
 use crate::harness::commands::{
-    collect_directory_link_drift_recursive, flat_profile_commands, import_commands,
-    import_flat_commands, link_commands, link_flat_commands, profile_commands_recursive,
+    collect_commands_drift_recursive, collect_flat_commands_drift, copy_commands,
+    copy_flat_commands, flat_profile_commands, import_commands, import_flat_commands,
+    profile_commands_recursive,
 };
 use crate::harness::drift::DriftItem;
 use crate::harness::fs::{
-    collect_directory_link_drift, collect_instruction_content_drift, read_optional_string,
-    symlink_points_to, verify_profile_instructions, write_profile_instructions,
+    collect_instruction_content_drift, read_optional_string, verify_profile_instructions,
+    write_profile_instructions,
 };
 use crate::harness::integration::{
-    AppEnvironment, HarnessConfigPaths, ImportedPreference, ProfileImport, ProfileRef,
+    HarnessConfigPaths, ImportedPreference, ProfileImport, ProfileRef,
 };
-use crate::harness::kind::HarnessKind;
 use crate::harness::managed::ManagedSurface;
-use crate::harness::skills::{import_skills, link_skills, valid_skills};
+use crate::harness::skills::{collect_skills_drift, copy_skills, import_skills};
 use crate::profile::mcp::{canonical_mcp_json, read_mcp_definitions, McpDefinition};
 use crate::profile::read_profile_config;
 
 pub type PathSelector = for<'a> fn(&'a HarnessConfigPaths) -> &'a Path;
 
 pub struct ArtifactContext<'a> {
-    pub env: Option<&'a AppEnvironment>,
-    pub kind: HarnessKind,
     pub display_name: &'a str,
     pub paths: &'a HarnessConfigPaths,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ArtifactKind {
+    Instructions,
+    Skills,
+    Commands,
+    Subagents,
+    Mcp,
+    Settings,
+}
+
 pub trait HarnessArtifact {
+    fn kind(&self) -> ArtifactKind;
     fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface>;
     fn preflight(&self, _ctx: &ArtifactContext<'_>, _profile: &ProfileRef) -> Result<()> {
         Ok(())
@@ -58,11 +67,25 @@ pub trait HarnessArtifact {
     }
 }
 
-pub trait HarnessSettings: HarnessArtifact {}
-
 pub enum NativeConfig {
     Json(Value),
     Toml(toml_edit::DocumentMut),
+}
+
+impl NativeConfig {
+    pub fn json_object(&self, label: &str) -> Result<&serde_json::Map<String, Value>> {
+        let Self::Json(Value::Object(document)) = self else {
+            anyhow::bail!("{label} must be an object");
+        };
+        Ok(document)
+    }
+
+    pub fn json_object_mut(&mut self, label: &str) -> Result<&mut serde_json::Map<String, Value>> {
+        let Self::Json(Value::Object(document)) = self else {
+            anyhow::bail!("{label} must be an object");
+        };
+        Ok(document)
+    }
 }
 
 pub trait NativeConfigFile {
@@ -118,7 +141,7 @@ impl NativeConfigFile for JsonConfigFile {
         let NativeConfig::Json(value) = config else {
             anyhow::bail!("cannot write TOML config to {}", self.path(paths).display());
         };
-        crate::harness::managed::write_text_atomic(
+        crate::file_system::write_text_atomic(
             self.path(paths),
             &serde_json::to_string_pretty(value)?,
         )
@@ -171,7 +194,7 @@ impl NativeConfigFile for TomlConfigFile {
         let NativeConfig::Toml(document) = config else {
             anyhow::bail!("cannot write JSON config to {}", self.path(paths).display());
         };
-        crate::harness::managed::write_text_atomic(self.path(paths), &document.to_string())
+        crate::file_system::write_text_atomic(self.path(paths), &document.to_string())
             .with_context(|| format!("failed to write {}", self.path(paths).display()))
     }
 }
@@ -179,12 +202,18 @@ impl NativeConfigFile for TomlConfigFile {
 pub trait McpCodec {
     fn import(&self, config: &NativeConfig) -> Result<Vec<McpDefinition>>;
     fn apply(&self, config: &mut NativeConfig, definitions: &[McpDefinition]) -> Result<()>;
+    fn preflight_apply(
+        &self,
+        _config: &NativeConfig,
+        _definitions: &[McpDefinition],
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct McpConfig<C> {
     config_file: Box<dyn NativeConfigFile>,
     codec: C,
-    label: &'static str,
 }
 
 impl<C> McpConfig<C> {
@@ -192,14 +221,23 @@ impl<C> McpConfig<C> {
         Self {
             config_file: Box::new(config_file),
             codec,
-            label: "MCP",
         }
     }
 }
 
 impl<C: McpCodec> HarnessArtifact for McpConfig<C> {
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::Mcp
+    }
+
     fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
         vec![ManagedSurface::preserved_file(self.config_file.path(paths))]
+    }
+
+    fn preflight(&self, ctx: &ArtifactContext<'_>, profile: &ProfileRef) -> Result<()> {
+        let config = self.config_file.read(ctx.paths)?;
+        let definitions = read_mcp_definitions(&profile.path)?;
+        self.codec.preflight_apply(&config, &definitions)
     }
 
     fn detect_drift(
@@ -240,9 +278,8 @@ impl<C: McpCodec> HarnessArtifact for McpConfig<C> {
         let profile_mcps = read_mcp_definitions(&profile.path)?;
         if canonical_mcp_json(&native_mcps)? != canonical_mcp_json(&profile_mcps)? {
             anyhow::bail!(
-                "{} {} config does not match profile MCP definitions",
-                ctx.display_name,
-                self.label
+                "{} MCP config does not match profile MCP definitions",
+                ctx.display_name
             );
         }
         Ok(())
@@ -257,6 +294,18 @@ pub trait PreferenceCodec {
         profile: &ProfileRef,
         preference_kind: PreferenceKind,
     ) -> Result<()>;
+    fn preflight(&self, _expected: Value) -> Result<()> {
+        Ok(())
+    }
+    fn verify(&self, config: &NativeConfig, expected: Value) -> Result<()> {
+        let Some(expected) = non_default_value(expected) else {
+            return Ok(());
+        };
+        if self.import(config)?.into_value() != expected {
+            anyhow::bail!("applied custom preference does not match the profile");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -266,7 +315,7 @@ pub enum PreferenceKind {
 }
 
 pub enum PreferenceBinding {
-    JsonPointer { pointer: &'static str },
+    JsonStringPointer { pointer: &'static str },
     TomlKey { key: &'static str },
     Custom(Box<dyn PreferenceCodec>),
 }
@@ -298,6 +347,10 @@ impl SettingsPreferences {
 }
 
 impl HarnessArtifact for SettingsPreferences {
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::Settings
+    }
+
     fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
         vec![ManagedSurface::preserved_file(self.config_file.path(paths))]
     }
@@ -331,12 +384,52 @@ impl HarnessArtifact for SettingsPreferences {
         self.config_file.write(ctx.paths, &config)
     }
 
-    fn verify(&self, ctx: &ArtifactContext<'_>, _profile: &ProfileRef) -> Result<()> {
-        self.config_file.read(ctx.paths).map(|_| ())
+    fn preflight(&self, _ctx: &ArtifactContext<'_>, profile: &ProfileRef) -> Result<()> {
+        let config = read_profile_config(&profile.path)?;
+        for (binding, value, label) in [
+            (
+                self.model.as_ref(),
+                config.model_preference(&profile.harness_id),
+                "model preference",
+            ),
+            (
+                self.permission.as_ref(),
+                config.permission_preference(&profile.harness_id),
+                "permission preference",
+            ),
+        ] {
+            if let Some(PreferenceBinding::Custom(codec)) = binding {
+                codec.preflight(value.clone())?;
+            }
+            if matches!(
+                binding,
+                Some(
+                    PreferenceBinding::JsonStringPointer { .. } | PreferenceBinding::TomlKey { .. }
+                )
+            ) {
+                non_default_string(value, label)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify(&self, ctx: &ArtifactContext<'_>, profile: &ProfileRef) -> Result<()> {
+        let native = self.config_file.read(ctx.paths)?;
+        let profile_config = read_profile_config(&profile.path)?;
+        verify_direct_preference(
+            self.model.as_ref(),
+            &native,
+            profile_config.model_preference(&profile.harness_id),
+            "model preference",
+        )?;
+        verify_direct_preference(
+            self.permission.as_ref(),
+            &native,
+            profile_config.permission_preference(&profile.harness_id),
+            "permission preference",
+        )
     }
 }
-
-impl HarnessSettings for SettingsPreferences {}
 
 fn import_preference(
     binding: Option<&PreferenceBinding>,
@@ -346,28 +439,33 @@ fn import_preference(
         return Ok(ImportedPreference::default_value());
     };
     match binding {
-        PreferenceBinding::JsonPointer { pointer } => {
+        PreferenceBinding::JsonStringPointer { pointer } => {
             let NativeConfig::Json(value) = config else {
                 anyhow::bail!("JSON pointer preference requires JSON config");
             };
-            Ok(ImportedPreference::new(
-                value
-                    .pointer(pointer)
-                    .cloned()
-                    .unwrap_or_else(|| Value::String("default".to_string())),
-            ))
+            match value.pointer(pointer) {
+                Some(Value::String(value)) => {
+                    Ok(ImportedPreference::new(Value::String(value.clone())))
+                }
+                Some(other) => {
+                    anyhow::bail!("native preference at {pointer} must be a string, got {other}")
+                }
+                None => Ok(ImportedPreference::default_value()),
+            }
         }
         PreferenceBinding::TomlKey { key } => {
             let NativeConfig::Toml(document) = config else {
                 anyhow::bail!("TOML key preference requires TOML config");
             };
-            Ok(ImportedPreference::new(
-                document
-                    .get(key)
-                    .and_then(toml_edit::Item::as_str)
-                    .map(|value| Value::String(value.to_string()))
-                    .unwrap_or_else(|| Value::String("default".to_string())),
-            ))
+            match document.get(key) {
+                Some(item) => item
+                    .as_str()
+                    .map(|value| ImportedPreference::new(Value::String(value.to_string())))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("native TOML preference {key} must be a string")
+                    }),
+                None => Ok(ImportedPreference::default_value()),
+            }
         }
         PreferenceBinding::Custom(codec) => codec.import(config),
     }
@@ -381,14 +479,14 @@ fn apply_preference(
     value: Value,
 ) -> Result<()> {
     match binding {
-        PreferenceBinding::JsonPointer { pointer } => {
-            let Some(value) = non_default_value(value) else {
+        PreferenceBinding::JsonStringPointer { pointer } => {
+            let Some(value) = non_default_string(value, "JSON preference")? else {
                 return Ok(());
             };
             let NativeConfig::Json(config) = config else {
                 anyhow::bail!("JSON pointer preference requires JSON config");
             };
-            set_json_pointer(config, pointer, value)
+            set_json_pointer(config, pointer, Value::String(value))
         }
         PreferenceBinding::TomlKey { key } => {
             let Some(value) = non_default_string(value, "TOML preference")? else {
@@ -404,14 +502,36 @@ fn apply_preference(
     }
 }
 
-fn non_default_value(value: Value) -> Option<Value> {
+fn verify_direct_preference(
+    binding: Option<&PreferenceBinding>,
+    config: &NativeConfig,
+    expected: Value,
+    label: &str,
+) -> Result<()> {
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    if non_default_value(expected.clone()).is_none() {
+        return Ok(());
+    }
+    if let PreferenceBinding::Custom(codec) = binding {
+        return codec.verify(config, expected);
+    }
+    let actual = import_preference(Some(binding), config)?.into_value();
+    if actual != expected {
+        anyhow::bail!("applied {label} does not match the profile");
+    }
+    Ok(())
+}
+
+pub fn non_default_value(value: Value) -> Option<Value> {
     match value {
         Value::String(value) if value == "default" => None,
         other => Some(other),
     }
 }
 
-fn non_default_string(value: Value, label: &str) -> Result<Option<String>> {
+pub fn non_default_string(value: Value, label: &str) -> Result<Option<String>> {
     match value {
         Value::String(value) if value == "default" => Ok(None),
         Value::String(value) => Ok(Some(value)),
@@ -488,6 +608,10 @@ impl InstructionFile {
 }
 
 impl HarnessArtifact for InstructionFile {
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::Instructions
+    }
+
     fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
         vec![ManagedSurface::file((self.path)(paths))]
     }
@@ -529,6 +653,10 @@ impl SkillsDirectory {
 }
 
 impl HarnessArtifact for SkillsDirectory {
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::Skills
+    }
+
     fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
         vec![ManagedSurface::directory((self.path)(paths))]
     }
@@ -539,12 +667,7 @@ impl HarnessArtifact for SkillsDirectory {
         profile: &ProfileRef,
     ) -> Result<Vec<DriftItem>> {
         let mut items = Vec::new();
-        collect_directory_link_drift(
-            "skills",
-            valid_skills(&profile.path)?,
-            (self.path)(ctx.paths),
-            &mut items,
-        )?;
+        collect_skills_drift(&profile.path, (self.path)(ctx.paths), &mut items)?;
         Ok(items)
     }
 
@@ -558,31 +681,26 @@ impl HarnessArtifact for SkillsDirectory {
     fn apply(&self, ctx: &ArtifactContext<'_>, profile: &ProfileRef) -> Result<()> {
         fs::create_dir_all((self.path)(ctx.paths))
             .with_context(|| format!("failed to create {}", (self.path)(ctx.paths).display()))?;
-        link_skills(profile, ctx.paths)
+        copy_skills(profile, ctx.paths)
     }
 
     fn verify(&self, ctx: &ArtifactContext<'_>, profile: &ProfileRef) -> Result<()> {
-        for skill in valid_skills(&profile.path)? {
-            let target = (self.path)(ctx.paths).join(
-                skill
-                    .file_name()
-                    .ok_or_else(|| anyhow::anyhow!("invalid skill path {}", skill.display()))?,
+        let mut items = Vec::new();
+        collect_skills_drift(&profile.path, (self.path)(ctx.paths), &mut items)?;
+        if let Some(item) = items.first() {
+            anyhow::bail!(
+                "{} skills do not match the profile: {}",
+                ctx.display_name,
+                item.detail
             );
-            if !symlink_points_to(&target, &skill) {
-                anyhow::bail!(
-                    "{} skill link {} was not applied",
-                    ctx.display_name,
-                    target.display()
-                );
-            }
         }
         Ok(())
     }
 }
 
 pub enum CommandMode {
-    FlatSymlink,
-    RecursiveSymlink,
+    FlatCopy,
+    RecursiveCopy,
     Rendered(Box<dyn CommandCodec>),
 }
 
@@ -605,12 +723,16 @@ impl CommandsDirectory {
 }
 
 impl HarnessArtifact for CommandsDirectory {
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::Commands
+    }
+
     fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
         vec![ManagedSurface::directory((self.path)(paths))]
     }
 
     fn preflight(&self, _ctx: &ArtifactContext<'_>, profile: &ProfileRef) -> Result<()> {
-        if matches!(self.mode, CommandMode::FlatSymlink) {
+        if matches!(self.mode, CommandMode::FlatCopy) {
             flat_profile_commands(&profile.path)?;
         }
         Ok(())
@@ -622,20 +744,14 @@ impl HarnessArtifact for CommandsDirectory {
         profile: &ProfileRef,
     ) -> Result<Vec<DriftItem>> {
         match &self.mode {
-            CommandMode::FlatSymlink => {
+            CommandMode::FlatCopy => {
                 let mut items = Vec::new();
-                collect_directory_link_drift(
-                    "commands",
-                    flat_profile_commands(&profile.path)?,
-                    (self.path)(ctx.paths),
-                    &mut items,
-                )?;
+                collect_flat_commands_drift(&profile.path, (self.path)(ctx.paths), &mut items)?;
                 Ok(items)
             }
-            CommandMode::RecursiveSymlink => {
+            CommandMode::RecursiveCopy => {
                 let mut items = Vec::new();
-                collect_directory_link_drift_recursive(
-                    "commands",
+                collect_commands_drift_recursive(
                     profile_commands_recursive(&profile.path)?,
                     (self.path)(ctx.paths),
                     &profile.path.join("commands"),
@@ -649,8 +765,8 @@ impl HarnessArtifact for CommandsDirectory {
 
     fn import(&self, ctx: &ArtifactContext<'_>) -> Result<ProfileImport> {
         let commands = match &self.mode {
-            CommandMode::FlatSymlink => import_flat_commands((self.path)(ctx.paths))?,
-            CommandMode::RecursiveSymlink => import_commands((self.path)(ctx.paths))?,
+            CommandMode::FlatCopy => import_flat_commands((self.path)(ctx.paths))?,
+            CommandMode::RecursiveCopy => import_commands((self.path)(ctx.paths))?,
             CommandMode::Rendered(codec) => codec.import((self.path)(ctx.paths))?,
         };
         Ok(ProfileImport {
@@ -663,49 +779,44 @@ impl HarnessArtifact for CommandsDirectory {
         fs::create_dir_all((self.path)(ctx.paths))
             .with_context(|| format!("failed to create {}", (self.path)(ctx.paths).display()))?;
         match &self.mode {
-            CommandMode::FlatSymlink => link_flat_commands(profile, ctx.paths),
-            CommandMode::RecursiveSymlink => link_commands(profile, ctx.paths),
+            CommandMode::FlatCopy => copy_flat_commands(profile, ctx.paths),
+            CommandMode::RecursiveCopy => copy_commands(profile, ctx.paths),
             CommandMode::Rendered(codec) => codec.apply(profile, (self.path)(ctx.paths)),
         }
     }
 
     fn verify(&self, ctx: &ArtifactContext<'_>, profile: &ProfileRef) -> Result<()> {
         match &self.mode {
-            CommandMode::FlatSymlink => {
-                for command in flat_profile_commands(&profile.path)? {
-                    let target =
-                        (self.path)(ctx.paths).join(command.file_name().ok_or_else(|| {
-                            anyhow::anyhow!("invalid command path {}", command.display())
-                        })?);
-                    if !symlink_points_to(&target, &command) {
-                        anyhow::bail!(
-                            "{} command link {} was not applied",
-                            ctx.display_name,
-                            target.display()
-                        );
-                    }
-                }
-                Ok(())
+            CommandMode::FlatCopy => {
+                let mut items = Vec::new();
+                collect_flat_commands_drift(&profile.path, (self.path)(ctx.paths), &mut items)?;
+                verify_no_command_drift(ctx.display_name, &items)
             }
-            CommandMode::RecursiveSymlink => {
-                for command in profile_commands_recursive(&profile.path)? {
-                    let relative = command.strip_prefix(profile.path.join("commands")).unwrap();
-                    let target = (self.path)(ctx.paths).join(relative);
-                    if !symlink_points_to(&target, &command) {
-                        anyhow::bail!(
-                            "{} command link {} was not applied",
-                            ctx.display_name,
-                            target.display()
-                        );
-                    }
-                }
-                Ok(())
+            CommandMode::RecursiveCopy => {
+                let mut items = Vec::new();
+                collect_commands_drift_recursive(
+                    profile_commands_recursive(&profile.path)?,
+                    (self.path)(ctx.paths),
+                    &profile.path.join("commands"),
+                    &mut items,
+                )?;
+                verify_no_command_drift(ctx.display_name, &items)
             }
             CommandMode::Rendered(codec) => {
                 codec.verify(profile, (self.path)(ctx.paths), ctx.display_name)
             }
         }
     }
+}
+
+fn verify_no_command_drift(display_name: &str, items: &[DriftItem]) -> Result<()> {
+    if let Some(item) = items.first() {
+        anyhow::bail!(
+            "{display_name} commands do not match the profile: {}",
+            item.detail
+        );
+    }
+    Ok(())
 }
 
 pub trait SubagentCodec {
@@ -734,9 +845,15 @@ impl SubagentsDirectory {
         profile_agents(&profile.path)?
             .into_iter()
             .map(|agent| {
+                let agent_name = agent.name.clone();
                 Ok(RenderedAgent {
                     relative_path: PathBuf::from(self.codec.native_file_name(&agent)),
-                    contents: self.codec.render(&agent)?,
+                    contents: self.codec.render(&agent).with_context(|| {
+                        format!(
+                            "profile {} agent {agent_name} cannot be rendered",
+                            profile.name
+                        )
+                    })?,
                 })
             })
             .collect()
@@ -744,6 +861,10 @@ impl SubagentsDirectory {
 }
 
 impl HarnessArtifact for SubagentsDirectory {
+    fn kind(&self) -> ArtifactKind {
+        ArtifactKind::Subagents
+    }
+
     fn surfaces(&self, paths: &HarnessConfigPaths) -> Vec<ManagedSurface> {
         vec![ManagedSurface::directory((self.path)(paths))]
     }
@@ -771,10 +892,9 @@ impl HarnessArtifact for SubagentsDirectory {
             });
         }
         let mut imported = Vec::new();
-        for file in crate::harness::fs::import_files_recursive(path, path)? {
-            if !self.codec.should_import(&file.relative_path) {
-                continue;
-            }
+        for file in crate::harness::fs::import_files_recursive_filtered(path, path, &|relative| {
+            self.codec.should_import(relative)
+        })? {
             let text = String::from_utf8(file.contents)
                 .with_context(|| format!("agent {} is not UTF-8", file.relative_path.display()))?;
             let agent = self.codec.parse(&file.relative_path, &text)?;
@@ -793,5 +913,35 @@ impl HarnessArtifact for SubagentsDirectory {
 
     fn verify(&self, ctx: &ArtifactContext<'_>, profile: &ProfileRef) -> Result<()> {
         verify_rendered_agents(&self.rendered(profile)?, (self.path)(ctx.paths))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutable_json_config_rejects_non_object_roots() {
+        let mut config = NativeConfig::Json(serde_json::json!(["valid", "but", "wrong"]));
+
+        let error = config.json_object_mut("settings JSON").unwrap_err();
+
+        assert!(error.to_string().contains("must be an object"));
+    }
+
+    #[test]
+    fn typed_preferences_reject_present_wrong_native_types() {
+        let json = NativeConfig::Json(serde_json::json!({"model": {"name": "wrong"}}));
+        let error = import_preference(
+            Some(&PreferenceBinding::JsonStringPointer { pointer: "/model" }),
+            &json,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must be a string"));
+
+        let toml = NativeConfig::Toml("model = true".parse().unwrap());
+        let error = import_preference(Some(&PreferenceBinding::TomlKey { key: "model" }), &toml)
+            .unwrap_err();
+        assert!(error.to_string().contains("must be a string"));
     }
 }

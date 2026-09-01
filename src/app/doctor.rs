@@ -1,12 +1,11 @@
 use anyhow::Result;
 
 use crate::app::harness_registry::HarnessRegistry;
-use crate::app::state::LazyagentsState;
+use crate::app::state::{active_profile_for_aliases, LazyagentsState};
 use crate::harness::drift::DriftReport;
 use crate::harness::integration::{
     AppEnvironment, HarnessDetection, HarnessIntegration, ProfileRef,
 };
-use crate::harness::kind::normalize_path_lexically;
 use crate::profile::{ProfileConfigStatus, ProfileName, ProfileStore};
 
 pub struct DoctorReport {
@@ -110,6 +109,36 @@ fn lazyagents_doctor_report(
         }
     }
 
+    let mut alias_groups = std::collections::BTreeMap::new();
+    for integration in integrations {
+        alias_groups
+            .entry(integration.instance().alias_key()?)
+            .or_insert_with(Vec::new)
+            .push(integration.instance_id().to_string());
+    }
+    for aliases in alias_groups.values() {
+        let assignments = aliases
+            .iter()
+            .filter_map(|alias| {
+                state
+                    .active_profiles
+                    .get(alias)
+                    .map(|profile| format!("{alias}={profile}"))
+            })
+            .collect::<Vec<_>>();
+        let profiles = aliases
+            .iter()
+            .filter_map(|alias| state.active_profiles.get(alias))
+            .collect::<std::collections::BTreeSet<_>>();
+        if profiles.len() > 1 {
+            issues += 1;
+            lines.push(format!(
+                "  - harness aliases have conflicting active profiles: {}",
+                assignments.join(", ")
+            ));
+        }
+    }
+
     let marker = if issues == 0 { "[✓]" } else { "[!]" };
     let summary = if issues == 0 {
         Vec::new()
@@ -134,6 +163,13 @@ fn status_rows_for(
 ) -> Result<Vec<HarnessStatus>> {
     let state = LazyagentsState::load(&env.lazyagents_home.join("state.json"))?;
     let mut rows = Vec::new();
+    let mut aliases_by_config = std::collections::BTreeMap::new();
+    for integration in &integrations {
+        aliases_by_config
+            .entry(integration.instance().alias_key()?)
+            .or_insert_with(Vec::new)
+            .push(integration.instance_id().to_string());
+    }
 
     for integration in integrations {
         let paths = integration.paths(env)?;
@@ -147,11 +183,20 @@ fn status_rows_for(
             HarnessAvailability::Available
         };
 
-        let profile = match state.active_profiles.get(integration.instance_id()) {
+        let aliases = aliases_by_config
+            .get(&integration.instance().alias_key()?)
+            .ok_or_else(|| anyhow::anyhow!("failed to resolve shared harness state"))?;
+        let shared_profile = active_profile_for_aliases(&state, aliases).ok().flatten();
+        let profile = match shared_profile.or_else(|| {
+            state
+                .active_profiles
+                .get(integration.instance_id())
+                .cloned()
+        }) {
             Some(name) => {
                 let loaded = ProfileRef {
                     name: name.clone(),
-                    path: profile_store.profile_dir(name),
+                    path: profile_store.profile_dir(&name),
                     harness_id: integration.instance_id().to_string(),
                 };
 
@@ -208,7 +253,7 @@ fn status_rows_for(
     for row in &mut rows {
         let key = (
             row.harness_type.clone(),
-            normalize_path_lexically(&row.config_dir),
+            crate::file_system::resolve_path_identity(&row.config_dir)?,
         );
         if let Some(first) = first_by_config.get(&key) {
             row.shared_config_with = Some(first.clone());
@@ -227,11 +272,20 @@ fn has_relevant_validation_errors(
         .iter()
         .any(|issue| {
             issue.severity == crate::profile::validation::Severity::Error
-                && match issue.category.as_str() {
-                    "Skills" => integration.supports_skills(),
-                    "Commands" => integration.supports_commands(),
-                    "MCP" => integration.supports_mcp(),
-                    _ => true,
+                && match issue.category {
+                    crate::profile::validation::ValidationCategory::Skills => {
+                        integration.supports_skills()
+                    }
+                    crate::profile::validation::ValidationCategory::Commands => {
+                        integration.supports_commands()
+                    }
+                    crate::profile::validation::ValidationCategory::Subagents => {
+                        integration.supports_subagents()
+                    }
+                    crate::profile::validation::ValidationCategory::Mcp => {
+                        integration.supports_mcp()
+                    }
+                    crate::profile::validation::ValidationCategory::Config => true,
                 }
         })
 }
@@ -444,7 +498,7 @@ mod tests {
             Vec::new()
         }
 
-        fn preflight(&self, _profile: &ProfileRef) -> Result<()> {
+        fn preflight(&self, _profile: &ProfileRef, _paths: &HarnessConfigPaths) -> Result<()> {
             Ok(())
         }
 
@@ -644,6 +698,44 @@ mod tests {
                 Box::new(
                     StatusIntegration::detected(HarnessKind::Codex, DriftReport::clean())
                         .with_config_dir(config_dir.join("..").join("codex")),
+                ),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].shared_config_with, None);
+        assert_eq!(rows[1].shared_config_with.as_deref(), Some("codex"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_reports_shared_config_dirs_through_symlinked_ancestors() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("lazyagents");
+        let store = ProfileStore::new(LazyagentsHome::from_path(&home));
+        let env = AppEnvironment {
+            lazyagents_home: home,
+            user_home: temp.path().join("user"),
+            path_entries: Vec::new(),
+        };
+        let config_dir = env.user_home.join("real/codex");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        symlink(env.user_home.join("real"), env.user_home.join("linked")).unwrap();
+
+        let rows = status_rows_for(
+            &env,
+            &store,
+            vec![
+                Box::new(
+                    StatusIntegration::detected(HarnessKind::Codex, DriftReport::clean())
+                        .with_config_dir(config_dir),
+                ),
+                Box::new(
+                    StatusIntegration::detected(HarnessKind::Codex, DriftReport::clean())
+                        .with_config_dir(env.user_home.join("linked/codex")),
                 ),
             ],
         )

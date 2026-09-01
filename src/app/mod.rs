@@ -5,4 +5,5 @@ pub mod edit_profile;
 pub mod harness_registry;
 pub mod inspect_profile;
 pub mod state;
+pub mod unset_profile;
 pub mod use_profile;

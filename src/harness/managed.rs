@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::file_system::is_hidden_name;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedSurface {
@@ -46,6 +47,7 @@ pub enum ManagedSurfaceKind {
 #[derive(Debug)]
 pub struct ManagedBackup {
     backup_dir: PathBuf,
+    surfaces: Vec<ManagedSurface>,
 }
 
 impl ManagedBackup {
@@ -60,6 +62,7 @@ impl ManagedBackup {
 
         let backup_dir = backups_root.join(harness_id);
         let temp_dir = backups_root.join(format!(".{harness_id}.tmp"));
+        let previous_dir = backups_root.join(format!(".{harness_id}.previous"));
 
         if temp_dir.exists() {
             fs::remove_dir_all(&temp_dir)
@@ -104,12 +107,10 @@ impl ManagedBackup {
                     });
                 }
                 Ok(_) => {
-                    manifest.surfaces.push(BackupSurface {
-                        original_path: surface.path.clone(),
-                        surface_kind: surface.kind,
-                        original_state: BackupSurfaceState::Other,
-                        backup_entry: None,
-                    });
+                    anyhow::bail!(
+                        "managed surface {} has an unsupported filesystem type",
+                        surface.path.display()
+                    );
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     manifest.surfaces.push(BackupSurface {
@@ -128,61 +129,354 @@ impl ManagedBackup {
 
         write_manifest(&temp_dir, &manifest)?;
 
+        if previous_dir.exists() {
+            if backup_dir.exists() {
+                fs::remove_dir_all(&previous_dir).with_context(|| {
+                    format!(
+                        "failed to remove stale backup dir {}",
+                        previous_dir.display()
+                    )
+                })?;
+            } else {
+                fs::rename(&previous_dir, &backup_dir).with_context(|| {
+                    format!(
+                        "failed to recover previous backup {}",
+                        previous_dir.display()
+                    )
+                })?;
+            }
+        }
+
         if backup_dir.exists() {
-            fs::remove_dir_all(&backup_dir).with_context(|| {
-                format!("failed to remove old backup dir {}", backup_dir.display())
+            fs::rename(&backup_dir, &previous_dir).with_context(|| {
+                format!("failed to preserve old backup dir {}", backup_dir.display())
             })?;
         }
-        fs::rename(&temp_dir, &backup_dir).with_context(|| {
-            format!(
-                "failed to rename temp dir {} to backup dir {}",
-                temp_dir.display(),
-                backup_dir.display()
-            )
-        })?;
+        if let Err(error) = fs::rename(&temp_dir, &backup_dir) {
+            if previous_dir.exists() {
+                let _ = fs::rename(&previous_dir, &backup_dir);
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to rename temp dir {} to backup dir {}",
+                    temp_dir.display(),
+                    backup_dir.display()
+                )
+            });
+        }
+        if previous_dir.exists() {
+            fs::remove_dir_all(&previous_dir).with_context(|| {
+                format!("failed to remove old backup dir {}", previous_dir.display())
+            })?;
+        }
 
-        Ok(Self { backup_dir })
+        Ok(Self {
+            backup_dir,
+            surfaces: surfaces.to_vec(),
+        })
     }
 
-    pub fn restore(&self, _surfaces: &[ManagedSurface]) -> Result<()> {
+    pub fn restore(&self) -> Result<()> {
         if !self.backup_dir.exists() {
             return Ok(());
         }
 
         let manifest = read_manifest(&self.backup_dir)?;
-        for entry in manifest.surfaces {
-            let surface = ManagedSurface {
-                path: entry.original_path.clone(),
-                kind: entry.surface_kind,
-            };
-            remove_surface(&surface)?;
-
-            match entry.original_state {
-                BackupSurfaceState::Missing | BackupSurfaceState::Other => {}
-                BackupSurfaceState::File => {
-                    let backup_path = manifest_backup_path(&self.backup_dir, &entry)?;
-                    if let Some(parent) = surface.path.parent() {
-                        fs::create_dir_all(parent)
-                            .with_context(|| format!("failed to create {}", parent.display()))?;
+        validate_manifest(&self.backup_dir, &manifest, &self.surfaces)?;
+        let mut plans = manifest
+            .surfaces
+            .iter()
+            .map(|entry| RestorePlan::stage(&self.backup_dir, entry))
+            .collect::<Result<Vec<_>>>()?;
+        let mut committed = 0usize;
+        for index in 0..plans.len() {
+            if let Err(error) = plans[index].publish() {
+                let mut rollback_error = None;
+                for plan in plans[..=index].iter_mut().rev() {
+                    if let Err(error) = plan.rollback() {
+                        rollback_error.get_or_insert(error);
                     }
-                    ensure_backup_kind(&backup_path, BackupSurfaceState::File)?;
-                    fs::copy(&backup_path, &surface.path)
-                        .with_context(|| format!("failed to restore {}", surface.path.display()))?;
+                }
+                if let Some(rollback_error) = rollback_error {
+                    anyhow::bail!(
+                        "restore publication failed: {error}; rollback also failed: {rollback_error}"
+                    );
+                }
+                return Err(error);
+            }
+            committed += 1;
+        }
+        for plan in &mut plans[..committed] {
+            plan.finish()?;
+        }
+        Ok(())
+    }
+}
+
+struct RestorePlan {
+    destination: PathBuf,
+    holder: Option<tempfile::TempDir>,
+    staged: Option<PathBuf>,
+    previous: PathBuf,
+    moved_previous: bool,
+    published: bool,
+    hidden_paths: Vec<PathBuf>,
+    moved_hidden: usize,
+}
+
+impl RestorePlan {
+    fn stage(backup_dir: &Path, entry: &BackupSurface) -> Result<Self> {
+        let parent = entry.original_path.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "restore destination has no parent: {}",
+                entry.original_path.display()
+            )
+        })?;
+        let existing_parent = parent
+            .ancestors()
+            .find(|path| path.is_dir())
+            .map(Path::to_path_buf);
+        fs::create_dir_all(parent)?;
+        let holder = match tempfile::Builder::new()
+            .prefix(".lazyagents-restore-")
+            .tempdir_in(parent)
+        {
+            Ok(holder) => holder,
+            Err(error) => {
+                remove_new_empty_parents(parent, existing_parent.as_deref());
+                return Err(error.into());
+            }
+        };
+        let staged = holder.path().join("new");
+        let mut hidden_paths = Vec::new();
+        let stage_result = (|| -> Result<()> {
+            match entry.original_state {
+                BackupSurfaceState::Missing => {}
+                BackupSurfaceState::File => {
+                    fs::copy(manifest_backup_path(backup_dir, entry)?, &staged)?;
                 }
                 BackupSurfaceState::Directory => {
-                    let backup_path = manifest_backup_path(&self.backup_dir, &entry)?;
-                    if let Some(parent) = surface.path.parent() {
-                        fs::create_dir_all(parent)
-                            .with_context(|| format!("failed to create {}", parent.display()))?;
+                    match fs::symlink_metadata(&entry.original_path) {
+                        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                            collect_hidden_entry_roots(
+                                &entry.original_path,
+                                &entry.original_path,
+                                &mut hidden_paths,
+                            )?;
+                            fs::create_dir_all(&staged)?;
+                        }
+                        Ok(_) | Err(_) => fs::create_dir_all(&staged)?,
                     }
-                    ensure_backup_kind(&backup_path, BackupSurfaceState::Directory)?;
-                    copy_dir_all(&backup_path, &surface.path)
-                        .with_context(|| format!("failed to restore {}", surface.path.display()))?;
+                    copy_dir_all(manifest_backup_path(backup_dir, entry)?, &staged)?;
                 }
+                BackupSurfaceState::Other => unreachable!("validated manifest rejects other"),
+            }
+            Ok(())
+        })();
+        if let Err(error) = stage_result {
+            drop(holder);
+            remove_new_empty_parents(parent, existing_parent.as_deref());
+            return Err(error);
+        }
+        Ok(Self {
+            destination: entry.original_path.clone(),
+            previous: holder.path().join("previous"),
+            holder: Some(holder),
+            staged: (entry.original_state != BackupSurfaceState::Missing).then_some(staged),
+            moved_previous: false,
+            published: false,
+            hidden_paths,
+            moved_hidden: 0,
+        })
+    }
+
+    fn publish(&mut self) -> Result<()> {
+        match fs::symlink_metadata(&self.destination) {
+            Ok(_) => {
+                fs::rename(&self.destination, &self.previous)?;
+                self.moved_previous = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if let Some(staged) = &self.staged {
+            if let Err(error) = fs::rename(staged, &self.destination) {
+                if let Err(rollback_error) = self.rollback() {
+                    anyhow::bail!(
+                        "failed to publish restore data: {error}; failed to restore current destination: {rollback_error}"
+                    );
+                }
+                return Err(error.into());
+            }
+            self.published = true;
+            let hidden_paths = self.hidden_paths.clone();
+            for relative in &hidden_paths {
+                let source = self.previous.join(relative);
+                let target = self.destination.join(relative);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if let Err(error) = fs::rename(&source, &target) {
+                    if let Err(rollback_error) = self.rollback() {
+                        anyhow::bail!(
+                            "failed to preserve hidden entry {}: {error}; rollback also failed: {rollback_error}",
+                            relative.display()
+                        );
+                    }
+                    return Err(error).with_context(|| {
+                        format!("failed to preserve hidden entry {}", relative.display())
+                    });
+                }
+                self.moved_hidden += 1;
             }
         }
         Ok(())
     }
+
+    fn rollback(&mut self) -> Result<()> {
+        if self.published {
+            let moved_hidden = self.hidden_paths[..self.moved_hidden].to_vec();
+            for relative in moved_hidden.iter().rev() {
+                let source = self.destination.join(relative);
+                let target = self.previous.join(relative);
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if let Err(error) = fs::rename(&source, &target) {
+                    let recovery = self.preserve_holder();
+                    anyhow::bail!(
+                        "failed to return hidden entry {} during rollback: {error}; rollback data remains at {recovery}",
+                        relative.display()
+                    );
+                }
+            }
+            self.moved_hidden = 0;
+            if let Err(error) = remove_path_entirely(&self.destination) {
+                let recovery = self.preserve_holder();
+                anyhow::bail!("{error:#}; rollback data remains at {recovery}");
+            }
+            self.published = false;
+        }
+        if self.moved_previous {
+            if let Err(error) = fs::rename(&self.previous, &self.destination) {
+                let recovery = self.preserve_holder();
+                anyhow::bail!(
+                    "failed to restore current destination {}: {error}; rollback data remains at {recovery}",
+                    self.destination.display()
+                );
+            }
+            self.moved_previous = false;
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        if let Some(holder) = self.holder.take() {
+            let path = holder.path().to_path_buf();
+            holder
+                .close()
+                .with_context(|| format!("failed to remove restore staging {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    fn preserve_holder(&mut self) -> String {
+        self.holder
+            .take()
+            .map(|holder| holder.keep().display().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+}
+
+fn collect_hidden_entry_roots(
+    root: &Path,
+    directory: &Path,
+    hidden: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(directory)
+        .with_context(|| format!("failed to read {}", directory.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if is_hidden_name(&entry.file_name()) {
+            hidden.push(path.strip_prefix(root)?.to_path_buf());
+            continue;
+        }
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            collect_hidden_entry_roots(root, &path, hidden)?;
+        }
+    }
+    hidden.sort_by_key(|path| path.components().count());
+    Ok(())
+}
+
+fn remove_new_empty_parents(path: &Path, stop: Option<&Path>) {
+    let mut current = Some(path);
+    while let Some(directory) = current {
+        if Some(directory) == stop || fs::remove_dir(directory).is_err() {
+            break;
+        }
+        current = directory.parent();
+    }
+}
+
+fn validate_manifest(
+    backup_dir: &Path,
+    manifest: &BackupManifest,
+    expected: &[ManagedSurface],
+) -> Result<()> {
+    if manifest.surfaces.len() != expected.len() {
+        anyhow::bail!("backup manifest does not match the captured managed surfaces");
+    }
+    let mut paths = BTreeSet::new();
+    let mut backup_entries = BTreeSet::new();
+    for entry in &manifest.surfaces {
+        if !paths.insert(entry.original_path.clone()) {
+            anyhow::bail!(
+                "backup manifest repeats destination {}",
+                entry.original_path.display()
+            );
+        }
+        if !expected.iter().any(|surface| {
+            surface.path == entry.original_path && surface.kind == entry.surface_kind
+        }) {
+            anyhow::bail!(
+                "backup manifest contains unexpected destination {}",
+                entry.original_path.display()
+            );
+        }
+        match entry.original_state {
+            BackupSurfaceState::Missing => {
+                if entry.backup_entry.is_some() {
+                    anyhow::bail!("missing backup surface must not have backup data");
+                }
+            }
+            BackupSurfaceState::File | BackupSurfaceState::Directory => {
+                let name = entry.backup_entry.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "backup manifest entry for {} is missing backup data",
+                        entry.original_path.display()
+                    )
+                })?;
+                let path = Path::new(name);
+                if path.components().count() != 1
+                    || !matches!(
+                        path.components().next(),
+                        Some(std::path::Component::Normal(_))
+                    )
+                    || !backup_entries.insert(name.to_string())
+                {
+                    anyhow::bail!("backup manifest contains invalid backup entry {name}");
+                }
+                ensure_backup_kind(&backup_dir.join(name), entry.original_state)?;
+            }
+            BackupSurfaceState::Other => {
+                anyhow::bail!("backup manifest contains an unsupported surface type")
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -263,8 +557,11 @@ fn manifest_backup_path(backup_dir: &Path, entry: &BackupSurface) -> Result<Path
 }
 
 fn ensure_backup_kind(path: &Path, expected: BackupSurfaceState) -> Result<()> {
-    let metadata =
-        fs::metadata(path).with_context(|| format!("failed to inspect {}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("backup entry {} must not be a symlink", path.display());
+    }
     match expected {
         BackupSurfaceState::File if metadata.is_file() => Ok(()),
         BackupSurfaceState::Directory if metadata.is_dir() => Ok(()),
@@ -286,66 +583,68 @@ pub fn clear_surfaces(surfaces: &[ManagedSurface]) -> Result<()> {
     Ok(())
 }
 
-pub fn write_text_atomic(path: &Path, contents: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    let temp_path = temp_write_path(path);
-    {
-        let mut file = fs::File::create(&temp_path)
-            .with_context(|| format!("failed to create {}", temp_path.display()))?;
-        file.write_all(contents.as_bytes())
-            .with_context(|| format!("failed to write {}", temp_path.display()))?;
-        file.sync_all()
-            .with_context(|| format!("failed to flush {}", temp_path.display()))?;
-    }
-
-    fs::rename(&temp_path, path).with_context(|| {
-        format!(
-            "failed to rename {} to {}",
-            temp_path.display(),
-            path.display()
-        )
-    })
-}
-
-fn temp_write_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("lazyagents-config");
-    path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()))
-}
-
 fn copy_dir_all(src: impl AsRef<Path>, dst: impl AsRef<Path>) -> Result<()> {
-    fs::create_dir_all(&dst)
-        .with_context(|| format!("failed to create directory {}", dst.as_ref().display()))?;
-    for entry in fs::read_dir(&src)
-        .with_context(|| format!("failed to read directory {}", src.as_ref().display()))?
+    copy_dir_all_policy(src.as_ref(), dst.as_ref(), true)
+}
+
+fn copy_dir_all_policy(src: &Path, dst: &Path, ignore_hidden: bool) -> Result<()> {
+    let root =
+        fs::canonicalize(src).with_context(|| format!("failed to resolve {}", src.display()))?;
+    copy_dir_all_at(src, dst, &root, &mut BTreeSet::new(), ignore_hidden)
+}
+
+fn copy_dir_all_at(
+    src: &Path,
+    dst: &Path,
+    root: &Path,
+    active: &mut BTreeSet<PathBuf>,
+    ignore_hidden: bool,
+) -> Result<()> {
+    let identity =
+        fs::canonicalize(src).with_context(|| format!("failed to resolve {}", src.display()))?;
+    if !identity.starts_with(root) {
+        anyhow::bail!(
+            "directory {} resolves outside its managed tree",
+            src.display()
+        );
+    }
+    if !active.insert(identity.clone()) {
+        anyhow::bail!("directory cycle detected at {}", src.display());
+    }
+    fs::create_dir_all(dst)
+        .with_context(|| format!("failed to create directory {}", dst.display()))?;
+    for entry in
+        fs::read_dir(src).with_context(|| format!("failed to read directory {}", src.display()))?
     {
         let entry = entry?;
-        let is_hidden = entry
-            .file_name()
-            .to_str()
-            .map(|s| s.starts_with('.'))
-            .unwrap_or(false);
-        if is_hidden {
+        if ignore_hidden && is_hidden_name(&entry.file_name()) {
             continue;
         }
 
         let path = entry.path();
+        let link_metadata = fs::symlink_metadata(&path)?;
         let metadata = fs::metadata(&path)
             .with_context(|| format!("failed to get metadata for {}", path.display()))?;
-        let dst_path = dst.as_ref().join(entry.file_name());
+        if link_metadata.file_type().is_symlink() {
+            let resolved = fs::canonicalize(&path)?;
+            if !resolved.starts_with(root) {
+                anyhow::bail!(
+                    "symlink {} resolves outside its managed tree",
+                    path.display()
+                );
+            }
+        }
+        let dst_path = dst.join(entry.file_name());
         if metadata.is_dir() {
-            copy_dir_all(&path, dst_path)?;
+            copy_dir_all_at(&path, &dst_path, root, active, ignore_hidden)?;
         } else if metadata.is_file() {
             fs::copy(&path, &dst_path)
                 .with_context(|| format!("failed to copy to {}", dst_path.display()))?;
+        } else {
+            anyhow::bail!("unsupported filesystem entry {}", path.display());
         }
     }
+    active.remove(&identity);
     Ok(())
 }
 
@@ -353,32 +652,7 @@ fn remove_surface(surface: &ManagedSurface) -> Result<()> {
     match fs::symlink_metadata(&surface.path) {
         Ok(metadata) => {
             if metadata.is_dir() && surface.kind == ManagedSurfaceKind::Directory {
-                for entry in fs::read_dir(&surface.path).with_context(|| {
-                    format!("failed to read directory {}", surface.path.display())
-                })? {
-                    let entry = entry?;
-                    let is_hidden = entry
-                        .file_name()
-                        .to_str()
-                        .map(|s| s.starts_with('.'))
-                        .unwrap_or(false);
-                    if !is_hidden {
-                        let path = entry.path();
-                        let entry_metadata = fs::symlink_metadata(&path).with_context(|| {
-                            format!("failed to get metadata for {}", path.display())
-                        })?;
-                        if entry_metadata.is_dir() {
-                            fs::remove_dir_all(&path).with_context(|| {
-                                format!("failed to remove dir {}", path.display())
-                            })?;
-                        } else {
-                            fs::remove_file(&path).with_context(|| {
-                                format!("failed to remove file {}", path.display())
-                            })?;
-                        }
-                    }
-                }
-                Ok(())
+                clear_visible_directory_contents(&surface.path)
             } else if metadata.is_dir() {
                 fs::remove_dir_all(&surface.path)
                     .with_context(|| format!("failed to remove {}", surface.path.display()))
@@ -394,10 +668,104 @@ fn remove_surface(surface: &ManagedSurface) -> Result<()> {
     }
 }
 
+fn remove_path_entirely(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(path).with_context(|| format!("failed to remove {}", path.display()))
+        }
+        Ok(_) => {
+            fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn clear_visible_directory_contents(path: &Path) -> Result<()> {
+    for entry in fs::read_dir(path)
+        .with_context(|| format!("failed to read directory {}", path.display()))?
+    {
+        let entry = entry?;
+        if is_hidden_name(&entry.file_name()) {
+            continue;
+        }
+        let entry_path = entry.path();
+        let metadata = fs::symlink_metadata(&entry_path)
+            .with_context(|| format!("failed to inspect {}", entry_path.display()))?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            clear_visible_directory_contents(&entry_path)?;
+            if fs::read_dir(&entry_path)
+                .with_context(|| format!("failed to read directory {}", entry_path.display()))?
+                .next()
+                .is_none()
+            {
+                fs::remove_dir(&entry_path).with_context(|| {
+                    format!("failed to remove directory {}", entry_path.display())
+                })?;
+            }
+        } else {
+            fs::remove_file(&entry_path)
+                .with_context(|| format!("failed to remove file {}", entry_path.display()))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+
+    #[cfg(unix)]
+    #[test]
+    fn rollback_preserves_hidden_entries_without_reading_them() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{symlink, FileTypeExt};
+
+        unsafe extern "C" {
+            fn mkfifo(path: *const std::os::raw::c_char, mode: u32) -> i32;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("lazyagents");
+        let skills = temp.path().join("skills");
+        fs::create_dir_all(skills.join("visible/nested")).unwrap();
+        fs::write(skills.join("visible/old.txt"), "old").unwrap();
+        fs::write(skills.join(".hidden"), "secret").unwrap();
+        fs::write(skills.join("visible/nested/.data"), "nested").unwrap();
+        let external = temp.path().join("external");
+        fs::write(&external, "external").unwrap();
+        symlink(&external, skills.join(".external-link")).unwrap();
+        let fifo = skills.join(".pipe");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+
+        let backup =
+            ManagedBackup::capture(&home, "codex", &[ManagedSurface::directory(&skills)]).unwrap();
+        clear_surfaces(&[ManagedSurface::directory(&skills)]).unwrap();
+        fs::write(skills.join("new.txt"), "new").unwrap();
+        backup.restore().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(skills.join("visible/old.txt")).unwrap(),
+            "old"
+        );
+        assert!(!skills.join("new.txt").exists());
+        assert_eq!(
+            fs::read_to_string(skills.join(".hidden")).unwrap(),
+            "secret"
+        );
+        assert_eq!(
+            fs::read_to_string(skills.join("visible/nested/.data")).unwrap(),
+            "nested"
+        );
+        assert!(fs::symlink_metadata(skills.join(".external-link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::symlink_metadata(fifo).unwrap().file_type().is_fifo());
+    }
 
     #[test]
     fn managed_backup_captures_and_restores_surfaces_on_disk() {
@@ -469,12 +837,15 @@ mod tests {
         assert!(!temp_dir.exists());
 
         // Modify surfaces
-        fs::write(&file_path, "changed contents").unwrap();
+        fs::remove_file(&file_path).unwrap();
+        fs::create_dir(&file_path).unwrap();
+        fs::write(file_path.join("unexpected"), "changed contents").unwrap();
         fs::remove_dir_all(&dir_path).unwrap();
-        fs::write(&missing_path, "suddenly exists").unwrap();
+        fs::create_dir(&missing_path).unwrap();
+        fs::write(missing_path.join("unexpected"), "suddenly exists").unwrap();
 
         // Restore
-        backup.restore(&surfaces).unwrap();
+        backup.restore().unwrap();
 
         // Assert states reverted correctly
         assert_eq!(fs::read_to_string(&file_path).unwrap(), "file contents");
@@ -541,6 +912,11 @@ mod tests {
         fs::create_dir_all(&hidden_dir).unwrap();
         fs::write(hidden_dir.join("system_skill.txt"), "system").unwrap();
 
+        let visible_dir = dir_path.join("visible-dir");
+        fs::create_dir_all(&visible_dir).unwrap();
+        fs::write(visible_dir.join("visible.txt"), "nested visible").unwrap();
+        fs::write(visible_dir.join(".nested-hidden.txt"), "nested hidden").unwrap();
+
         let surfaces = vec![ManagedSurface::directory(&dir_path)];
 
         // Capture backup
@@ -550,19 +926,25 @@ mod tests {
         // Check backup dir doesn't contain hidden files
         let backup_dir = lazyagents_home.join("backups").join(harness_kind.id());
         assert!(backup_dir.join("skills").join("visible.txt").exists());
+        assert!(backup_dir.join("skills/visible-dir/visible.txt").exists());
         assert!(!backup_dir.join("skills").join(".hidden.txt").exists());
         assert!(!backup_dir.join("skills").join(".system").exists());
+        assert!(!backup_dir
+            .join("skills/visible-dir/.nested-hidden.txt")
+            .exists());
 
         // Clear surfaces (simulating profile apply)
         super::clear_surfaces(&surfaces).unwrap();
 
         // Assert original visible is gone, but hidden ones remain
         assert!(!dir_path.join("visible.txt").exists());
+        assert!(!visible_dir.join("visible.txt").exists());
+        assert!(visible_dir.join(".nested-hidden.txt").exists());
         assert!(dir_path.join(".hidden.txt").exists());
         assert!(dir_path.join(".system").join("system_skill.txt").exists());
 
         // Restore backup
-        backup.restore(&surfaces).unwrap();
+        backup.restore().unwrap();
 
         // Assert visible is back, hidden still remain unchanged
         assert_eq!(
@@ -572,6 +954,14 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir_path.join(".hidden.txt")).unwrap(),
             "hidden"
+        );
+        assert_eq!(
+            fs::read_to_string(visible_dir.join("visible.txt")).unwrap(),
+            "nested visible"
+        );
+        assert_eq!(
+            fs::read_to_string(visible_dir.join(".nested-hidden.txt")).unwrap(),
+            "nested hidden"
         );
         assert_eq!(
             fs::read_to_string(dir_path.join(".system").join("system_skill.txt")).unwrap(),
@@ -599,31 +989,104 @@ mod tests {
         )
         .unwrap();
 
-        let error = backup.restore(&surfaces).unwrap_err();
+        let error = backup.restore().unwrap_err();
         assert!(format!("{error:#}").contains("invalid backup manifest"));
+        assert_eq!(fs::read_to_string(file_path).unwrap(), "before");
     }
 
     #[test]
-    fn write_text_atomic_uses_same_directory_temp_file_and_replaces_content() {
+    fn damaged_later_backup_entry_leaves_every_destination_unchanged() {
         let temp = tempfile::tempdir().unwrap();
-        let target = temp.path().join("config.json");
+        let lazyagents_home = temp.path().join("lazyagents");
+        let first = temp.path().join("first.json");
+        let second = temp.path().join("second.json");
+        fs::write(&first, "first backup").unwrap();
+        fs::write(&second, "second backup").unwrap();
+        let surfaces = vec![ManagedSurface::file(&first), ManagedSurface::file(&second)];
+        let backup = ManagedBackup::capture(&lazyagents_home, "codex", &surfaces).unwrap();
+        fs::write(&first, "first current").unwrap();
+        fs::write(&second, "second current").unwrap();
+        fs::remove_file(lazyagents_home.join("backups/codex/second.json")).unwrap();
 
-        write_text_atomic(&target, "{\"old\":true}").unwrap();
-        write_text_atomic(&target, "{\"new\":true}").unwrap();
+        assert!(backup.restore().is_err());
+        assert_eq!(fs::read_to_string(first).unwrap(), "first current");
+        assert_eq!(fs::read_to_string(second).unwrap(), "second current");
+    }
 
-        assert_eq!(fs::read_to_string(&target).unwrap(), "{\"new\":true}");
+    #[cfg(unix)]
+    #[test]
+    fn backup_symlink_data_is_rejected_before_destination_mutation() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("lazyagents");
+        let destination = temp.path().join("settings.json");
+        fs::write(&destination, "backup").unwrap();
+        let surfaces = vec![ManagedSurface::file(&destination)];
+        let backup = ManagedBackup::capture(&home, "codex", &surfaces).unwrap();
+        fs::write(&destination, "current").unwrap();
+        let stored = home.join("backups/codex/settings.json");
+        fs::remove_file(&stored).unwrap();
+        symlink(&destination, &stored).unwrap();
+        assert!(backup.restore().is_err());
+        assert_eq!(fs::read_to_string(destination).unwrap(), "current");
+    }
 
-        let leftovers = fs::read_dir(temp.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(leftovers, vec!["config.json"]);
-
-        let temp_path = temp_write_path(&target);
-        assert_eq!(temp_path.parent(), target.parent());
+    #[cfg(unix)]
+    #[test]
+    fn later_staging_failure_cleans_restore_holders_without_mutation() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("lazyagents");
+        let first = temp.path().join("first.json");
+        let second = temp.path().join("second");
+        fs::write(&first, "first backup").unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(second.join("data"), "second backup").unwrap();
+        let surfaces = vec![
+            ManagedSurface::file(&first),
+            ManagedSurface::directory(&second),
+        ];
+        let backup = ManagedBackup::capture(&home, "codex", &surfaces).unwrap();
+        fs::write(&first, "first current").unwrap();
+        fs::write(second.join("data"), "second current").unwrap();
+        let stored = home.join("backups/codex/second/data");
+        fs::remove_file(&stored).unwrap();
+        symlink(&first, &stored).unwrap();
+        assert!(backup.restore().is_err());
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first current");
         assert_eq!(
-            temp_path.file_name().unwrap().to_string_lossy(),
-            ".config.json.".to_owned() + &std::process::id().to_string() + ".tmp"
+            fs::read_to_string(second.join("data")).unwrap(),
+            "second current"
         );
+        assert!(!fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".lazyagents-restore-")
+            }));
+    }
+
+    #[test]
+    fn managed_backup_recovers_interrupted_previous_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let lazyagents_home = temp.path().join("lazyagents");
+        let file_path = temp.path().join("settings.json");
+        fs::write(&file_path, "first").unwrap();
+        let surfaces = vec![ManagedSurface::file(&file_path)];
+
+        ManagedBackup::capture(&lazyagents_home, "codex", &surfaces).unwrap();
+        let backups = lazyagents_home.join("backups");
+        fs::rename(backups.join("codex"), backups.join(".codex.previous")).unwrap();
+
+        fs::write(&file_path, "second").unwrap();
+        let backup = ManagedBackup::capture(&lazyagents_home, "codex", &surfaces).unwrap();
+        fs::write(&file_path, "changed").unwrap();
+        backup.restore().unwrap();
+
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "second");
+        assert!(!backups.join(".codex.previous").exists());
     }
 }

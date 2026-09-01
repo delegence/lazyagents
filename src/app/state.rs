@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 use fs2::FileExt;
@@ -67,18 +67,33 @@ impl LazyagentsState {
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        let temp_path = temp_state_path(path);
         let raw = RawState::from_state(self);
         let text = serde_json::to_string_pretty(&raw)?;
-        fs::write(&temp_path, format!("{text}\n"))
-            .with_context(|| format!("failed to write {}", temp_path.display()))?;
-        fs::rename(&temp_path, path)
+        crate::file_system::write_text_atomic(path, &format!("{text}\n"))
             .with_context(|| format!("failed to save state file at {}", path.display()))
     }
+}
+
+pub fn active_profile_for_aliases(
+    state: &LazyagentsState,
+    aliases: &[String],
+) -> Result<Option<ProfileName>> {
+    let mut active: Option<(&str, &ProfileName)> = None;
+    for alias in aliases {
+        let Some(profile) = state.active_profiles.get(alias) else {
+            continue;
+        };
+        if let Some((active_alias, active_profile)) = active {
+            if active_profile != profile {
+                anyhow::bail!(
+                    "harness aliases {active_alias} and {alias} share configDir but reference different active profiles ({active_profile} and {profile})"
+                );
+            }
+        } else {
+            active = Some((alias, profile));
+        }
+    }
+    Ok(active.map(|(_, profile)| profile.clone()))
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -105,14 +120,6 @@ impl RawState {
             .collect();
         Self { active_profiles }
     }
-}
-
-fn temp_state_path(path: &Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state.json");
-    path.with_file_name(format!(".{file_name}.tmp"))
 }
 
 #[cfg(test)]
@@ -167,5 +174,37 @@ mod tests {
         }
 
         let _second = LazyagentsHomeLock::acquire(temp.path()).unwrap();
+    }
+
+    #[test]
+    fn aliases_resolve_one_shared_active_profile() {
+        let mut state = LazyagentsState::default();
+        state
+            .active_profiles
+            .insert("codex".to_string(), ProfileName::parse("work").unwrap());
+
+        let profile =
+            active_profile_for_aliases(&state, &["codex".to_string(), "codex-max".to_string()])
+                .unwrap();
+
+        assert_eq!(profile.unwrap().as_str(), "work");
+    }
+
+    #[test]
+    fn aliases_reject_inconsistent_active_profiles() {
+        let mut state = LazyagentsState::default();
+        state
+            .active_profiles
+            .insert("codex".to_string(), ProfileName::parse("work").unwrap());
+        state.active_profiles.insert(
+            "codex-max".to_string(),
+            ProfileName::parse("personal").unwrap(),
+        );
+
+        let error =
+            active_profile_for_aliases(&state, &["codex".to_string(), "codex-max".to_string()])
+                .unwrap_err();
+
+        assert!(error.to_string().contains("different active profiles"));
     }
 }
