@@ -1,6 +1,6 @@
 # lazyagents
 
-`lazyagents` turns any folder into a local AI agent. Describe its role, choose a harness, and start chatting.
+Turn any folder into an AI agent. Describe its role, choose a harness, and start chatting.
 
 ## Install
 
