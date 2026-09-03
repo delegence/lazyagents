@@ -1,18 +1,24 @@
 [package]
 name = "lazyagents"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Manage reusable coding-agent profiles across local agent harnesses."
+description = "Turn any folder into a local AI agent. Describe its role, choose harness, and start chatting."
 license = "MIT"
 repository = "https://github.com/delegence/lazyagents"
 readme = "README.md"
 
 [dependencies]
 anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
+indicatif = "0.18"
+libc = "0.2"
+pulldown-cmark = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-yaml_backend = { package = "serde_yaml", version = "0.9" }
-fs2 = "0.4"
+tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
 tempfile = "3"
-toml_edit = "0.22"

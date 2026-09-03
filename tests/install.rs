@@ -12,6 +12,15 @@ fn output(command: &str, args: &[&str]) -> String {
 }
 
 #[test]
+fn installer_is_executable() {
+    let installer = concat!(env!("CARGO_MANIFEST_DIR"), "/install.sh");
+    assert_ne!(
+        fs::metadata(installer).unwrap().permissions().mode() & 0o111,
+        0
+    );
+}
+
+#[test]
 fn installer_resolves_relative_destination_from_callers_directory() {
     let temp = tempfile::tempdir().unwrap();
     let caller = temp.path().join("caller");

@@ -1,9 +1,22 @@
 [tools]
 rust = "1.92.0"
+node = "22"
 
 [tasks.test]
 description = "Run the test suite"
-run = "cargo test"
+run = "cargo test --all-targets --locked"
+
+[tasks.check]
+description = "Run formatting, lint, and test checks"
+run = '''
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --locked
+'''
+
+[tasks.build]
+description = "Build the release binary"
+run = "cargo build --release --locked"
 
 [tasks.release]
 description = "Bump the version, test, commit Cargo version files, tag, and push"

@@ -3,9 +3,10 @@ set -eu
 
 repo="delegence/lazyagents"
 bin_name="lazyagents"
-install_dir="${LAZYAGENTS_INSTALL_DIR:-$HOME/.local/bin}"
 version="${LAZYAGENTS_VERSION:-latest}"
 caller_dir="$(pwd -P)"
+tmp_dir=""
+install_tmp=""
 
 fail() {
   echo "lazyagents installer: $*" >&2
@@ -17,8 +18,17 @@ need() {
 }
 
 need curl
+need mktemp
 need tar
 need uname
+
+if [ -n "${LAZYAGENTS_INSTALL_DIR:-}" ]; then
+  install_dir="$LAZYAGENTS_INSTALL_DIR"
+elif [ -n "${HOME:-}" ]; then
+  install_dir="$HOME/.local/bin"
+else
+  fail "HOME is not set; set LAZYAGENTS_INSTALL_DIR"
+fi
 
 case "$install_dir" in
   /*) ;;
@@ -34,7 +44,15 @@ arch="$(uname -m)"
 
 case "$os" in
   Darwin) os_target="apple-darwin" ;;
-  Linux) os_target="unknown-linux-gnu" ;;
+  Linux)
+    if command -v ldd >/dev/null 2>&1; then
+      libc="$(ldd --version 2>&1 || true)"
+      case "$libc" in
+        *musl*) fail "musl Linux is not supported; install from source" ;;
+      esac
+    fi
+    os_target="unknown-linux-gnu"
+    ;;
   *) fail "unsupported operating system: $os" ;;
 esac
 
@@ -58,7 +76,14 @@ else
 fi
 
 tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT INT TERM
+cleanup() {
+  [ -z "$install_tmp" ] || rm -f "$install_tmp"
+  [ -z "$tmp_dir" ] || rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 echo "Downloading $asset..."
 curl -fsSL "$base_url/$asset" -o "$tmp_dir/$asset"
@@ -67,19 +92,32 @@ curl -fsSL "$base_url/checksums.txt" -o "$tmp_dir/checksums.txt"
 cd "$tmp_dir"
 
 if command -v sha256sum >/dev/null 2>&1; then
-  grep "  $asset\$" checksums.txt | sha256sum -c -
+  actual="$(sha256sum "$asset")"
 elif command -v shasum >/dev/null 2>&1; then
-  expected="$(grep "  $asset\$" checksums.txt | awk '{print $1}')"
-  actual="$(shasum -a 256 "$asset" | awk '{print $1}')"
-  [ "$expected" = "$actual" ] || fail "checksum mismatch for $asset"
+  actual="$(shasum -a 256 "$asset")"
 else
-  echo "lazyagents installer: sha256sum or shasum not found; skipping checksum verification" >&2
+  fail "missing required command: sha256sum or shasum"
 fi
+actual="${actual%% *}"
+
+expected=""
+while read -r checksum filename; do
+  if [ "$filename" = "$asset" ]; then
+    expected="$checksum"
+    break
+  fi
+done < checksums.txt
+[ -n "$expected" ] || fail "checksums.txt has no entry for $asset"
+[ "$expected" = "$actual" ] || fail "checksum mismatch for $asset"
+echo "$asset: OK"
 
 tar -xzf "$asset"
 mkdir -p "$install_dir" || fail "cannot create install destination: $install_dir"
-cp "$bin_name-$target/$bin_name" "$install_dir/$bin_name" || fail "cannot copy binary to $install_dir"
-chmod 755 "$install_dir/$bin_name" || fail "cannot make installed binary executable"
+install_tmp="$(mktemp "$install_dir/.$bin_name.XXXXXX")" || fail "cannot create a temporary file in $install_dir"
+cp "$bin_name-$target/$bin_name" "$install_tmp" || fail "cannot copy binary to $install_dir"
+chmod 755 "$install_tmp" || fail "cannot make installed binary executable"
+mv -f "$install_tmp" "$install_dir/$bin_name" || fail "cannot replace binary in $install_dir"
+install_tmp=""
 
 echo "Installed $bin_name to $install_dir/$bin_name"
 
