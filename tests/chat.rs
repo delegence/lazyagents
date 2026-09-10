@@ -814,7 +814,8 @@ fn terminal_command(
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut size,
+                // macOS takes a mutable pointer; Linux takes a const pointer.
+                &raw mut size,
             )
         },
         0

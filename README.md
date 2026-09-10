@@ -140,6 +140,4 @@ cargo build --release --locked
 
 Use `cargo run -- <command>` to run from source.
 
-`src/chat/mod.rs` runs the chat loop and selectors. Its sibling modules handle slash commands, terminal input, editor state, layout, and output. Shared setup and chat prompts live in `src/prompts.rs`.
-
 Harness implementations live in `src/harness/`. To add one, implement the `Harness` trait and register it in `HARNESSES` in `src/harness/mod.rs`.
