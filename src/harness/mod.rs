@@ -132,25 +132,55 @@ pub async fn install_adapter(root: &Path, harness: &dyn Harness) -> Result<()> {
     fs::create_dir_all(&runtime)?;
     let package = format!("{}@{}", adapter.package, adapter.version);
 
-    let spinner = crate::progress::start(format!("Installing {package}..."));
-    let output = Command::new(npm)
-        .args([
-            "install",
-            "--ignore-scripts",
-            "--no-audit",
-            "--no-fund",
-            "--package-lock=false",
-            "--no-save",
-            "--prefix",
-        ])
-        .arg(&runtime)
-        .arg(&package)
-        .env("NPM_CONFIG_MIN_RELEASE_AGE", "0")
-        .stdin(Stdio::null())
-        .output()
-        .await;
+    let input = crate::prompts::CancellationInput::new()?;
+    let spinner = crate::progress::start("Preparing harness...".to_owned());
+    let output = async {
+        let mut command = Command::new(npm);
+        command
+            .args([
+                "install",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                "--package-lock=false",
+                "--no-save",
+                "--prefix",
+            ])
+            .arg(&runtime)
+            .arg(&package)
+            .env("NPM_CONFIG_MIN_RELEASE_AGE", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command.spawn().context("could not run npm")?;
+        #[cfg(unix)]
+        let pid = child.id();
+        let output = child.wait_with_output();
+        tokio::pin!(output);
+        tokio::select! {
+            biased;
+            result = &mut output => result.context("could not run npm"),
+            result = input.cancelled(true) => {
+                #[cfg(unix)]
+                {
+                    // Stop npm and its children before setup removes their files.
+                    if let Some(pid) = pid {
+                        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
+                    }
+                    let _ = output.await;
+                }
+                result?;
+                Err(crate::prompts::Cancelled.into())
+            }
+        }
+    }
+    .await;
     spinner.finish_and_clear();
-    let output = output.context("could not run npm")?;
+    drop(input);
+    let output = output?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);

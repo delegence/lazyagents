@@ -1,12 +1,12 @@
 use std::env;
-use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{anyhow, bail, Context, Result};
+use inquire::validator::{StringValidator, Validation};
 use inquire::{Confirm, InquireError, Select, Text};
 use tokio::process::Command;
 
@@ -14,12 +14,13 @@ use crate::acp::{Client, ConfigChoice, ConfigKind, StreamEvent};
 use crate::config::{paths, AgentConfig};
 use crate::harness;
 use crate::harness::Harness;
+use crate::prompts::{CancellationInput, Cancelled};
 
 const SOUL_WRITER: &str = "You write precise system prompts for small AI agents. Return only the finished Markdown system prompt. Do not use a code fence. Define the agent's identity, purpose, operating principles, boundaries, and response style. Keep it concise and useful. Do not invent tools, skills, files, or facts that were not supplied.";
 
 pub async fn run(root: PathBuf) -> Result<()> {
     match run_setup(root).await {
-        Err(error) if error.downcast_ref::<SetupCancelled>().is_some() => {
+        Err(error) if error.downcast_ref::<Cancelled>().is_some() => {
             println!("Setup cancelled.");
             Ok(())
         }
@@ -36,13 +37,21 @@ async fn run_setup(root: PathBuf) -> Result<()> {
     println!("Create an Agent in {}\n", display_path(&root));
     let selected = select_harness(&available)?;
     print_answer("Harness", selected.display_name())?;
-    let name = text("What is your Agent name:")?;
+    let name = text("What is your Agent name:", |value: &str| {
+        Ok(match make_slug(value) {
+            Ok(_) => Validation::Valid,
+            Err(error) => Validation::Invalid(error.to_string().into()),
+        })
+    })?;
     let slug = make_slug(&name)?;
     print_answer("Agent name", &name)?;
-    let description = text("Describe what your Agent does:")?;
-    if description.trim().is_empty() {
-        bail!("the agent description cannot be empty");
-    }
+    let description = text("Describe what your Agent does:", |value: &str| {
+        Ok(if value.trim().is_empty() {
+            Validation::Invalid("the agent description cannot be empty".into())
+        } else {
+            Validation::Valid
+        })
+    })?;
     print_answer("Agent description", &description)?;
 
     let agent_paths = paths(&root);
@@ -112,7 +121,18 @@ async fn create_agent(
     harness::install_adapter(root, selected).await?;
 
     let launch = harness::launch(root, &config.harness, SOUL_WRITER)?;
-    let mut client = Client::start(launch, root, Vec::new(), None).await?;
+    let input = CancellationInput::new()?;
+    let spinner = crate::progress::start("Preparing harness...".to_owned());
+    let client = tokio::select! {
+        biased;
+        result = Client::start(launch, root, Vec::new(), None) => result,
+        result = input.cancelled(true) => {
+            result.and(Err(Cancelled.into()))
+        }
+    };
+    spinner.finish_and_clear();
+    drop(input);
+    let mut client = client?;
     let model = choose_option(
         &mut client,
         ConfigKind::Model,
@@ -125,15 +145,30 @@ async fn create_agent(
     let thinking = choose_option(
         &mut client,
         ConfigKind::Thinking,
-        "Select thinking level for your Agent:",
+        "Select reasoning level for your Agent:",
     )
     .await?;
     config.thinking.clone_from(&thinking.value);
-    show_selection("Thinking level", &thinking)?;
+    show_selection("Reasoning level", &thinking)?;
+    let input = CancellationInput::new()?;
     let spinner = crate::progress::start("Creating SOUL.md...".to_owned());
-    let soul = generate_soul(&mut client, &config).await;
+    let soul = tokio::select! {
+        biased;
+        result = generate_soul(&mut client, &config) => result,
+        result = input.cancelled(true) => {
+            match result {
+                Ok(()) => {
+                    // Close the adapter below even if it ignores cancellation.
+                    let _ = client.cancel_prompt(|_| Ok(None)).await;
+                    Err(Cancelled.into())
+                }
+                Err(error) => Err(error),
+            }
+        }
+    };
     client.close().await;
     spinner.finish_and_clear();
+    drop(input);
     let soul = soul?;
     let agent_paths = paths(root);
     fs::write(&agent_paths.soul, format!("{}\n", soul.trim()))
@@ -229,7 +264,11 @@ async fn generate_soul(client: &mut Client, config: &AgentConfig) -> Result<Stri
 }
 
 fn print_answer(label: &str, value: &str) -> Result<()> {
-    println!("> {label}: {value}");
+    if io::stdout().is_terminal() {
+        println!("> {label}: \x1b[1m{value}\x1b[0m");
+    } else {
+        println!("> {label}: {value}");
+    }
     io::stdout().flush()?;
     Ok(())
 }
@@ -254,7 +293,12 @@ fn select_harness(available: &[&'static dyn Harness]) -> Result<&'static dyn Har
         .iter()
         .map(|harness| harness.display_name())
         .collect();
-    let selected = inquire(|| Select::new("Select harness runtime", names).prompt())?;
+    let label = "Select harness runtime";
+    let selected = inquire(label, || {
+        Select::new(label, names)
+            .with_formatter(&|_| String::new())
+            .prompt()
+    })?;
     available
         .iter()
         .copied()
@@ -262,12 +306,23 @@ fn select_harness(available: &[&'static dyn Harness]) -> Result<&'static dyn Har
         .context("selected harness is unavailable")
 }
 
-fn text(label: &str) -> Result<String> {
-    inquire(|| Text::new(label).prompt()).map(|value| value.trim().to_owned())
+fn text(label: &str, validator: impl StringValidator + 'static) -> Result<String> {
+    inquire(label, || {
+        Text::new(label)
+            .with_validator(validator)
+            .with_formatter(&|_| String::new())
+            .prompt()
+    })
+    .map(|value| value.trim().to_owned())
 }
 
 fn confirm(label: &str, default: bool) -> Result<bool> {
-    inquire(|| Confirm::new(label).with_default(default).prompt())
+    inquire(label, || {
+        Confirm::new(label)
+            .with_default(default)
+            .with_formatter(&|_| String::new())
+            .prompt()
+    })
 }
 
 async fn choose_option(
@@ -297,9 +352,10 @@ async fn choose_option(
         .iter()
         .position(|choice| choice.0.value == option.current_value)
         .unwrap_or_default();
-    let selected = inquire(|| {
+    let selected = inquire(label, || {
         Select::new(label, choices)
             .with_starting_cursor(cursor)
+            .with_formatter(&|_| String::new())
             .prompt()
     })?
     .0;
@@ -334,32 +390,24 @@ impl fmt::Display for Choice {
     }
 }
 
-fn inquire<T>(prompt: impl FnOnce() -> std::result::Result<T, InquireError>) -> Result<T> {
-    let result = crate::prompts::run(prompt);
+fn inquire<T>(
+    message: &str,
+    prompt: impl FnOnce() -> std::result::Result<T, InquireError>,
+) -> Result<T> {
+    let result = crate::prompts::run(message, prompt);
     match result {
         Ok(value) => Ok(value),
         Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
-            Err(SetupCancelled.into())
+            Err(Cancelled.into())
         }
         Err(error) => Err(error.into()),
     }
 }
 
-#[derive(Debug)]
-struct SetupCancelled;
-
-impl fmt::Display for SetupCancelled {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("setup cancelled")
-    }
-}
-
-impl Error for SetupCancelled {}
-
 fn optional_confirm(label: &str, default: bool) -> Result<bool> {
     match confirm(label, default) {
         Ok(value) => Ok(value),
-        Err(error) if error.downcast_ref::<SetupCancelled>().is_some() => Ok(false),
+        Err(error) if error.downcast_ref::<Cancelled>().is_some() => Ok(false),
         Err(error) => Err(error),
     }
 }

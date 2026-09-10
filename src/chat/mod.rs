@@ -221,7 +221,7 @@ pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
         input.accepted()?;
         let mut system_error = String::new();
         let mut display = TurnDisplay::new();
-        let turn_input = self::input::TurnInput::new()?;
+        let turn_input = crate::prompts::CancellationInput::new()?;
         display.start_waiting();
         let answer = tokio::select! {
             biased;
@@ -240,7 +240,7 @@ pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
                     display.handle(event, permission_selection)
                 }
             }, Some(Duration::from_secs(config.idle_timeout.get()))) => Some(result),
-            result = turn_input.cancelled() => {
+            result = turn_input.cancelled(false) => {
                 result?;
                 None
             },
@@ -643,7 +643,7 @@ async fn apply_selection(
         if !client.set_config(kind, selection).await? {
             let name = match kind {
                 ConfigKind::Model => "model",
-                ConfigKind::Thinking => "thinking level",
+                ConfigKind::Thinking => "reasoning level",
             };
             eprintln!("warning: saved {name} {selection:?} is unavailable; using the default");
         }

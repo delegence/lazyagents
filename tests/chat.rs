@@ -1047,6 +1047,429 @@ fn plain_byte(text: &mut String, ansi: &mut u8, byte: u8) {
     }
 }
 
+fn terminal_prompt(
+    chat: &mut Chat,
+    terminal: &mut fs::File,
+    screen: &mut vt100::Parser,
+    label: &str,
+    input: &[u8],
+) {
+    let mut plain = String::new();
+    let mut ansi = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let byte = chat
+            .output
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|error| panic!("waiting for {label}: {error}; {plain}"));
+        terminal_byte(chat, terminal, screen, byte);
+        plain_byte(&mut plain, &mut ansi, byte);
+        if plain.contains(label) && chat.text.ends_with("\x1b[?25h") {
+            break;
+        }
+    }
+    terminal.write_all(input).unwrap();
+}
+
+fn preparing_agent() -> tempfile::TempDir {
+    let root = agent();
+    fs::remove_dir_all(root.path().join(".agents")).unwrap();
+    for (name, script) in [
+        ("pi", "#!/bin/sh\nexit 0\n"),
+        ("node", "#!/bin/sh\nexec \"$@\"\n"),
+        (
+            "npm",
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$$" > npm.pid
+sleep 60 &
+sleeper=$!
+printf '%s\n' "$sleeper" > npm-child.pid
+trap 'kill "$sleeper" 2>/dev/null || true' EXIT
+attempts=0
+while [ ! -f finish-install ]; do
+  attempts=$((attempts + 1))
+  [ "$attempts" -lt 500 ] || exit 1
+  sleep 0.02
+done
+kill "$sleeper"
+wait "$sleeper" 2>/dev/null || true
+mkdir -p .agents/runtime/acp-pi/node_modules/.bin
+cp bin/opencode .agents/runtime/acp-pi/node_modules/.bin/pi-acp
+"#,
+        ),
+    ] {
+        let path = root.path().join("bin").join(name);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    root
+}
+
+fn terminal_progress(
+    chat: &mut Chat,
+    terminal: &mut fs::File,
+    screen: &mut vt100::Parser,
+    message: &str,
+    marker: &std::path::Path,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !screen.screen().contents().contains(message) || !marker.exists() {
+        if let Ok(byte) = chat.output.recv_timeout(Duration::from_millis(30)) {
+            terminal_byte(chat, terminal, screen, byte);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "waiting for {message}: {}",
+            screen.screen().contents()
+        );
+    }
+}
+
+#[test]
+fn setup_retries_invalid_text_and_cleans_up_scrolled_menus() {
+    for (width, submit_model) in [(80, false), (40, false), (80, true)] {
+        let root = agent();
+        fs::remove_dir_all(root.path().join(".agents")).unwrap();
+        let adapter = root.path().join("bin/opencode");
+        let script = fs::read_to_string(&adapter).unwrap();
+        let models = (0..12)
+            .map(|index| serde_json::json!({"value": format!("model-{index}"), "name": format!("Model {index}")}))
+            .collect::<Vec<_>>();
+        fs::write(
+            adapter,
+            script.replace(
+                r#"[{"value":"fast","name":"Fast"},{"value":"deep","name":"Deep"}]"#,
+                &serde_json::to_string(&models).unwrap(),
+            ),
+        )
+        .unwrap();
+        let (mut chat, mut terminal, _slave) = terminal_command(root.path(), width, 12, "init");
+        let mut screen = vt100::Parser::new(12, width, 100);
+        let mut prompt = |label: &str, input: &[u8]| {
+            terminal_prompt(&mut chat, &mut terminal, &mut screen, label, input);
+        };
+        prompt("Select harness runtime", b"OpenCode\r");
+        prompt("What is your Agent name:", b"\r");
+        prompt("the agent name must contain", b"   \r");
+        prompt("What is your Agent name:", b" -- \r");
+        prompt(
+            "What is your Agent name:",
+            b"\x7f\x7f\x7f\x7f\x7f\x7f\x7fBuddy\r",
+        );
+        prompt("Describe what your Agent does:", b"\r");
+        prompt("the agent description cannot be empty", b"   \r");
+        prompt("Describe what your Agent does:", b"friend\r");
+        prompt(
+            "Select model for your Agent:",
+            if submit_model { b"\r" } else { b"\x1b" },
+        );
+        if submit_model {
+            prompt("Select reasoning level for your Agent:", b"\x1b");
+        }
+        loop {
+            let byte = chat.output.recv_timeout(Duration::from_secs(5)).unwrap();
+            terminal_byte(&mut chat, &mut terminal, &mut screen, byte);
+            if chat.text.ends_with("Setup cancelled.\r\n") {
+                break;
+            }
+        }
+        chat.wait_for_exit();
+        assert!(chat.text.contains("> Agent name: \x1b[1mBuddy\x1b[0m\r\n"));
+        let contents = screen.screen().contents();
+        let answer = if submit_model {
+            "> Model: model 0"
+        } else {
+            "> Agent description: friend"
+        };
+        assert!(
+            contents.ends_with(&format!("{answer}\nSetup cancelled.")),
+            "width={width}, submitted={submit_model}: {contents}"
+        );
+        assert!(!contents.contains("<canceled>"), "{contents}");
+        assert!(!contents.contains("Select model"), "{contents}");
+        assert!(!root.path().join(".agents").exists());
+    }
+}
+
+#[test]
+fn setup_soul_cancellation_stops_adapter_and_restores_terminal() {
+    use std::os::fd::AsRawFd;
+    for (key, ignore_cancel, keep_workspace) in [
+        (Some("\x1b"), false, false),
+        (Some("\x03"), false, true),
+        (None, false, false),
+        (Some("\x1b"), true, true),
+    ] {
+        let root = agent();
+        fs::remove_dir_all(root.path().join(".agents")).unwrap();
+        if keep_workspace {
+            fs::create_dir(root.path().join("workspace")).unwrap();
+            fs::write(root.path().join("workspace/keep.txt"), "existing work").unwrap();
+        }
+        let adapter = root.path().join("bin/opencode");
+        let mut script = fs::read_to_string(&adapter)
+            .unwrap()
+            .replace("prompts=0", "prompts=0\nprintf '%s\\n' \"$$\" > adapter.pid")
+            .replace(
+                "      case \"$line\" in\n",
+                "      case \"$line\" in\n        *'Create the system prompt for this agent.'*) continue ;;\n",
+            );
+        if ignore_cancel {
+            script = script.replace(
+                "    *'\"method\":\"session/cancel\"'*)",
+                "    *'\"method\":\"session/cancel\"'*) continue ;;\n    unused)",
+            );
+        }
+        fs::write(adapter, script).unwrap();
+        let (mut chat, mut terminal, _slave) = terminal_command(root.path(), 80, 24, "init");
+        let mut screen = vt100::Parser::new(24, 80, 100);
+        for (label, input) in [
+            ("Select harness runtime", "OpenCode\r"),
+            ("What is your Agent name:", "Buddy\r"),
+            ("Describe what your Agent does:", "friend\r"),
+            ("Select model for your Agent:", "\r"),
+            ("Select reasoning level for your Agent:", "\r"),
+        ] {
+            terminal_prompt(
+                &mut chat,
+                &mut terminal,
+                &mut screen,
+                label,
+                input.as_bytes(),
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(byte) = chat.output.recv_timeout(Duration::from_millis(30)) {
+                terminal_byte(&mut chat, &mut terminal, &mut screen, byte);
+            }
+            if screen.screen().contents().contains("Creating SOUL.md...")
+                && fs::read_to_string(root.path().join("requests.jsonl"))
+                    .unwrap()
+                    .contains("\"method\":\"session/prompt\"")
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "SOUL generation did not start");
+        }
+        if let Some(key) = key {
+            terminal.write_all(key.as_bytes()).unwrap();
+        } else {
+            assert_eq!(
+                unsafe { libc::kill(chat.child.id() as i32, libc::SIGINT) },
+                0
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(12);
+        while !chat.text.ends_with("Setup cancelled.\r\n") {
+            let byte = chat
+                .output
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| panic!("cancelling SOUL: {error}; {:?}", chat.text));
+            terminal_byte(&mut chat, &mut terminal, &mut screen, byte);
+        }
+        chat.wait_for_exit();
+        let contents = screen.screen().contents();
+        assert!(
+            contents.ends_with("> Reasoning level: Low\nSetup cancelled."),
+            "{contents}"
+        );
+        assert!(!contents.contains("Creating SOUL.md"), "{contents}");
+        assert!(!contents.contains("\n\n\n"), "{contents}");
+        assert!(!screen.screen().hide_cursor());
+        assert!(!root.path().join(".agents").exists());
+        assert!(!root.path().join("buddy").exists());
+        if keep_workspace {
+            assert_eq!(
+                fs::read_to_string(root.path().join("workspace/keep.txt")).unwrap(),
+                "existing work"
+            );
+        } else {
+            assert!(!root.path().join("workspace").exists());
+        }
+        let requests = fs::read_to_string(root.path().join("requests.jsonl")).unwrap();
+        assert!(requests.contains("\"method\":\"session/cancel\""));
+        assert!(requests.contains("\"method\":\"session/close\""));
+        let pid: i32 = fs::read_to_string(root.path().join("adapter.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "adapter is still running"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(terminal.as_raw_fd(), mode.as_mut_ptr()) },
+            0
+        );
+        let mode = unsafe { mode.assume_init() };
+        assert_ne!(mode.c_lflag & libc::ICANON, 0);
+        assert_ne!(mode.c_lflag & libc::ECHO, 0);
+    }
+}
+
+#[test]
+fn setup_preparation_cancellation_stops_npm_and_its_children() {
+    for key in ["\x1b", "\x03"] {
+        let root = preparing_agent();
+        let (mut chat, mut terminal, _slave) = terminal_command(root.path(), 80, 24, "init");
+        let mut screen = vt100::Parser::new(24, 80, 100);
+        for (label, input) in [
+            ("Select harness runtime", "Pi\r"),
+            ("What is your Agent name:", "Buddy\r"),
+            ("Describe what your Agent does:", "friend\r"),
+        ] {
+            terminal_prompt(
+                &mut chat,
+                &mut terminal,
+                &mut screen,
+                label,
+                input.as_bytes(),
+            );
+        }
+        terminal_progress(
+            &mut chat,
+            &mut terminal,
+            &mut screen,
+            "Preparing harness...",
+            &root.path().join("npm-child.pid"),
+        );
+        terminal.write_all(key.as_bytes()).unwrap();
+        while !chat.text.ends_with("Setup cancelled.\r\n") {
+            let byte = chat.output.recv_timeout(Duration::from_secs(5)).unwrap();
+            terminal_byte(&mut chat, &mut terminal, &mut screen, byte);
+        }
+        chat.wait_for_exit();
+        let contents = screen.screen().contents();
+        assert!(
+            contents.ends_with("> Agent description: friend\nSetup cancelled."),
+            "{contents}"
+        );
+        assert!(!contents.contains("Preparing harness"), "{contents}");
+        assert!(!chat.text.contains("Installing "));
+        assert!(!root.path().join(".agents").exists());
+        assert!(!root.path().join("workspace").exists());
+        for file in ["npm.pid", "npm-child.pid"] {
+            let pid: i32 = fs::read_to_string(root.path().join(file))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                assert!(Instant::now() < deadline, "{file} is still running");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
+    }
+}
+
+#[test]
+fn setup_soul_completion_continues_to_launcher_prompt() {
+    let root = preparing_agent();
+    let adapter = root.path().join("bin/opencode");
+    let script = fs::read_to_string(&adapter).unwrap().replace(
+        "      prompts=$((prompts + 1))",
+        "      touch soul-started\n      while [ ! -f finish-soul ]; do sleep 0.02; done\n      prompts=$((prompts + 1))",
+    );
+    fs::write(adapter, script).unwrap();
+    let (mut chat, mut terminal, _slave) = terminal_command(root.path(), 80, 24, "init");
+    let mut screen = vt100::Parser::new(24, 80, 100);
+    for (label, input) in [
+        ("Select harness runtime", "Pi\r"),
+        ("What is your Agent name:", "Buddy\r"),
+        ("Describe what your Agent does:", "friend\r"),
+    ] {
+        terminal_prompt(
+            &mut chat,
+            &mut terminal,
+            &mut screen,
+            label,
+            input.as_bytes(),
+        );
+    }
+    terminal_progress(
+        &mut chat,
+        &mut terminal,
+        &mut screen,
+        "Preparing harness...",
+        &root.path().join("npm-child.pid"),
+    );
+    terminal.write_all(b"\r\r\r").unwrap();
+    fs::write(root.path().join("finish-install"), "").unwrap();
+    terminal_prompt(
+        &mut chat,
+        &mut terminal,
+        &mut screen,
+        "Select model for your Agent:",
+        b"",
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        !fs::read_to_string(root.path().join("requests.jsonl"))
+            .unwrap()
+            .contains("session/set_config_option"),
+        "Enter during preparation selected a model"
+    );
+    terminal.write_all(b"\r").unwrap();
+    terminal_prompt(
+        &mut chat,
+        &mut terminal,
+        &mut screen,
+        "Select reasoning level for your Agent:",
+        b"\r",
+    );
+    terminal_progress(
+        &mut chat,
+        &mut terminal,
+        &mut screen,
+        "Creating SOUL.md...",
+        &root.path().join("soul-started"),
+    );
+    terminal.write_all(b"\r\r\r").unwrap();
+    fs::write(root.path().join("finish-soul"), "").unwrap();
+    terminal_prompt(
+        &mut chat,
+        &mut terminal,
+        &mut screen,
+        "Install a global launcher",
+        b"",
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        chat.child.try_wait().unwrap().is_none(),
+        "Enter during SOUL generation answered the launcher prompt"
+    );
+    terminal.write_all(b"n\r").unwrap();
+    while !chat.text.ends_with("Ready. Run ./buddy\r\n") {
+        let byte = chat.output.recv_timeout(Duration::from_secs(5)).unwrap();
+        terminal_byte(&mut chat, &mut terminal, &mut screen, byte);
+    }
+    chat.wait_for_exit();
+    assert_eq!(
+        fs::read_to_string(root.path().join(".agents/SOUL.md")).unwrap(),
+        "Before\n\nAfter\n"
+    );
+    assert!(root.path().join(".agents/agent.json").is_file());
+    assert!(root.path().join("buddy").is_file());
+    assert!(!screen.screen().contents().contains("Creating SOUL.md"));
+    let requests = fs::read_to_string(root.path().join("requests.jsonl")).unwrap();
+    assert!(!requests.contains("\"method\":\"session/cancel\""));
+    assert!(requests.contains("\"method\":\"session/close\""));
+}
+
 #[test]
 fn setup_cancel_after_resize_removes_menu_and_blank_rows() {
     use std::os::fd::AsRawFd;
