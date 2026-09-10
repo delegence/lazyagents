@@ -2,20 +2,18 @@ use std::env;
 use std::error::Error;
 use std::fmt;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use inquire::{Confirm, InquireError, Select, Text};
 use tokio::process::Command;
 
 use crate::acp::{Client, ConfigChoice, ConfigKind, StreamEvent};
 use crate::config::{paths, AgentConfig};
+use crate::harness;
 use crate::harness::Harness;
-use crate::{harness, mcp, slug};
 
 const SOUL_WRITER: &str = "You write precise system prompts for small AI agents. Return only the finished Markdown system prompt. Do not use a code fence. Define the agent's identity, purpose, operating principles, boundaries, and response style. Keep it concise and useful. Do not invent tools, skills, files, or facts that were not supplied.";
 
@@ -37,15 +35,15 @@ async fn run_setup(root: PathBuf) -> Result<()> {
 
     println!("Create an Agent in {}\n", display_path(&root));
     let selected = select_harness(&available)?;
-    replace_answer("Harness", selected.display_name())?;
+    print_answer("Harness", selected.display_name())?;
     let name = text("What is your Agent name:")?;
-    let slug = slug::make(&name)?;
-    replace_answer("Agent name", &name)?;
+    let slug = make_slug(&name)?;
+    print_answer("Agent name", &name)?;
     let description = text("Describe what your Agent does:")?;
     if description.trim().is_empty() {
         bail!("the agent description cannot be empty");
     }
-    replace_answer("Agent description", &description)?;
+    print_answer("Agent description", &description)?;
 
     let agent_paths = paths(&root);
     let launcher = root.join(&slug);
@@ -61,28 +59,25 @@ async fn run_setup(root: PathBuf) -> Result<()> {
     let workspace_existed = workspace.exists();
     create_structure(&root)?;
     let result = create_agent(&root, selected, &name, &slug, &description).await;
-    match result {
-        Ok(()) => {}
-        Err(error) => {
-            let _ = fs::remove_dir_all(&agent_paths.state);
-            let _ = fs::remove_file(&launcher);
-            if !workspace_existed {
-                let _ = fs::remove_dir_all(&workspace);
-            }
-            if error.downcast_ref::<crate::acp::ProtocolError>().is_some() {
-                return Err(anyhow!(crate::acp::friendly_error(
-                    selected.display_name(),
-                    &error,
-                    "",
-                    &[]
-                )));
-            }
-            return Err(error);
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&agent_paths.state);
+        let _ = fs::remove_file(&launcher);
+        if !workspace_existed {
+            let _ = fs::remove_dir_all(&workspace);
         }
+        if error.downcast_ref::<crate::acp::ProtocolError>().is_some() {
+            return Err(anyhow!(crate::acp::friendly_error(
+                selected.display_name(),
+                &error,
+                "",
+                &[]
+            )));
+        }
+        return Err(error);
     }
     println!("Agent Created ./{}", slug);
     let install_globally = optional_confirm("Install a global launcher in ~/.local/bin", false)?;
-    replace_answer(
+    print_answer(
         "Install a global launcher in ~/.local/bin",
         if install_globally { "Yes" } else { "No" },
     )?;
@@ -102,12 +97,17 @@ async fn create_agent(
     description: &str,
 ) -> Result<()> {
     let mut config = AgentConfig {
+        color: Some(crate::config::AgentColor::random()),
         name: name.trim().to_owned(),
         slug: slug.to_owned(),
         description: description.trim().to_owned(),
         harness: selected.id().to_owned(),
         model: None,
         thinking: None,
+        permissions: Vec::new(),
+        permission_mode: Default::default(),
+        draft: String::new(),
+        idle_timeout: crate::config::default_idle_timeout(),
     };
     harness::install_adapter(root, selected).await?;
 
@@ -130,14 +130,10 @@ async fn create_agent(
     .await?;
     config.thinking.clone_from(&thinking.value);
     show_selection("Thinking level", &thinking)?;
-
-    println!();
-    let spinner = start_spinner("Creating SOUL of your Agent...");
+    let spinner = crate::progress::start("Creating SOUL.md...".to_owned());
     let soul = generate_soul(&mut client, &config).await;
     client.close().await;
-    if let Some(spinner) = spinner {
-        spinner.finish_and_clear();
-    }
+    spinner.finish_and_clear();
     let soul = soul?;
     let agent_paths = paths(root);
     fs::write(&agent_paths.soul, format!("{}\n", soul.trim()))
@@ -145,22 +141,6 @@ async fn create_agent(
     config.save(root)?;
     write_launcher(&root.join(&config.slug))?;
     Ok(())
-}
-
-fn start_spinner(message: &'static str) -> Option<ProgressBar> {
-    if !io::stderr().is_terminal() {
-        println!("{message}");
-        return None;
-    }
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::with_template("{spinner} {msg}")
-            .expect("the static spinner template must be valid")
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-    );
-    spinner.set_message(message);
-    spinner.enable_steady_tick(Duration::from_millis(80));
-    Some(spinner)
 }
 
 async fn ensure_authentication(harness: &dyn Harness) -> Result<()> {
@@ -212,7 +192,7 @@ fn create_structure(root: &Path) -> Result<()> {
     fs::create_dir_all(&agent_paths.skills)?;
     fs::create_dir_all(&agent_paths.runtime)?;
     fs::create_dir_all(&agent_paths.sessions)?;
-    fs::write(&agent_paths.mcp, mcp::template())?;
+    fs::write(&agent_paths.mcp, b"[]\n")?;
     fs::write(
         agent_paths.state.join(".gitignore"),
         b"agent.json\nSOUL.md\nmcps.json\nruntime/\nsessions/\n",
@@ -236,7 +216,11 @@ async fn generate_soul(client: &mut Client, config: &AgentConfig) -> Result<Stri
         .await
     {
         Ok(soul) => soul,
-        Err(error) => bail!(client.friendly_error(&error, &system_error)),
+        Err(error) => bail!(
+            "{}\n{error:#}\n{}\n{system_error}",
+            client.friendly_error(&error, &system_error),
+            client.diagnostics().join("\n")
+        ),
     };
     if soul.trim().is_empty() {
         bail!("the harness returned an empty SOUL.md");
@@ -244,23 +228,14 @@ async fn generate_soul(client: &mut Client, config: &AgentConfig) -> Result<Stri
     Ok(soul)
 }
 
-fn replace_answer(label: &str, value: &str) -> Result<()> {
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        print!("\x1b[1A\r\x1b[2K> {label}: {value}\n");
-    } else {
-        println!("> {label}: {value}");
-    }
+fn print_answer(label: &str, value: &str) -> Result<()> {
+    println!("> {label}: {value}");
     io::stdout().flush()?;
     Ok(())
 }
 
 fn show_selection(label: &str, selection: &WizardSelection) -> Result<()> {
-    if selection.prompted {
-        replace_answer(label, &selection.label)
-    } else {
-        println!("> {label}: {}", selection.label);
-        Ok(())
-    }
+    print_answer(label, &selection.label)
 }
 
 fn display_path(path: &Path) -> String {
@@ -279,7 +254,7 @@ fn select_harness(available: &[&'static dyn Harness]) -> Result<&'static dyn Har
         .iter()
         .map(|harness| harness.display_name())
         .collect();
-    let selected = inquire(Select::new("Select harness runtime", names).prompt())?;
+    let selected = inquire(|| Select::new("Select harness runtime", names).prompt())?;
     available
         .iter()
         .copied()
@@ -288,11 +263,11 @@ fn select_harness(available: &[&'static dyn Harness]) -> Result<&'static dyn Har
 }
 
 fn text(label: &str) -> Result<String> {
-    inquire(Text::new(label).prompt()).map(|value| value.trim().to_owned())
+    inquire(|| Text::new(label).prompt()).map(|value| value.trim().to_owned())
 }
 
 fn confirm(label: &str, default: bool) -> Result<bool> {
-    inquire(Confirm::new(label).with_default(default).prompt())
+    inquire(|| Confirm::new(label).with_default(default).prompt())
 }
 
 async fn choose_option(
@@ -303,35 +278,41 @@ async fn choose_option(
     let Some(option) = client.select_config_option(kind) else {
         return Ok(WizardSelection {
             value: None,
-            label: "Default".to_owned(),
-            prompted: false,
+            label: "default".to_owned(),
         });
     };
-    let choices = option.choices.into_iter().map(Choice).collect::<Vec<_>>();
+    let id = option.id.clone();
+    let choices = option
+        .choices
+        .iter()
+        .cloned()
+        .map(|mut choice| {
+            if matches!(kind, ConfigKind::Model) {
+                choice.label = choice.label.to_lowercase();
+            }
+            Choice(choice)
+        })
+        .collect::<Vec<_>>();
     let cursor = choices
         .iter()
         .position(|choice| choice.0.value == option.current_value)
         .unwrap_or_default();
-    let selected = inquire(
+    let selected = inquire(|| {
         Select::new(label, choices)
             .with_starting_cursor(cursor)
-            .prompt(),
-    )?
+            .prompt()
+    })?
     .0;
-    client
-        .set_config_option(&option.id, &selected.value)
-        .await?;
+    client.set_config_option(&id, &selected.value).await?;
     Ok(WizardSelection {
         value: Some(selected.value),
         label: selected.label,
-        prompted: true,
     })
 }
 
 struct WizardSelection {
     value: Option<String>,
     label: String,
-    prompted: bool,
 }
 
 struct Choice(ConfigChoice);
@@ -353,7 +334,8 @@ impl fmt::Display for Choice {
     }
 }
 
-fn inquire<T>(result: std::result::Result<T, InquireError>) -> Result<T> {
+fn inquire<T>(prompt: impl FnOnce() -> std::result::Result<T, InquireError>) -> Result<T> {
+    let result = crate::prompts::run(prompt);
     match result {
         Ok(value) => Ok(value),
         Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
@@ -375,10 +357,10 @@ impl fmt::Display for SetupCancelled {
 impl Error for SetupCancelled {}
 
 fn optional_confirm(label: &str, default: bool) -> Result<bool> {
-    match Confirm::new(label).with_default(default).prompt() {
+    match confirm(label, default) {
         Ok(value) => Ok(value),
-        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => Ok(false),
-        Err(error) => Err(error.into()),
+        Err(error) if error.downcast_ref::<SetupCancelled>().is_some() => Ok(false),
+        Err(error) => Err(error),
     }
 }
 
@@ -434,6 +416,28 @@ fn install_global_link(launcher: &Path, slug: &str) -> Result<()> {
     Ok(())
 }
 
+fn make_slug(value: &str) -> Result<String> {
+    let mut slug = String::new();
+    let mut separator = false;
+
+    for character in value.trim().chars() {
+        if character.is_ascii_alphanumeric() {
+            if separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(character.to_ascii_lowercase());
+            separator = false;
+        } else {
+            separator = true;
+        }
+    }
+
+    if slug.is_empty() {
+        bail!("the agent name must contain at least one letter or number");
+    }
+    Ok(slug)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -454,5 +458,15 @@ mod tests {
             fs::metadata(launcher).unwrap().permissions().mode() & 0o111,
             0
         );
+    }
+    #[test]
+    fn creates_a_safe_launcher_name() {
+        assert_eq!(make_slug(" Research  Agent! ").unwrap(), "research-agent");
+        assert_eq!(make_slug("Agent 42").unwrap(), "agent-42");
+    }
+
+    #[test]
+    fn rejects_an_empty_name() {
+        assert!(make_slug(" -- ").is_err());
     }
 }

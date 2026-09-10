@@ -25,7 +25,7 @@ impl Harness for Claude {
     fn adapter(&self) -> Option<AdapterSpec> {
         Some(AdapterSpec {
             package: "@agentclientprotocol/claude-agent-acp",
-            version: "0.71.0",
+            version: "0.76.0",
             binary: "claude-agent-acp",
         })
     }
@@ -68,20 +68,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lists_only_local_skill_directories() {
-        let directory = tempdir().unwrap();
-        fs::create_dir_all(directory.path().join("writer")).unwrap();
-        fs::write(directory.path().join("writer/SKILL.md"), "# Writer").unwrap();
-        fs::create_dir_all(directory.path().join("empty")).unwrap();
-        assert_eq!(local_skills(directory.path()).unwrap(), vec!["writer"]);
-    }
-
-    #[test]
     fn launch_appends_instructions_and_selects_only_agent_skills() {
         let root = tempdir().unwrap();
         let skills = paths(root.path()).skills;
         fs::create_dir_all(skills.join("writer")).unwrap();
         fs::write(skills.join("writer/SKILL.md"), "# Writer").unwrap();
+        fs::create_dir_all(skills.join("empty")).unwrap();
 
         let options = CLAUDE
             .launch_options(LaunchContext {
@@ -96,7 +88,7 @@ mod tests {
             meta["systemPrompt"]["append"],
             serde_json::Value::String("You are a writer.".into())
         );
-        assert_eq!(meta["claudeCode"]["options"]["skills"][0], "writer");
+        assert_eq!(meta["claudeCode"]["options"]["skills"], json!(["writer"]));
         assert!(options.env.is_empty());
     }
 }

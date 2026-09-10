@@ -1,11 +1,13 @@
 mod acp;
+mod chat;
 mod config;
 mod harness;
 mod markdown;
 mod mcp;
+mod permissions;
+mod progress;
+mod prompts;
 mod session;
-mod slug;
-mod tui;
 mod wizard;
 
 use std::path::PathBuf;
@@ -32,13 +34,14 @@ enum Command {
 
 #[derive(Args)]
 struct ChatArgs {
-    /// Resume the most recent session.
-    #[arg(short, long)]
-    resume: bool,
+    /// Pick a previous session, or resume a specific session ID.
+    #[arg(short, long, num_args = 0..=1)]
+    resume: Option<Option<String>>,
 }
 
 #[tokio::main]
 async fn main() {
+    inquire::set_global_render_config(prompts::theme());
     if let Err(error) = run().await {
         eprintln!("error: {error:#}");
         std::process::exit(1);
@@ -51,10 +54,14 @@ async fn run() -> Result<()> {
         Some(Command::Init) => wizard::run(std::env::current_dir()?).await,
         Some(Command::Chat(args)) => {
             let root = current_agent_root()?;
-            tui::run(root, args.resume).await
+            chat::run(root, args.resume).await
         }
         Some(Command::Repair) => repair().await,
-        None => print_help(),
+        None => {
+            Cli::command().print_help()?;
+            println!();
+            Ok(())
+        }
     }
 }
 
@@ -80,10 +87,4 @@ fn current_agent_root() -> Result<PathBuf> {
     }
 
     bail!("no agent found in the current folder; run `lazyagents init` first")
-}
-
-fn print_help() -> Result<()> {
-    Cli::command().print_help()?;
-    println!();
-    Ok(())
 }

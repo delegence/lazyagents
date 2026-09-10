@@ -1,54 +1,23 @@
 # lazyagents
 
-Turn any folder into an AI agent. Describe its role, choose a harness, and start chatting.
+Turn any folder into an AI agent.
+Describe its role, choose a harness, and start chatting.
 
 ## Install
-
-Install the latest release:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/delegence/lazyagents/main/install.sh | sh
 ```
 
-Install a specific version:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/delegence/lazyagents/main/install.sh | LAZYAGENTS_VERSION=0.1.0 sh
-```
-
-Build from source:
-
-```sh
-cargo build --release --locked
-```
-
-Run from source:
-
-```sh
-cargo run -- <command>
-```
-
-## Supported harnesses
+### Supported harnesses
 
 - Codex
 - Claude Code
 - OpenCode
 - Pi
 
-## Requirements
-
-- One supported harness installed and available on `PATH`
-- Node.js 22.19 or newer and npm for Codex, Claude Code, and Pi
-- Rust when building from source
-
-OpenCode has a built-in ACP server and does not need Node.js or an npm adapter.
-
-## Build
-
-```sh
-cargo build --release --locked
-cp target/release/lazyagents ~/.local/bin/lazyagents
-```
+Requires an installed harness on `PATH`.
+Codex, Claude Code, and Pi also require Node.js 22.19 or newer and npm for their ACP adapters. OpenCode has built-in ACP support.
 
 ## Create an agent
 
@@ -56,40 +25,81 @@ cp target/release/lazyagents ~/.local/bin/lazyagents
 mkdir researcher
 cd researcher
 lazyagents init
+lazyagents chat
 ```
 
-The interactive wizard selects an installed harness, asks for a name and description, and then selects the model and thinking level exposed by that harness. It generates `.agents/SOUL.md` and creates a launcher from the normalized name. Use the arrow keys and Enter to select an option. Escape cancels setup. For example, `Research Agent` creates `./research-agent`.
+Setup asks for a harness, name, description, model, and reasoning level. It installs the required adapter and generates `.agents/SOUL.md` automatically.
 
-An existing harness login is reused. If it is missing or expired, the wizard asks before it starts the native login command. Pi has no general login command, so sign in with Pi before you create the agent.
+The agent name determines the launcher name. Setup can also add a launcher symlink in `~/.local/bin`. Launchers work from any directory and use the `lazyagents` binary on `PATH`.
 
-The wizard can also create `~/.local/bin/research-agent` as a symbolic link. The launcher in the agent folder stays the source of truth.
+Edit `.agents/SOUL.md` to change the agent's instructions. The agent uses `workspace/` as its working directory.
 
-Running `lazyagents` without a command shows help.
+## Chat
 
-## Files
+```sh
+lazyagents chat             # start a new session
+lazyagents chat -r          # choose a previous session
+lazyagents chat -r <id>     # resume a specific session
+```
+
+The agent launcher accepts the same options. The session picker shows the latest message and its local date and time, with recent sessions first.
+
+Type `/` to see commands. Keep typing to filter and use the arrow keys to select. Press Tab to complete the selected command, or Enter to run it.
+
+| Command | Action |
+| --- | --- |
+| `/model` | Select model and reasoning level; save them for new sessions |
+| `/permissions` | Select and save `ask for approval` or `full access` |
+| `/new` | Start an empty conversation with the current settings |
+| `/status` | Show session settings and usage reported by the harness |
+| `/quit` | Exit chat |
+
+Unsent input is saved per agent and restored on the next launch. Tool output is shortened in chat; complete events are saved in `.agents/sessions/`.
+
+## Configuration
+
+Settings live in `.agents/agent.json`. Setup writes the initial configuration, and chat commands save accepted changes.
+
+| Field | Purpose |
+| --- | --- |
+| `name`, `slug`, `description` | Agent identity and launcher name |
+| `harness` | `codex`, `claude`, `opencode`, or `pi` |
+| `model`, `thinking` | Default model and reasoning level for new sessions |
+| `permission_mode` | `ask` or `full_access` |
+| `permissions` | Permanent tool approvals |
+| `idle_timeout` | Seconds without harness activity before cancelling a turn; defaults to `300` |
+| `color` | Header name color, chosen during setup; defaults to cyan if absent |
+| `draft` | Unsent input, managed by chat |
+
+`idle_timeout` must be a positive integer. It applies to an active turn, not time spent at the input prompt.
+
+Available colors: `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `orange`, `coral`, `pink`, `rose`, `violet`, `lavender`, `purple`, `teal`, `turquoise`, `mint`, `lime`, `gold`, `amber`, `sky`.
+
+### Permissions
+
+Ask mode prompts when a request has no saved approval. Permanent approvals are stored per agent and harness in `agent.json`. Session-only approvals stay with the harness.
+
+Full access automatically approves tool permission requests. It does not change the harness sandbox.
+
+## Agent files
 
 ```text
-research-agent              shell shortcut for `lazyagents chat`
+researcher                  launcher
 workspace/                  agent working directory
 .agents/
-  .gitignore                ignores private and generated agent state
   SOUL.md                   editable system prompt
-  agent.json                agent configuration
-  mcps.json                 agent-specific MCP servers
-  skills/<name>/SKILL.md    agent-specific native skills
-  runtime/
-    <harness>/              isolated harness files, when required
-    acp-<harness>/          pinned ACP adapter, when required
-  sessions/*.jsonl          local chat event logs
+  agent.json                configuration
+  mcps.json                 MCP servers
+  skills/<name>/SKILL.md     agent skills
+  runtime/                  private harness files and ACP adapters
+  sessions/*.jsonl           chat event logs
 ```
 
-The generated `.agents/.gitignore` ignores `agent.json`, `SOUL.md`, `mcps.json`, `runtime/`, and `sessions/`. Agent skills remain available for version control.
+The generated `.agents/.gitignore` excludes configuration, the system prompt, MCP settings, runtime files, and session logs. Skills remain available for version control.
 
-Each launch reads the current `SOUL.md` and adds the `workspace/` instruction and current date and time. A normal chat starts a new ACP session. The `--resume` option resumes the latest session. The tool has no special logic for `AGENTS.md` or `CLAUDE.md`, but a harness can still read its native project files.
+## MCP servers and skills
 
-## MCP servers
-
-`.agents/mcps.json` is a JSON array. It is empty by default.
+Add MCP servers to `.agents/mcps.json`, which contains an empty array by default:
 
 ```json
 [
@@ -104,70 +114,32 @@ Each launch reads the current `SOUL.md` and adds the `workspace/` instruction an
     "name": "remote-tools",
     "transport": "http",
     "url": "https://example.com/mcp",
-    "headers": { "Authorization": "Bearer token" },
-    "enabled": true
+    "headers": { "Authorization": "Bearer token" }
   }
 ]
 ```
 
-Set `"enabled": false` to keep a server in the file without loading it. ACP adapter support determines which transports are available.
+Set `"enabled": false` to disable a server without removing it. Transport support depends on the harness adapter.
 
-## Skills
+Put each skill at `.agents/skills/<name>/SKILL.md`. The selected harness handles skill discovery and loading.
 
-Put each skill at `.agents/skills/<skill-name>/SKILL.md`. Codex, Claude Code, OpenCode, and Pi recognize this project skill location. Skill discovery and loading stay native to the selected harness.
+## Troubleshooting
 
-## Add a harness
+Run `lazyagents repair` in the agent folder to reinstall its pinned ACP adapter. Interactive chat offers to install a missing adapter; for scripts, run repair first.
 
-Harness support lives behind the `Harness` trait in `src/harness/mod.rs`. Shared code handles detection, ACP adapter installation, registry lookup, and process startup.
+## Pipes
 
-Each harness owns one file:
+Piped chat sends assistant output to stdout and diagnostics to stderr. It does not save drafts or load input history. Failed turns and inactivity timeouts return a nonzero exit code. Permission requests that require an interactive choice are cancelled. Ctrl-C stops the turn.
 
-```text
-src/harness/codex.rs
-src/harness/claude.rs
-src/harness/opencode.rs
-src/harness/pi.rs
-```
-
-To add another harness:
-
-1. Create `src/harness/<id>.rs` and implement `Harness`.
-2. Declare its runtime command, pinned ACP adapter, authentication commands, and launch options in that file.
-3. Add the implementation to `HARNESSES` in `src/harness/mod.rs`.
-
-No config or session-log changes are required. `agent.json` stores the harness registry ID as a string.
-
-## Repair
-
-If an ACP adapter is missing or damaged, run:
+## Development
 
 ```sh
-lazyagents repair
+cargo test --locked
+cargo build --release --locked
 ```
 
-This checks that the selected harness is on `PATH` and reinstalls its pinned ACP adapter when required.
+Use `cargo run -- <command>` to run from source.
 
-## Chat
+`src/chat/mod.rs` runs the chat loop and selectors. Its sibling modules handle slash commands, terminal input, editor state, layout, and output. Shared setup and chat prompts live in `src/prompts.rs`.
 
-Chat with the agent in the current folder:
-
-```sh
-lazyagents chat
-```
-
-Or run its local launcher:
-
-```sh
-./research-agent
-```
-
-Both use the same agent configuration. Without `--resume`, each command starts a new ACP session. The local launcher changes to its agent folder and runs the `lazyagents` binary found on `PATH`. A global launcher symlink works from any current directory.
-
-Resume the most recent session with either form:
-
-```sh
-lazyagents chat -r
-./research-agent -r
-```
-
-Lazyagents shows the permission choices sent by the harness. It does not keep its own permission history. The harness decides whether an "always allow" choice persists. Use `/exit`, `/quit`, Control-C, or Control-D to leave. Reasoning, tool calls, tool results, permissions, and messages are saved in session JSONL and shown again when you resume.
+Harness implementations live in `src/harness/`. To add one, implement the `Harness` trait and register it in `HARNESSES` in `src/harness/mod.rs`.

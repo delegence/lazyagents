@@ -31,7 +31,7 @@ impl Harness for Codex {
     fn adapter(&self) -> Option<AdapterSpec> {
         Some(AdapterSpec {
             package: "@agentclientprotocol/codex-acp",
-            version: "1.8.0",
+            version: "1.11.0",
             binary: "codex-acp",
         })
     }
@@ -48,7 +48,6 @@ impl Harness for Codex {
         let agent_paths = paths(context.root);
         let runtime = agent_paths.runtime.join(self.id());
         let private_home = runtime.join("home");
-        fs::create_dir_all(&runtime)?;
         fs::create_dir_all(&private_home)?;
         let authentication = env::var_os("CODEX_HOME")
             .map(PathBuf::from)

@@ -86,10 +86,6 @@ fn validate_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn template() -> &'static [u8] {
-    b"[]\n"
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;

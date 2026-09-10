@@ -5,10 +5,8 @@ use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
 use tokio::process::Command;
 
@@ -134,16 +132,7 @@ pub async fn install_adapter(root: &Path, harness: &dyn Harness) -> Result<()> {
     fs::create_dir_all(&runtime)?;
     let package = format!("{}@{}", adapter.package, adapter.version);
 
-    let spinner = io::stderr().is_terminal().then(|| {
-        let spinner = ProgressBar::new_spinner();
-        spinner.set_style(
-            ProgressStyle::with_template("{spinner}")
-                .expect("the static spinner template must be valid")
-                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-        );
-        spinner.enable_steady_tick(Duration::from_millis(80));
-        spinner
-    });
+    let spinner = crate::progress::start(format!("Installing {package}..."));
     let output = Command::new(npm)
         .args([
             "install",
@@ -160,9 +149,7 @@ pub async fn install_adapter(root: &Path, harness: &dyn Harness) -> Result<()> {
         .stdin(Stdio::null())
         .output()
         .await;
-    if let Some(spinner) = spinner {
-        spinner.finish_and_clear();
-    }
+    spinner.finish_and_clear();
     let output = output.context("could not run npm")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -180,6 +167,39 @@ pub async fn install_adapter(root: &Path, harness: &dyn Harness) -> Result<()> {
     Ok(())
 }
 
+fn adapter_path(root: &Path, harness: &dyn Harness) -> Option<PathBuf> {
+    harness.adapter().map(|adapter| {
+        paths(root)
+            .runtime
+            .join(format!("acp-{}", harness.id()))
+            .join("node_modules/.bin")
+            .join(adapter.binary)
+    })
+}
+
+/// Installs a missing adapter only after an interactive first-use choice.
+pub async fn ensure_adapter(root: &Path, harness: &dyn Harness) -> Result<()> {
+    find_command(harness.runtime_command()).with_context(|| {
+        format!(
+            "{} is not installed or is not on PATH",
+            harness.display_name()
+        )
+    })?;
+    if adapter_path(root, harness).is_none_or(|path| path.is_file()) {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("the ACP adapter is missing; run `lazyagents repair` before using chat in a pipe");
+    }
+    let install = inquire::Confirm::new("Install the missing ACP adapter now")
+        .with_default(true)
+        .prompt()?;
+    if !install {
+        bail!("chat needs the ACP adapter; run `lazyagents repair` when ready");
+    }
+    install_adapter(root, harness).await
+}
+
 pub fn launch(root: &Path, harness_id: &str, instruction: &str) -> Result<Launch> {
     let harness = get(harness_id)?;
     let runtime_path = find_command(harness.runtime_command()).with_context(|| {
@@ -193,15 +213,10 @@ pub fn launch(root: &Path, harness_id: &str, instruction: &str) -> Result<Launch
         runtime_path: &runtime_path,
         instruction,
     })?;
-    let program = if let Some(adapter) = harness.adapter() {
-        let adapter_path = paths(root)
-            .runtime
-            .join(format!("acp-{}", harness.id()))
-            .join("node_modules/.bin")
-            .join(adapter.binary);
+    let program = if let Some(adapter_path) = adapter_path(root, harness) {
         if !adapter_path.is_file() {
             bail!(
-                "the ACP adapter is missing; run `lazyagents init` again in {}",
+                "the ACP adapter is missing; run `lazyagents repair` in {}",
                 root.display()
             );
         }

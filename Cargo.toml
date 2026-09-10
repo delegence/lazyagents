@@ -9,16 +9,20 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1"
+indicatif = "0.18"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
-indicatif = "0.18"
 libc = "0.2"
 pulldown-cmark = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["io-std", "io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 uuid = { version = "1", features = ["v7"] }
+crossterm = "0.29"
+unicode-width = "0.2"
+unicode-segmentation = "1"
 
 [dev-dependencies]
 tempfile = "3"
+vt100 = "0.16"
