@@ -20,7 +20,8 @@ mod pi;
 #[derive(Clone, Copy)]
 pub struct AdapterSpec {
     pub package: &'static str,
-    pub version: &'static str,
+    /// The oldest release known to work. Setup and repair install the latest release.
+    pub min_version: &'static str,
     pub binary: &'static str,
 }
 
@@ -61,6 +62,16 @@ pub trait Harness: Sync {
     fn adapter(&self) -> Option<AdapterSpec>;
     fn authentication(&self) -> Option<Authentication>;
     fn launch_options(&self, context: LaunchContext<'_>) -> Result<LaunchOptions>;
+
+    /// Saved approvals match the tool name instead of the exact request.
+    fn approves_tool_names(&self) -> bool {
+        false
+    }
+
+    /// The adapter's own "always allow" choice lasts only for the session.
+    fn always_allow_is_session_only(&self) -> bool {
+        false
+    }
 }
 
 const HARNESSES: &[&dyn Harness] = &[&codex::CODEX, &claude::CLAUDE, &opencode::OPENCODE, &pi::PI];
@@ -114,49 +125,32 @@ pub(super) fn link_authentication(source: Option<PathBuf>, destination: &Path) -
         return Ok(());
     };
 
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&source, destination)
-        .with_context(|| format!("could not link authentication from {}", source.display()))?;
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(&source, destination)
-        .with_context(|| format!("could not link authentication from {}", source.display()))?;
-    Ok(())
+        .with_context(|| format!("could not link authentication from {}", source.display()))
 }
 
-pub async fn install_adapter(root: &Path, harness: &dyn Harness) -> Result<()> {
+/// Installs the latest adapter release and returns its version.
+pub async fn install_adapter(root: &Path, harness: &dyn Harness) -> Result<Option<String>> {
     let Some(adapter) = harness.adapter() else {
-        return Ok(());
+        return Ok(None);
     };
     let npm = find_command("npm").context("npm is required to install the ACP adapter")?;
-    let runtime = paths(root).runtime.join(format!("acp-{}", harness.id()));
-    fs::create_dir_all(&runtime)?;
-    let package = format!("{}@{}", adapter.package, adapter.version);
+    let runtime = adapter_runtime(root, harness);
+    fs::create_dir_all(paths(root).runtime)?;
+    let temporary =
+        paths(root)
+            .runtime
+            .join(format!(".acp-{}-{}", harness.id(), uuid::Uuid::now_v7()));
+    fs::create_dir(&temporary)?;
+    let temporary = TemporaryAdapter(temporary);
+    let package = format!("{}@latest", adapter.package);
 
     let input = crate::prompts::CancellationInput::new()?;
     let spinner = crate::progress::start("Preparing harness...".to_owned());
     let output = async {
-        let mut command = Command::new(npm);
-        command
-            .args([
-                "install",
-                "--ignore-scripts",
-                "--no-audit",
-                "--no-fund",
-                "--package-lock=false",
-                "--no-save",
-                "--prefix",
-            ])
-            .arg(&runtime)
-            .arg(&package)
-            .env("NPM_CONFIG_MIN_RELEASE_AGE", "0")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
-        let child = command.spawn().context("could not run npm")?;
-        #[cfg(unix)]
+        let child = npm_install(&npm, &temporary.0, &package)
+            .spawn()
+            .context("could not run npm")?;
         let pid = child.id();
         let output = child.wait_with_output();
         tokio::pin!(output);
@@ -164,14 +158,11 @@ pub async fn install_adapter(root: &Path, harness: &dyn Harness) -> Result<()> {
             biased;
             result = &mut output => result.context("could not run npm"),
             result = input.cancelled(true) => {
-                #[cfg(unix)]
-                {
-                    // Stop npm and its children before setup removes their files.
-                    if let Some(pid) = pid {
-                        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
-                    }
-                    let _ = output.await;
+                // Stop npm and its children before setup removes their files.
+                if let Some(pid) = pid {
+                    unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL); }
                 }
+                let _ = output.await;
                 result?;
                 Err(crate::prompts::Cancelled.into())
             }
@@ -194,14 +185,160 @@ pub async fn install_adapter(root: &Path, harness: &dyn Harness) -> Result<()> {
         }
         bail!("npm could not install {package}: {detail}");
     }
+    let version = installed_version(&temporary.0, adapter.package)?;
+    if !meets_floor(&version, adapter.min_version) {
+        bail!(
+            "npm installed {} {version}, but lazyagents needs {} or newer",
+            adapter.package,
+            adapter.min_version
+        );
+    }
+    let binary = temporary.0.join("node_modules/.bin").join(adapter.binary);
+    if !binary.is_file() {
+        bail!(
+            "npm did not install the ACP adapter binary {}",
+            binary.display()
+        );
+    }
+    replace_adapter(&temporary.0, &runtime)?;
+    Ok(Some(version))
+}
+
+struct TemporaryAdapter(PathBuf);
+
+impl Drop for TemporaryAdapter {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn replace_adapter(temporary: &Path, runtime: &Path) -> Result<()> {
+    // Keep the old adapter outside the temporary directory so cleanup cannot
+    // delete it if restoring it also fails.
+    let previous = temporary.with_extension("previous");
+    let had_previous = match fs::rename(runtime, &previous) {
+        Ok(()) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => return Err(error).context("could not back up the ACP adapter"),
+    };
+    if let Err(error) = fs::rename(temporary, runtime) {
+        if had_previous {
+            fs::rename(&previous, runtime).with_context(|| {
+                format!(
+                    "could not replace the ACP adapter ({error}) or restore it; the previous adapter is at {}",
+                    previous.display()
+                )
+            })?;
+        }
+        return Err(error).context("could not replace the ACP adapter");
+    }
+    if had_previous {
+        fs::remove_dir_all(&previous).context("could not remove the previous ACP adapter")?;
+    }
+    Ok(())
+}
+
+fn npm_install(npm: &Path, runtime: &Path, package: &str) -> Command {
+    let mut command = Command::new(npm);
+    command
+        .args([
+            "install",
+            "--ignore-scripts",
+            "--no-audit",
+            "--no-fund",
+            "--package-lock=false",
+            "--no-save",
+            "--prefix",
+        ])
+        .arg(runtime)
+        .arg(package)
+        .env("NPM_CONFIG_MIN_RELEASE_AGE", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    command
+}
+
+fn adapter_runtime(root: &Path, harness: &dyn Harness) -> PathBuf {
+    paths(root).runtime.join(format!("acp-{}", harness.id()))
+}
+
+/// Reads the version npm installed from the package manifest.
+fn installed_version(runtime: &Path, package: &str) -> Result<String> {
+    let path = runtime
+        .join("node_modules")
+        .join(package)
+        .join("package.json");
+    let contents = fs::read(&path).with_context(|| format!("could not read {}", path.display()))?;
+    let manifest: Value = serde_json::from_slice(&contents)
+        .with_context(|| format!("could not parse {}", path.display()))?;
+    manifest["version"]
+        .as_str()
+        .map(str::to_owned)
+        .with_context(|| format!("{} has no version", path.display()))
+}
+
+/// Parses `major.minor.patch`. A prerelease sorts before its release.
+fn parse_version(version: &str) -> Option<(u64, u64, u64, bool)> {
+    let version = version.trim().trim_start_matches('v');
+    let version = version.split_once('+').map_or(version, |(core, _)| core);
+    let (core, release) = match version.split_once('-') {
+        Some((core, _)) => (core, false),
+        None => (version, true),
+    };
+    let mut parts = core.split('.').map(str::parse::<u64>);
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch)), None) => {
+            Some((major, minor, patch, release))
+        }
+        _ => None,
+    }
+}
+
+fn meets_floor(version: &str, floor: &str) -> bool {
+    matches!(
+        (parse_version(version), parse_version(floor)),
+        (Some(version), Some(floor)) if version >= floor
+    )
+}
+
+/// Returns the adapter package and its installed version, if the version can be read.
+pub fn installed_adapter(
+    root: &Path,
+    harness: &dyn Harness,
+) -> Option<(&'static str, Option<String>)> {
+    let adapter = harness.adapter()?;
+    let version = installed_version(&adapter_runtime(root, harness), adapter.package).ok();
+    Some((adapter.package, version))
+}
+
+/// Rejects an installed adapter that is older than the known-good floor.
+fn check_installed_floor(root: &Path, harness: &dyn Harness) -> Result<()> {
+    let Some(adapter) = harness.adapter() else {
+        return Ok(());
+    };
+    let Ok(version) = installed_version(&adapter_runtime(root, harness), adapter.package) else {
+        bail!(
+            "could not read the ACP adapter version; run `lazyagents repair` in {}",
+            root.display()
+        );
+    };
+    if !meets_floor(&version, adapter.min_version) {
+        bail!(
+            "the ACP adapter {} {version} is older than {}; run `lazyagents repair` in {}",
+            adapter.package,
+            adapter.min_version,
+            root.display()
+        );
+    }
     Ok(())
 }
 
 fn adapter_path(root: &Path, harness: &dyn Harness) -> Option<PathBuf> {
     harness.adapter().map(|adapter| {
-        paths(root)
-            .runtime
-            .join(format!("acp-{}", harness.id()))
+        adapter_runtime(root, harness)
             .join("node_modules/.bin")
             .join(adapter.binary)
     })
@@ -221,13 +358,21 @@ pub async fn ensure_adapter(root: &Path, harness: &dyn Harness) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("the ACP adapter is missing; run `lazyagents repair` before using chat in a pipe");
     }
-    let install = inquire::Confirm::new("Install the missing ACP adapter now")
-        .with_default(true)
-        .prompt()?;
-    if !install {
-        bail!("chat needs the ACP adapter; run `lazyagents repair` when ready");
+    let message = "Install the missing ACP adapter now";
+    let install = crate::prompts::run(message, || {
+        inquire::Confirm::new(message)
+            .with_default(true)
+            .with_formatter(&|_| String::new())
+            .prompt()
+    });
+    match install {
+        Ok(true) => install_adapter(root, harness).await.map(|_| ()),
+        Ok(false)
+        | Err(
+            inquire::InquireError::OperationCanceled | inquire::InquireError::OperationInterrupted,
+        ) => bail!("chat needs the ACP adapter; run `lazyagents repair` when ready"),
+        Err(error) => Err(error.into()),
     }
-    install_adapter(root, harness).await
 }
 
 pub fn launch(root: &Path, harness_id: &str, instruction: &str) -> Result<Launch> {
@@ -250,6 +395,7 @@ pub fn launch(root: &Path, harness_id: &str, instruction: &str) -> Result<Launch
                 root.display()
             );
         }
+        check_installed_floor(root, harness)?;
         options.args.insert(0, adapter_path.into_os_string());
         find_command("node").context("node is required to run the ACP adapter")?
     } else {
@@ -289,5 +435,80 @@ mod tests {
             .await
             .unwrap();
         assert!(!paths(root.path()).runtime.join("acp-opencode").exists());
+    }
+
+    #[test]
+    fn replacement_failure_restores_previous_adapter() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("acp-pi");
+        fs::create_dir(&runtime).unwrap();
+        fs::write(runtime.join("original"), "previous adapter").unwrap();
+        let temporary = root.path().join("missing-install");
+
+        let error = replace_adapter(&temporary, &runtime).unwrap_err();
+
+        assert!(error.to_string().contains("could not replace"), "{error}");
+        assert_eq!(
+            fs::read_to_string(runtime.join("original")).unwrap(),
+            "previous adapter"
+        );
+        assert!(!temporary.with_extension("previous").exists());
+    }
+
+    #[test]
+    fn versions_compare_numerically_and_prereleases_sort_first() {
+        assert!(meets_floor("0.76.0", "0.76.0"));
+        assert!(meets_floor("0.100.0", "0.76.0"));
+        assert!(meets_floor("2.0.0", "1.11.0"));
+        assert!(meets_floor("v1.11.1+build.5", "1.11.0"));
+        assert!(meets_floor("1.12.0-rc.1", "1.11.0"));
+        assert!(!meets_floor("0.9.0", "0.76.0"));
+        assert!(!meets_floor("1.11.0-beta.2", "1.11.0"));
+        assert!(!meets_floor("1.11", "1.11.0"));
+        assert!(!meets_floor("latest", "1.11.0"));
+    }
+
+    fn write_manifest(root: &Path, contents: &str) {
+        let package = adapter_runtime(root, &claude::CLAUDE)
+            .join("node_modules/@agentclientprotocol/claude-agent-acp");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("package.json"), contents).unwrap();
+    }
+
+    #[test]
+    fn installed_adapter_reads_the_package_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            installed_adapter(root.path(), &claude::CLAUDE),
+            Some(("@agentclientprotocol/claude-agent-acp", None))
+        );
+        write_manifest(root.path(), r#"{"name":"x","version":"0.77.1"}"#);
+        assert_eq!(
+            installed_adapter(root.path(), &claude::CLAUDE),
+            Some((
+                "@agentclientprotocol/claude-agent-acp",
+                Some("0.77.1".into())
+            ))
+        );
+        assert_eq!(installed_adapter(root.path(), &opencode::OPENCODE), None);
+    }
+
+    #[test]
+    fn installed_floor_rejects_old_or_unreadable_adapters() {
+        let root = tempfile::tempdir().unwrap();
+        let error = check_installed_floor(root.path(), &claude::CLAUDE).unwrap_err();
+        assert!(error.to_string().contains("lazyagents repair"), "{error}");
+
+        write_manifest(root.path(), r#"{"version":"0.75.9"}"#);
+        let error = check_installed_floor(root.path(), &claude::CLAUDE).unwrap_err();
+        assert!(
+            error.to_string().contains("0.75.9 is older than 0.76.0"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("lazyagents repair"), "{error}");
+
+        write_manifest(root.path(), r#"{"version":"0.77.1"}"#);
+        check_installed_floor(root.path(), &claude::CLAUDE).unwrap();
+        check_installed_floor(root.path(), &opencode::OPENCODE).unwrap();
     }
 }

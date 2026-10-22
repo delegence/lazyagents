@@ -6,8 +6,8 @@ use anyhow::Result;
 use unicode_width::UnicodeWidthChar;
 
 use super::input::DARK_GRAY;
-use crate::acp::{PermissionOption, StreamEvent};
-use crate::session::SessionEntry;
+use crate::acp::{PermissionOption, StreamEvent, ToolStatus};
+use crate::session::{Role, SessionEntry};
 
 pub(crate) const LIGHT_GRAY: &str = "38;5;250";
 
@@ -95,9 +95,7 @@ impl TurnDisplay {
                         output_displayed: false,
                     });
                 tool.title.clone_from(&title);
-                if status.as_deref() == Some("in_progress")
-                    && tool.status.as_deref() != Some("in_progress")
-                {
+                if status == Some(ToolStatus::InProgress) && tool.status != status {
                     tool.started = Instant::now();
                 }
                 if status.is_some() {
@@ -112,15 +110,12 @@ impl TurnDisplay {
                 if first && !self.terminal && !self.replay {
                     render_tool(false, &title, None, None);
                 }
-                if matches!(tool.status.as_deref(), Some("completed" | "failed"))
-                    && !tool.completed_displayed
+                if matches!(
+                    tool.status,
+                    Some(ToolStatus::Completed | ToolStatus::Failed)
+                ) && !tool.completed_displayed
                 {
-                    render_tool(
-                        self.terminal,
-                        &title,
-                        tool.status.as_deref(),
-                        tool.output.as_ref(),
-                    );
+                    render_tool(self.terminal, &title, tool.status, tool.output.as_ref());
                     tool.output_displayed = tool
                         .output
                         .as_ref()
@@ -180,7 +175,12 @@ impl TurnDisplay {
             let mut active = self
                 .tools
                 .iter()
-                .filter(|(_, tool)| !matches!(tool.status.as_deref(), Some("completed" | "failed")))
+                .filter(|(_, tool)| {
+                    !matches!(
+                        tool.status,
+                        Some(ToolStatus::Completed | ToolStatus::Failed)
+                    )
+                })
                 .collect::<Vec<_>>();
             active.sort_by_key(|(id, _)| *id);
             let message = if active.is_empty() {
@@ -298,7 +298,7 @@ struct ToolView {
     title: String,
     kind: Option<String>,
     input: Option<serde_json::Value>,
-    status: Option<String>,
+    status: Option<ToolStatus>,
     output: Option<serde_json::Value>,
     completed_displayed: bool,
     output_displayed: bool,
@@ -439,12 +439,12 @@ pub(crate) fn detail_lines(text: &str, width: usize) -> Vec<String> {
 fn render_tool(
     terminal: bool,
     title: &str,
-    status: Option<&str>,
+    status: Option<ToolStatus>,
     output: Option<&serde_json::Value>,
 ) {
     let (symbol, color) = match status {
-        Some("failed") => ("✗ ", "31"),
-        Some("completed") => ("✓ ", "32"),
+        Some(ToolStatus::Failed) => ("✗ ", "31"),
+        Some(ToolStatus::Completed) => ("✓ ", "32"),
         _ => ("○ ", LIGHT_GRAY),
     };
     print_colored(terminal, color, symbol);
@@ -553,12 +553,12 @@ pub(crate) fn render_history(entries: Vec<SessionEntry>) -> Result<()> {
     display.replay = true;
     for entry in entries {
         match entry {
-            SessionEntry::Message(message) if message.role == "user" => {
+            SessionEntry::Message(message) if message.role == Role::User => {
                 display.finish();
                 display.tools.clear();
                 render_historical_user_prompt(&message.content);
             }
-            SessionEntry::Message(message) if message.role == "assistant" => {
+            SessionEntry::Message(message) if message.role == Role::Assistant => {
                 display.handle(StreamEvent::Assistant(message.content), |_, _, _| Ok(None))?;
                 display.flush_assistant();
             }

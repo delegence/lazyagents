@@ -38,6 +38,10 @@ impl Harness for OpenCode {
         None
     }
 
+    fn always_allow_is_session_only(&self) -> bool {
+        true
+    }
+
     fn launch_options(&self, context: LaunchContext<'_>) -> Result<LaunchOptions> {
         let agent_paths = paths(context.root);
         let runtime = agent_paths.runtime.join(self.id());

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::{save_permissions, AgentConfig};
+use crate::harness::Harness;
 
 pub const REMEMBER: &str = "lazyagents:remember";
 
@@ -41,14 +42,14 @@ pub enum Scope {
 
 pub struct Store {
     root: PathBuf,
-    harness: String,
+    harness: &'static dyn Harness,
 }
 
 impl Store {
-    pub fn new(root: &Path, harness: &str) -> Self {
+    pub fn new(root: &Path, harness: &'static dyn Harness) -> Self {
         Self {
             root: root.to_owned(),
-            harness: harness.to_owned(),
+            harness,
         }
     }
 
@@ -57,13 +58,13 @@ impl Store {
     }
 
     pub fn candidate(&self, tool_call: &Value) -> Option<Approval> {
-        if self.harness == "pi" {
+        if self.harness.approves_tool_names() {
             let name = tool_call.pointer("/_meta/toolName")?.as_str()?;
             if name.is_empty() {
                 return None;
             }
             return Some(Approval {
-                harness: self.harness.clone(),
+                harness: self.harness.id().to_owned(),
                 label: name.to_owned(),
                 scope: Scope::Tool {
                     name: name.to_owned(),
@@ -98,7 +99,7 @@ impl Store {
             .and_then(Value::as_str)
             .unwrap_or("tool request");
         Some(Approval {
-            harness: self.harness.clone(),
+            harness: self.harness.id().to_owned(),
             label: label.to_owned(),
             scope: Scope::Request {
                 tool_call: Value::Object(request),
@@ -132,7 +133,7 @@ impl Store {
             .filter_map(|option| {
                 let mut option = option.clone();
                 if option["kind"] == "allow_always" {
-                    let session = matches!(self.harness.as_str(), "pi" | "opencode")
+                    let session = self.harness.always_allow_is_session_only()
                         || option["optionId"]
                             .as_str()
                             .is_some_and(|id| id.to_lowercase().contains("session"))
@@ -172,6 +173,7 @@ pub fn allow_once(options: &[Value]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::harness::get;
 
     #[test]
     fn saved_rules_survive_reload_and_stay_with_their_agent_and_harness() {
@@ -186,12 +188,12 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        let store = Store::new(root.path(), "pi");
+        let store = Store::new(root.path(), get("pi").unwrap());
         let call = json!({"title": "bash", "_meta": {"toolName": "bash"}});
         let rule = store.candidate(&call).unwrap();
         store.remember(rule.clone()).unwrap();
         store.remember(rule.clone()).unwrap();
-        let reloaded = Store::new(root.path(), "pi");
+        let reloaded = Store::new(root.path(), get("pi").unwrap());
         assert!(reloaded.contains(&rule).unwrap());
         let config = AgentConfig::load(root.path()).unwrap();
         assert_eq!(config.permissions.len(), 1);
@@ -210,7 +212,7 @@ mod tests {
     #[test]
     fn exact_requests_do_not_match_changed_commands_paths_or_permission_data() {
         for harness in ["codex", "claude", "opencode"] {
-            let store = Store::new(Path::new("unused"), harness);
+            let store = Store::new(Path::new("unused"), get(harness).unwrap());
             let call = json!({"toolCallId": "1", "title": "bash", "kind": "execute",
                 "rawInput": {"command": "git status", "cwd": "/one"},
                 "content": [{"type": "text", "text": "network blocked"}]
@@ -233,7 +235,7 @@ mod tests {
 
     #[test]
     fn session_and_permanent_choices_are_separate() {
-        let store = Store::new(Path::new("unused"), "pi");
+        let store = Store::new(Path::new("unused"), get("pi").unwrap());
         let candidate = store
             .candidate(&json!({"_meta": {"toolName": "bash"}}))
             .unwrap();
@@ -251,7 +253,7 @@ mod tests {
 
     #[test]
     fn file_approvals_match_the_affected_paths() {
-        let store = Store::new(Path::new("unused"), "codex");
+        let store = Store::new(Path::new("unused"), get("codex").unwrap());
         let mut call = json!({"toolCallId": "1", "title": "Edit file", "kind": "edit",
             "locations": [{"path": "/agent/workspace/notes.md"}]});
         let original = store.candidate(&call).unwrap();

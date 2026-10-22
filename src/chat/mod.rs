@@ -7,7 +7,7 @@ mod output;
 use self::commands::Command;
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -20,7 +20,7 @@ use crate::acp::{Client, ConfigKind, PermissionOption, PromptTimeout, StreamEven
 use crate::config::{paths, AgentConfig};
 use crate::harness;
 use crate::mcp;
-use crate::session::{SessionEntry, SessionLog, SessionSummary};
+use crate::session::{Role, SessionEntry, SessionLog, SessionSummary};
 
 use self::output::{
     compact_line, detail_lines, display_width, interactive, print_colored, render_history,
@@ -30,10 +30,6 @@ use self::output::{
 pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
     let mut config = AgentConfig::load(&root)?;
     let agent_paths = paths(&root);
-    let soul = fs::read_to_string(&agent_paths.soul)
-        .with_context(|| format!("could not read {}", agent_paths.soul.display()))?;
-    let instruction = runtime_instruction(&soul);
-    let servers = mcp::load(&agent_paths.mcp)?;
     let session_id = if let Some(requested) = resume {
         let Some(selected) = select_session(
             SessionLog::list(&agent_paths.sessions)?,
@@ -52,19 +48,11 @@ pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
         None
     };
     harness::ensure_adapter(&root, harness::get(&config.harness)?).await?;
-    let launch = harness::launch(&root, &config.harness, &instruction)?;
     let history = match &session_id {
         Some(session_id) => SessionLog::messages(&agent_paths.sessions, session_id)?,
         None => Vec::new(),
     };
-    let spinner = crate::progress::start(format!(
-        "Starting {}...",
-        crate::markdown::sanitize(&config.name)
-    ));
-    let client = Client::start(launch, &root, servers, session_id.as_deref()).await;
-    spinner.finish_and_clear();
-    let mut client = client?;
-    client.remember_permissions(&root, &config.harness);
+    let mut client = start_client(&root, &config, session_id.as_deref()).await?;
     // The harness restores settings for an existing session.
     if session_id.is_none() {
         apply_selection(&mut client, ConfigKind::Model, config.model.as_deref()).await?;
@@ -75,24 +63,8 @@ pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
         )
         .await?;
     }
-    let mut log = None;
-    let model = client
-        .current_config_label(ConfigKind::Model)
-        .unwrap_or("default");
-    let thinking = client
-        .current_config_label(ConfigKind::Thinking)
-        .unwrap_or("default");
-    let name_color = config.color.unwrap_or(crate::config::AgentColor::Cyan);
-    let header = ChatHeader::new(
-        &config.name,
-        name_color,
-        &config.harness,
-        model,
-        thinking,
-        config.permission_mode,
-    );
-    let defer_header = interactive() && history.is_empty();
-    let header = if defer_header {
+    let header = chat_header(&root, &config, &client)?;
+    let header = if interactive() && history.is_empty() {
         Some(header)
     } else {
         eprint!("{}", header.render(interactive()));
@@ -105,6 +77,7 @@ pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
         Vec::new()
     };
     let input = self::input::ChatInput::new(prompt_history, root.clone(), header);
+    let mut log = None;
 
     loop {
         let next = if interactive() {
@@ -130,53 +103,96 @@ pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
             input.accepted()?;
             continue;
         }
-        let command = Command::parse(prompt.trim());
-        if command.is_some() {
+        if let Some(command) = Command::parse(prompt.trim()) {
             input.accepted()?;
-        }
-        if command == Some(Command::Quit) {
-            client.close().await;
-            return Ok(());
-        }
-        if command == Some(Command::Status) {
-            print_status(&client, &root, &config.harness)?;
+            if command == Command::Quit {
+                client.close().await;
+                return Ok(());
+            }
+            if command == Command::New {
+                log = None;
+            }
+            run_command(command, &mut client, &root, &config).await?;
             continue;
         }
-        if command == Some(Command::New) {
+
+        render_user_prompt(prompt);
+        let log = match &mut log {
+            Some(log) => log,
+            None => log.insert(SessionLog::create(
+                &agent_paths.sessions,
+                &config,
+                client.session_id(),
+            )?),
+        };
+        log.message(Role::User, prompt)?;
+        input.accepted()?;
+        run_turn(&mut client, log, prompt, &config).await?;
+    }
+}
+
+async fn start_client(
+    root: &Path,
+    config: &AgentConfig,
+    session_id: Option<&str>,
+) -> Result<Client> {
+    let agent_paths = paths(root);
+    let soul = fs::read_to_string(&agent_paths.soul)
+        .with_context(|| format!("could not read {}", agent_paths.soul.display()))?;
+    let launch = harness::launch(root, &config.harness, &runtime_instruction(&soul))?;
+    let servers = mcp::load(&agent_paths.mcp)?;
+    let spinner = crate::progress::start(format!(
+        "Starting {}...",
+        crate::markdown::sanitize(&config.name)
+    ));
+    let client = Client::start(launch, root, servers, session_id).await;
+    spinner.finish_and_clear();
+    let mut client = client?;
+    client.remember_permissions(root, harness::get(&config.harness)?);
+    Ok(client)
+}
+
+fn chat_header(root: &Path, config: &AgentConfig, client: &Client) -> Result<ChatHeader> {
+    Ok(ChatHeader::new(
+        &config.name,
+        config.color.unwrap_or(crate::config::AgentColor::Cyan),
+        &config.harness,
+        client
+            .current_config_label(ConfigKind::Model)
+            .unwrap_or("default"),
+        client
+            .current_config_label(ConfigKind::Thinking)
+            .unwrap_or("default"),
+        // Permission changes are saved to disk during chat.
+        AgentConfig::load(root)?.permission_mode,
+    ))
+}
+
+/// Runs a chat command other than `/quit`.
+async fn run_command(
+    command: Command,
+    client: &mut Client,
+    root: &Path,
+    config: &AgentConfig,
+) -> Result<()> {
+    match command {
+        Command::Quit => {}
+        Command::Status => print_status(client, root, &config.harness)?,
+        Command::Permissions => manage_permissions(root)?,
+        Command::New => {
             let model = client
                 .select_config_option(ConfigKind::Model)
                 .map(|option| option.current_value.clone());
             let thinking = client
                 .select_config_option(ConfigKind::Thinking)
                 .map(|option| option.current_value.clone());
-            let soul = fs::read_to_string(&agent_paths.soul)?;
-            let launch = harness::launch(&root, &config.harness, &runtime_instruction(&soul))?;
-            let spinner = crate::progress::start(format!(
-                "Starting {}...",
-                crate::markdown::sanitize(&config.name)
-            ));
-            let fresh = Client::start(launch, &root, mcp::load(&agent_paths.mcp)?, None).await;
-            spinner.finish_and_clear();
-            let mut fresh = fresh?;
-            fresh.remember_permissions(&root, &config.harness);
+            let mut fresh = start_client(root, config, None).await?;
             apply_selection(&mut fresh, ConfigKind::Model, model.as_deref()).await?;
             apply_selection(&mut fresh, ConfigKind::Thinking, thinking.as_deref()).await?;
             client.close().await;
-            client = fresh;
-            log = None;
+            *client = fresh;
             if interactive() {
-                let header = ChatHeader::new(
-                    &config.name,
-                    name_color,
-                    &config.harness,
-                    client
-                        .current_config_label(ConfigKind::Model)
-                        .unwrap_or("default"),
-                    client
-                        .current_config_label(ConfigKind::Thinking)
-                        .unwrap_or("default"),
-                    AgentConfig::load(&root)?.permission_mode,
-                );
+                let header = chat_header(root, config, client)?;
                 io::stdout().flush()?;
                 print_colored(true, LIGHT_GRAY, "\n\nNew session started\n");
                 eprint!("{}", header.render(true));
@@ -184,130 +200,114 @@ pub async fn run(root: PathBuf, resume: Option<Option<String>>) -> Result<()> {
             } else {
                 print_colored(false, LIGHT_GRAY, "New session started\n");
             }
-            continue;
         }
-        if command == Some(Command::Permissions) {
-            manage_permissions(&root)?;
-            continue;
-        }
-        if command == Some(Command::Model) {
+        Command::Model => {
             if !interactive() {
-                bail!("{} needs an interactive terminal", prompt.trim());
+                bail!("/model needs an interactive terminal");
             }
-            if let Err(error) = change_model(&mut client, &root, &config.harness).await {
-                if error.downcast_ref::<crate::acp::ProtocolError>().is_some() {
-                    print_colored(
-                        true,
-                        "31",
-                        &format!("{}\n", client.friendly_error(&error, "")),
-                    );
-                } else {
+            if let Err(error) = change_model(client, root, &config.harness).await {
+                if error.downcast_ref::<crate::acp::ProtocolError>().is_none() {
                     return Err(error);
                 }
+                print_colored(
+                    true,
+                    "31",
+                    &format!("{}\n", client.friendly_error(&error, "")),
+                );
             }
-            continue;
         }
+    }
+    Ok(())
+}
 
-        render_user_prompt(prompt);
-        if log.is_none() {
-            log = Some(SessionLog::create(
-                &agent_paths.sessions,
-                &config,
-                client.session_id(),
-            )?);
-        }
-        let log = log.as_mut().expect("the session log was created above");
-        log.message("user", prompt)?;
-        input.accepted()?;
-        let mut system_error = String::new();
-        let mut display = TurnDisplay::new();
-        let turn_input = crate::prompts::CancellationInput::new()?;
-        display.start_waiting();
-        let answer = tokio::select! {
-            biased;
-            result = client.prompt_with_timeout(prompt, |event| {
+/// Sends one prompt. Returns an error only when chat must stop.
+async fn run_turn(
+    client: &mut Client,
+    log: &mut SessionLog,
+    prompt: &str,
+    config: &AgentConfig,
+) -> Result<()> {
+    let mut system_error = String::new();
+    let mut display = TurnDisplay::new();
+    let turn_input = crate::prompts::CancellationInput::new()?;
+    display.start_waiting();
+    let answer = tokio::select! {
+        biased;
+        result = client.prompt_with_timeout(prompt, |event| {
+            log.stream(&event)?;
+            if let StreamEvent::SystemError(text) = &event {
+                system_error.push_str(text);
+                return Ok(None);
+            }
+            if matches!(&event, StreamEvent::PermissionRequest { .. }) {
+                turn_input.pause()?;
+                let result = display.handle(event, permission_selection);
+                turn_input.resume()?;
+                result
+            } else {
+                display.handle(event, permission_selection)
+            }
+        }, Some(Duration::from_secs(config.idle_timeout.get()))) => Some(result),
+        result = turn_input.cancelled(false) => {
+            result?;
+            None
+        },
+    };
+    drop(turn_input);
+    let interrupted = answer.as_ref().is_none_or(|result| {
+        result
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<InquireError>())
+            .is_some_and(|error| matches!(error, InquireError::OperationInterrupted))
+    });
+    if interrupted {
+        let cancelled = client
+            .cancel_prompt(|event| {
                 log.stream(&event)?;
-                if let StreamEvent::SystemError(text) = &event {
-                    system_error.push_str(text);
-                    return Ok(None);
-                }
-                if matches!(&event, StreamEvent::PermissionRequest { .. }) {
-                    turn_input.pause()?;
-                    let result = display.handle(event, permission_selection);
-                    turn_input.resume()?;
-                    result
-                } else {
-                    display.handle(event, permission_selection)
-                }
-            }, Some(Duration::from_secs(config.idle_timeout.get()))) => Some(result),
-            result = turn_input.cancelled(false) => {
-                result?;
-                None
-            },
-        };
-        drop(turn_input);
-        let interrupted = answer.as_ref().is_some_and(|result| {
-            result
-                .as_ref()
-                .err()
-                .and_then(|error| error.downcast_ref::<InquireError>())
-                .is_some_and(|error| matches!(error, InquireError::OperationInterrupted))
-        });
-        if answer.is_none() || interrupted {
-            let cancelled = client
-                .cancel_prompt(|event| {
-                    log.stream(&event)?;
-                    display.handle(event, permission_selection)
-                })
-                .await;
-            display.finish();
-            log.append(&SessionEntry::TurnEnd)?;
-            if let Err(error) = cancelled {
-                log.append(&SessionEntry::Error {
-                    message: "The agent did not stop. Restart chat.".into(),
-                    detail: format!("{error:#}"),
-                    diagnostics: client.diagnostics(),
-                })?;
-                client.close().await;
-                return Err(error);
-            }
-            print_colored(interactive(), LIGHT_GRAY, "Turn cancelled.\n");
-            continue;
-        }
-        match answer.expect("the interrupted prompt returned above") {
-            Ok(_) => {}
-            Err(error) => {
-                display.finish();
-                let friendly = client.friendly_error(&error, &system_error);
-                log.append(&SessionEntry::Error {
-                    message: friendly.clone(),
-                    detail: format!("{error:#}\n{system_error}"),
-                    diagnostics: client.diagnostics(),
-                })?;
-                log.append(&SessionEntry::TurnEnd)?;
-                if !interactive() {
-                    client.close().await;
-                    return Err(error.context(friendly));
-                }
-                if let Some(timeout) = error.downcast_ref::<PromptTimeout>() {
-                    print_colored(interactive(), "31", &format!("✗ {timeout}.\n"));
-                    if timeout.connection_ready() {
-                        continue;
-                    }
-                    client.close().await;
-                    return Err(error);
-                }
-                if error.downcast_ref::<crate::acp::ProtocolError>().is_some() {
-                    print_colored(interactive(), "31", &format!("✗ {friendly}\n"));
-                    continue;
-                }
-                client.close().await;
-                return Err(error);
-            }
-        };
+                display.handle(event, permission_selection)
+            })
+            .await;
         display.finish();
         log.append(&SessionEntry::TurnEnd)?;
+        if let Err(error) = cancelled {
+            log.append(&SessionEntry::Error {
+                message: "The agent did not stop. Restart chat.".into(),
+                detail: format!("{error:#}"),
+                diagnostics: client.diagnostics(),
+            })?;
+            client.close().await;
+            return Err(error);
+        }
+        print_colored(interactive(), LIGHT_GRAY, "Turn cancelled.\n");
+        return Ok(());
     }
+    display.finish();
+    let Some(Err(error)) = answer else {
+        return log.append(&SessionEntry::TurnEnd);
+    };
+    let friendly = client.friendly_error(&error, &system_error);
+    log.append(&SessionEntry::Error {
+        message: friendly.clone(),
+        detail: format!("{error:#}\n{system_error}"),
+        diagnostics: client.diagnostics(),
+    })?;
+    log.append(&SessionEntry::TurnEnd)?;
+    if !interactive() {
+        client.close().await;
+        return Err(error.context(friendly));
+    }
+    if let Some(timeout) = error.downcast_ref::<PromptTimeout>() {
+        print_colored(interactive(), "31", &format!("✗ {timeout}.\n"));
+        if timeout.connection_ready() {
+            return Ok(());
+        }
+    } else if error.downcast_ref::<crate::acp::ProtocolError>().is_some() {
+        print_colored(interactive(), "31", &format!("✗ {friendly}\n"));
+        return Ok(());
+    }
+    client.close().await;
+    Err(error)
 }
 
 fn permission_selection(
@@ -474,7 +474,7 @@ fn select_session(
     }
 }
 
-fn manage_permissions(root: &std::path::Path) -> Result<()> {
+fn manage_permissions(root: &Path) -> Result<()> {
     if !interactive() {
         bail!("/permissions needs an interactive terminal");
     }
@@ -494,7 +494,7 @@ fn manage_permissions(root: &std::path::Path) -> Result<()> {
     }
 }
 
-fn save_model(client: &Client, root: &std::path::Path, harness: &str) -> Result<()> {
+fn save_model(client: &Client, root: &Path, harness: &str) -> Result<()> {
     crate::config::update(root, |config| {
         config["harness"] = harness.into();
         for (key, kind) in [
@@ -510,20 +510,23 @@ fn save_model(client: &Client, root: &std::path::Path, harness: &str) -> Result<
     })
 }
 
-fn print_status(client: &Client, root: &std::path::Path, harness: &str) -> Result<()> {
+fn print_status(client: &Client, root: &Path, harness: &str) -> Result<()> {
     let config = AgentConfig::load(root)?;
     let mut text = format!(
         "session: {}\nharness: {harness}\nmodel: {}\nreasoning: {}\npermissions: {}\n",
         client.session_id(),
         client
             .current_config_label(ConfigKind::Model)
-            .unwrap_or("default")
-            .to_lowercase(),
+            .unwrap_or("default"),
         client
             .current_config_label(ConfigKind::Thinking)
             .unwrap_or("default"),
         config.permission_mode
     );
+    if let Some((package, version)) = harness::installed_adapter(root, harness::get(harness)?) {
+        let version = version.as_deref().unwrap_or("unknown");
+        text.push_str(&format!("adapter: {package} {version}\n"));
+    }
     if let Some(usage) = &client.context_usage {
         if let (Some(used), Some(size)) = (usage["used"].as_u64(), usage["size"].as_u64()) {
             text.push_str(&format!("context: {used} / {size} tokens\n"));
@@ -557,7 +560,7 @@ fn print_status(client: &Client, root: &std::path::Path, harness: &str) -> Resul
     Ok(())
 }
 
-async fn change_model(client: &mut Client, root: &std::path::Path, harness: &str) -> Result<()> {
+async fn change_model(client: &mut Client, root: &Path, harness: &str) -> Result<()> {
     if !change_setting(client, ConfigKind::Model).await? {
         return Ok(());
     }
@@ -571,8 +574,7 @@ async fn change_model(client: &mut Client, root: &std::path::Path, harness: &str
             "Model: {} · Reasoning: {}\n",
             client
                 .current_config_label(ConfigKind::Model)
-                .unwrap_or("default")
-                .to_lowercase(),
+                .unwrap_or("default"),
             client
                 .current_config_label(ConfigKind::Thinking)
                 .unwrap_or("default"),
@@ -596,25 +598,11 @@ async fn change_setting(client: &mut Client, kind: ConfigKind) -> Result<bool> {
     };
     let id = option.id.clone();
     let current = option.current_value.clone();
-    let cursor = option
-        .choices
-        .iter()
-        .position(|choice| choice.value == current)
-        .unwrap_or_default();
-    let choices = option
-        .choices
-        .iter()
-        .cloned()
-        .map(|mut choice| {
-            if matches!(kind, ConfigKind::Model) {
-                choice.label = choice.label.to_lowercase();
-            }
-            SettingChoice(choice)
-        })
-        .collect();
+    let cursor = option.cursor();
+    let choices = option.choices.clone();
     let selected =
         match crate::prompts::select(Select::new(label, choices).with_starting_cursor(cursor)) {
-            Ok(selected) => selected.0,
+            Ok(selected) => selected,
             Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
                 return Ok(false)
             }
@@ -624,14 +612,6 @@ async fn change_setting(client: &mut Client, kind: ConfigKind) -> Result<bool> {
         client.set_config_option(&id, &selected.value).await?;
     }
     Ok(true)
-}
-
-struct SettingChoice(crate::acp::ConfigChoice);
-
-impl std::fmt::Display for SettingChoice {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&crate::markdown::sanitize(&self.0.label))
-    }
 }
 
 async fn apply_selection(

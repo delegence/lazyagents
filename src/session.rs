@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::acp::StreamEvent;
+use crate::acp::{StreamEvent, ToolStatus};
 use crate::config::AgentConfig;
 
 pub struct SessionLog {
@@ -18,8 +18,17 @@ pub struct SessionLog {
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
 pub struct SessionMessage {
-    pub role: String,
+    pub role: Role,
     pub content: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    User,
+    Assistant,
+    #[serde(other)]
+    Other,
 }
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
@@ -215,9 +224,9 @@ impl SessionLog {
         })
     }
 
-    pub fn message(&mut self, role: &str, content: &str) -> Result<()> {
+    pub fn message(&mut self, role: Role, content: &str) -> Result<()> {
         self.append(&SessionEntry::Message(SessionMessage {
-            role: role.to_owned(),
+            role,
             content: content.to_owned(),
         }))
     }
@@ -324,8 +333,7 @@ fn decode_entry(value: Value) -> Result<Option<SessionEntry>> {
             kind: value.get("kind").and_then(Value::as_str).map(str::to_owned),
             status: value
                 .get("status")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+                .and_then(|status| ToolStatus::deserialize(status).ok()),
             input: value.get("input").filter(|v| !v.is_null()).cloned(),
             output: value.get("output").filter(|v| !v.is_null()).cloned(),
         },
@@ -353,7 +361,6 @@ mod tests {
     fn history_stops_before_opening_older_logs_and_keeps_chronological_order() {
         let directory = tempdir().unwrap();
         // Opening a dangling link fails if the history reader reaches this old log.
-        #[cfg(unix)]
         std::os::unix::fs::symlink("missing", directory.path().join("00.jsonl")).unwrap();
         let mut log = String::new();
         for index in 0..1005 {
@@ -419,19 +426,7 @@ mod tests {
     #[test]
     fn stream_events_are_readable_before_the_turn_finishes() {
         let directory = tempdir().unwrap();
-        let config = AgentConfig {
-            color: None,
-            name: "Test".into(),
-            slug: "test".into(),
-            description: "Test".into(),
-            harness: "fake".into(),
-            model: None,
-            thinking: None,
-            permissions: Vec::new(),
-            permission_mode: Default::default(),
-            draft: String::new(),
-            idle_timeout: crate::config::default_idle_timeout(),
-        };
+        let config = AgentConfig::new("Test", "test", "Test", "fake");
         let mut log = SessionLog::create(directory.path(), &config, "session").unwrap();
         let events = [
             StreamEvent::Assistant("Before".into()),
@@ -439,7 +434,7 @@ mod tests {
                 call_id: "1".into(),
                 title: "Read".into(),
                 kind: None,
-                status: Some("pending".into()),
+                status: Some(ToolStatus::Pending),
                 input: None,
                 output: None,
             },
@@ -533,11 +528,11 @@ mod tests {
             SessionLog::messages(directory.path(), "same").unwrap(),
             [
                 SessionEntry::Message(SessionMessage {
-                    role: "user".into(),
+                    role: Role::User,
                     content: "Hello".into()
                 }),
                 SessionEntry::Message(SessionMessage {
-                    role: "assistant".into(),
+                    role: Role::Assistant,
                     content: "Hi".into()
                 })
             ]
@@ -567,7 +562,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn prompt_history_skips_an_unreadable_log() {
         let directory = tempdir().unwrap();

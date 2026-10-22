@@ -75,8 +75,10 @@ async fn repair() -> Result<()> {
             selected.display_name()
         )
     })?;
-    harness::install_adapter(&root, selected).await?;
-    println!("{} runtime files are ready.", selected.display_name());
+    match harness::install_adapter(&root, selected).await? {
+        Some(version) => println!("{} adapter {version} is ready.", selected.display_name()),
+        None => println!("{} runtime files are ready.", selected.display_name()),
+    }
     Ok(())
 }
 

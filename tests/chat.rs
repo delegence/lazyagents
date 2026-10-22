@@ -1082,6 +1082,18 @@ fn preparing_agent() -> tempfile::TempDir {
             "npm",
             r#"#!/bin/sh
 set -eu
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --prefix ]; then
+    shift
+    prefix=$1
+    break
+  fi
+  shift
+done
+printf '%s\n' "$prefix" > npm-prefix
+mkdir -p "$prefix/node_modules/.bin" "$prefix/node_modules/@automatalabs/pi-acp"
+printf '%s\n' 'partial install' > "$prefix/node_modules/.bin/pi-acp"
+printf '%s\n' '{"version":"0.0.0"}' > "$prefix/node_modules/@automatalabs/pi-acp/package.json"
 printf '%s\n' "$$" > npm.pid
 sleep 60 &
 sleeper=$!
@@ -1095,8 +1107,9 @@ while [ ! -f finish-install ]; do
 done
 kill "$sleeper"
 wait "$sleeper" 2>/dev/null || true
-mkdir -p .agents/runtime/acp-pi/node_modules/.bin
-cp bin/opencode .agents/runtime/acp-pi/node_modules/.bin/pi-acp
+cp bin/opencode "$prefix/node_modules/.bin/pi-acp"
+chmod +x "$prefix/node_modules/.bin/pi-acp"
+printf '%s\n' '{"version":"99.0.0"}' > "$prefix/node_modules/@automatalabs/pi-acp/package.json"
 "#,
         ),
     ] {
@@ -1105,6 +1118,52 @@ cp bin/opencode .agents/runtime/acp-pi/node_modules/.bin/pi-acp
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
     root
+}
+
+fn existing_pi_agent() -> tempfile::TempDir {
+    let root = preparing_agent();
+    let runtime = root.path().join(".agents/runtime/acp-pi");
+    fs::create_dir_all(runtime.join("node_modules/.bin")).unwrap();
+    fs::create_dir_all(runtime.join("node_modules/@automatalabs/pi-acp")).unwrap();
+    let mut binary = fs::read(root.path().join("bin/opencode")).unwrap();
+    binary.extend_from_slice(b"\n# previous adapter\n");
+    let path = runtime.join("node_modules/.bin/pi-acp");
+    fs::write(&path, binary).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        runtime.join("node_modules/@automatalabs/pi-acp/package.json"),
+        r#"{"version":"1.0.0"}"#,
+    )
+    .unwrap();
+    fs::write(runtime.join("old-only"), "previous files").unwrap();
+    fs::write(root.path().join(".agents/agent.json"), r#"{"name":"Test","slug":"test","description":"Test","harness":"pi","model":null,"thinking":null}"#).unwrap();
+    fs::write(root.path().join(".agents/SOUL.md"), "Test").unwrap();
+    root
+}
+
+fn assert_no_adapter_temporary_files(root: &std::path::Path) {
+    for entry in fs::read_dir(root.join(".agents/runtime")).unwrap() {
+        let path = entry.unwrap().path();
+        assert!(
+            !path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".acp-"),
+            "adapter temporary files remain: {}",
+            path.display()
+        );
+    }
+}
+
+fn assert_pi_chat_works(root: &std::path::Path) {
+    let mut chat = Chat::start(root, false);
+    chat.wait_status("> ");
+    chat.send("Hello\n");
+    chat.wait_for("After\n\n");
+    assert_eq!(chat.text, "Before\n\nAfter\n\n");
+    chat.send("/quit\n");
+    chat.wait_for_exit();
 }
 
 fn terminal_progress(
@@ -1373,6 +1432,251 @@ fn setup_preparation_cancellation_stops_npm_and_its_children() {
                 std::io::Error::last_os_error().raw_os_error(),
                 Some(libc::ESRCH)
             );
+        }
+    }
+}
+
+#[test]
+fn setup_preparation_cancellation_preserves_existing_adapter() {
+    for key in ["\x1b", "\x03"] {
+        let root = existing_pi_agent();
+        let runtime = root.path().join(".agents/runtime/acp-pi");
+        let binary = fs::read(runtime.join("node_modules/.bin/pi-acp")).unwrap();
+        let manifest =
+            fs::read(runtime.join("node_modules/@automatalabs/pi-acp/package.json")).unwrap();
+        let config = fs::read(root.path().join(".agents/agent.json")).unwrap();
+        fs::write(root.path().join("buddy"), "old launcher").unwrap();
+        let (mut chat, mut terminal, _slave) = terminal_command(root.path(), 80, 24, "init");
+        let mut screen = vt100::Parser::new(24, 80, 100);
+        for (label, input) in [
+            ("Select harness runtime", "Pi\r"),
+            ("What is your Agent name:", "Buddy\r"),
+            ("Describe what your Agent does:", "friend\r"),
+            ("Replace these files", "y\r"),
+        ] {
+            terminal_prompt(
+                &mut chat,
+                &mut terminal,
+                &mut screen,
+                label,
+                input.as_bytes(),
+            );
+        }
+        terminal_progress(
+            &mut chat,
+            &mut terminal,
+            &mut screen,
+            "Preparing harness...",
+            &root.path().join("npm-child.pid"),
+        );
+        let prefix = std::path::PathBuf::from(
+            fs::read_to_string(root.path().join("npm-prefix"))
+                .unwrap()
+                .trim(),
+        );
+        assert_eq!(
+            prefix.parent().unwrap().canonicalize().unwrap(),
+            runtime.parent().unwrap().canonicalize().unwrap()
+        );
+        assert_ne!(prefix, runtime.canonicalize().unwrap());
+        assert_eq!(
+            fs::read_to_string(prefix.join("node_modules/.bin/pi-acp")).unwrap(),
+            "partial install\n"
+        );
+        terminal.write_all(key.as_bytes()).unwrap();
+        while !chat.text.ends_with("Setup cancelled.\r\n") {
+            let byte = chat.output.recv_timeout(Duration::from_secs(5)).unwrap();
+            terminal_byte(&mut chat, &mut terminal, &mut screen, byte);
+        }
+        chat.wait_for_exit();
+        assert_eq!(
+            fs::read(runtime.join("node_modules/.bin/pi-acp")).unwrap(),
+            binary
+        );
+        assert_eq!(
+            fs::read(runtime.join("node_modules/@automatalabs/pi-acp/package.json")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            fs::read(root.path().join(".agents/agent.json")).unwrap(),
+            config
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join(".agents/SOUL.md")).unwrap(),
+            "Test"
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("buddy")).unwrap(),
+            "old launcher"
+        );
+        assert_eq!(
+            fs::read_to_string(runtime.join("old-only")).unwrap(),
+            "previous files"
+        );
+        assert!(!prefix.exists());
+        assert_no_adapter_temporary_files(root.path());
+        assert_pi_chat_works(root.path());
+    }
+}
+
+#[test]
+fn repair_replaces_adapter_only_after_valid_installation() {
+    for (finish, error) in [
+        ("exit 1\n", Some("npm could not install")),
+        (
+            "printf '%s\\n' '{\"version\":\"0.7.0\"}' > \"$prefix/node_modules/@automatalabs/pi-acp/package.json\"\n",
+            Some("needs 0.8.0 or newer"),
+        ),
+        (
+            "printf '%s\\n' 'invalid' > \"$prefix/node_modules/@automatalabs/pi-acp/package.json\"\n",
+            Some("could not parse"),
+        ),
+        (
+            "rm \"$prefix/node_modules/.bin/pi-acp\"\n",
+            Some("did not install the ACP adapter binary"),
+        ),
+        (
+            "rm \"$prefix/node_modules/.bin/pi-acp\"\nln -s missing \"$prefix/node_modules/.bin/pi-acp\"\n",
+            Some("did not install the ACP adapter binary"),
+        ),
+        ("", None),
+    ] {
+        let root = existing_pi_agent();
+        let runtime = root.path().join(".agents/runtime/acp-pi");
+        let binary = fs::read(runtime.join("node_modules/.bin/pi-acp")).unwrap();
+        let manifest =
+            fs::read(runtime.join("node_modules/@automatalabs/pi-acp/package.json")).unwrap();
+        let npm = root.path().join("bin/npm");
+        let script = fs::read_to_string(&npm).unwrap();
+        fs::write(npm, format!("{script}{finish}")).unwrap();
+        fs::write(root.path().join("finish-install"), "").unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_lazyagents"))
+            .arg("repair")
+            .current_dir(root.path())
+            .env("HOME", root.path())
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("PATH", format!("{}:{}", root.path().join("bin").display(), std::env::var("PATH").unwrap()))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), error.is_none(), "{stderr}");
+        if let Some(error) = error {
+            assert!(stderr.contains(error), "{stderr}");
+            assert_eq!(fs::read(runtime.join("node_modules/.bin/pi-acp")).unwrap(), binary);
+            assert_eq!(
+                fs::read(runtime.join("node_modules/@automatalabs/pi-acp/package.json")).unwrap(),
+                manifest
+            );
+            assert_eq!(fs::read_to_string(runtime.join("old-only")).unwrap(), "previous files");
+        } else {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("adapter 99.0.0 is ready"));
+            assert_eq!(
+                fs::read(runtime.join("node_modules/.bin/pi-acp")).unwrap(),
+                fs::read(root.path().join("bin/opencode")).unwrap()
+            );
+            assert_eq!(
+                fs::read_to_string(runtime.join("node_modules/@automatalabs/pi-acp/package.json")).unwrap(),
+                "{\"version\":\"99.0.0\"}\n"
+            );
+            assert!(!runtime.join("old-only").exists());
+        }
+        assert_no_adapter_temporary_files(root.path());
+        assert_pi_chat_works(root.path());
+    }
+}
+
+#[test]
+fn setup_confirms_replacement_and_preserves_existing_agent_data() {
+    for (replace, cancel) in [(false, false), (true, true), (true, false)] {
+        let root = agent();
+        let state = root.path().join(".agents");
+        let config = fs::read(state.join("agent.json")).unwrap();
+        fs::write(root.path().join("buddy"), "old launcher").unwrap();
+        fs::create_dir_all(state.join("skills/jobs")).unwrap();
+        fs::write(state.join("skills/jobs/SKILL.md"), "Find jobs").unwrap();
+        fs::create_dir_all(state.join("sessions")).unwrap();
+        fs::write(state.join("sessions/history.jsonl"), "history").unwrap();
+        fs::write(state.join("mcps.json"), "[] \n").unwrap();
+        fs::write(state.join(".gitignore"), "custom\n").unwrap();
+        let (mut chat, mut terminal, _slave) = terminal_command(root.path(), 80, 24, "init");
+        let mut screen = vt100::Parser::new(24, 80, 100);
+        for (label, input) in [
+            ("Select harness runtime", "OpenCode\r"),
+            ("What is your Agent name:", "Buddy\r"),
+            ("Describe what your Agent does:", "friend\r"),
+            ("Replace these files", if replace { "y\r" } else { "\r" }),
+        ] {
+            terminal_prompt(
+                &mut chat,
+                &mut terminal,
+                &mut screen,
+                label,
+                input.as_bytes(),
+            );
+        }
+        assert!(chat.text.contains("agent.json"));
+        assert!(chat.text.contains("SOUL.md"));
+        if replace {
+            terminal_prompt(
+                &mut chat,
+                &mut terminal,
+                &mut screen,
+                "Select model for your Agent:",
+                if cancel { b"\x1b" } else { b"\r" },
+            );
+            if !cancel {
+                terminal_prompt(
+                    &mut chat,
+                    &mut terminal,
+                    &mut screen,
+                    "Select reasoning level for your Agent:",
+                    b"\r",
+                );
+                terminal_prompt(
+                    &mut chat,
+                    &mut terminal,
+                    &mut screen,
+                    "Install a global launcher",
+                    b"n\r",
+                );
+            }
+        }
+        let ending = if replace && !cancel {
+            "Ready. Run ./buddy\r\n"
+        } else {
+            "Setup cancelled.\r\n"
+        };
+        while !chat.text.ends_with(ending) {
+            let byte = chat.output.recv_timeout(Duration::from_secs(5)).unwrap();
+            terminal_byte(&mut chat, &mut terminal, &mut screen, byte);
+        }
+        chat.wait_for_exit();
+        if replace && !cancel {
+            let config: serde_json::Value =
+                serde_json::from_slice(&fs::read(state.join("agent.json")).unwrap()).unwrap();
+            assert_eq!(config["name"], "Buddy");
+            assert_eq!(
+                fs::read_to_string(state.join("SOUL.md")).unwrap(),
+                "Before\n\nAfter\n"
+            );
+            assert!(fs::read_to_string(root.path().join("buddy"))
+                .unwrap()
+                .contains("exec lazyagents chat"));
+        } else {
+            assert_eq!(fs::read(state.join("agent.json")).unwrap(), config);
+            assert_eq!(fs::read_to_string(state.join("SOUL.md")).unwrap(), "Test");
+            assert_eq!(
+                fs::read_to_string(root.path().join("buddy")).unwrap(),
+                "old launcher"
+            );
+        }
+        for (path, contents) in [
+            ("skills/jobs/SKILL.md", "Find jobs"),
+            ("sessions/history.jsonl", "history"),
+            ("mcps.json", "[] \n"),
+            (".gitignore", "custom\n"),
+        ] {
+            assert_eq!(fs::read_to_string(state.join(path)).unwrap(), contents);
         }
     }
 }

@@ -34,31 +34,32 @@ pub enum AgentColor {
 }
 
 impl AgentColor {
+    const ALL: [Self; 20] = [
+        Self::Red,
+        Self::Green,
+        Self::Yellow,
+        Self::Blue,
+        Self::Magenta,
+        Self::Cyan,
+        Self::Orange,
+        Self::Coral,
+        Self::Pink,
+        Self::Rose,
+        Self::Violet,
+        Self::Lavender,
+        Self::Purple,
+        Self::Teal,
+        Self::Turquoise,
+        Self::Mint,
+        Self::Lime,
+        Self::Gold,
+        Self::Amber,
+        Self::Sky,
+    ];
+
     pub fn random() -> Self {
-        let colors = [
-            Self::Red,
-            Self::Green,
-            Self::Yellow,
-            Self::Blue,
-            Self::Magenta,
-            Self::Cyan,
-            Self::Orange,
-            Self::Coral,
-            Self::Pink,
-            Self::Rose,
-            Self::Violet,
-            Self::Lavender,
-            Self::Purple,
-            Self::Teal,
-            Self::Turquoise,
-            Self::Mint,
-            Self::Lime,
-            Self::Gold,
-            Self::Amber,
-            Self::Sky,
-        ];
         let random = uuid::Uuid::now_v7();
-        colors[usize::from(random.as_bytes()[15]) % colors.len()]
+        Self::ALL[usize::from(random.as_bytes()[15]) % Self::ALL.len()]
     }
 
     pub fn ansi(self) -> &'static str {
@@ -112,6 +113,22 @@ pub fn default_idle_timeout() -> std::num::NonZeroU64 {
 }
 
 impl AgentConfig {
+    pub fn new(name: &str, slug: &str, description: &str, harness: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            color: None,
+            slug: slug.to_owned(),
+            description: description.to_owned(),
+            harness: harness.to_owned(),
+            model: None,
+            thinking: None,
+            permissions: Vec::new(),
+            permission_mode: Default::default(),
+            draft: String::new(),
+            idle_timeout: default_idle_timeout(),
+        }
+    }
+
     pub fn load(root: &Path) -> Result<Self> {
         let path = paths(root).config;
         let bytes =
@@ -208,19 +225,7 @@ mod tests {
     fn saves_configuration_without_leaving_a_temporary_file() {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir(root.path().join(STATE_DIR)).unwrap();
-        let config = AgentConfig {
-            color: None,
-            name: "Agent".into(),
-            slug: "agent".into(),
-            description: "Test".into(),
-            harness: "codex".into(),
-            model: None,
-            thinking: None,
-            permissions: Vec::new(),
-            permission_mode: Default::default(),
-            draft: String::new(),
-            idle_timeout: default_idle_timeout(),
-        };
+        let config = AgentConfig::new("Agent", "agent", "Test", "codex");
 
         config.save(root.path()).unwrap();
 

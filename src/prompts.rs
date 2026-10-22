@@ -121,26 +121,12 @@ impl CancellationInput {
             return Ok(());
         }
         // Keep normal newline output while reading individual keys without echo.
-        #[cfg(unix)]
-        let output_flags = {
-            let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
-            if unsafe { libc::tcgetattr(libc::STDIN_FILENO, mode.as_mut_ptr()) } != 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            unsafe { mode.assume_init() }.c_oflag
-        };
+        let output_flags = terminal_mode()?.c_oflag;
         crossterm::terminal::enable_raw_mode()?;
-        #[cfg(unix)]
-        {
-            let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
-            if unsafe { libc::tcgetattr(libc::STDIN_FILENO, mode.as_mut_ptr()) } != 0 {
-                return Err(io::Error::last_os_error().into());
-            }
-            let mut mode = unsafe { mode.assume_init() };
-            mode.c_oflag = output_flags;
-            if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &mode) } != 0 {
-                return Err(io::Error::last_os_error().into());
-            }
+        let mut mode = terminal_mode()?;
+        mode.c_oflag = output_flags;
+        if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &mode) } != 0 {
+            return Err(io::Error::last_os_error().into());
         }
         Ok(())
     }
@@ -171,6 +157,14 @@ impl CancellationInput {
             }
         }
     }
+}
+
+fn terminal_mode() -> io::Result<libc::termios> {
+    let mut mode = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, mode.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { mode.assume_init() })
 }
 
 impl Drop for CancellationInput {

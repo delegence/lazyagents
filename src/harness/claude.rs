@@ -25,7 +25,7 @@ impl Harness for Claude {
     fn adapter(&self) -> Option<AdapterSpec> {
         Some(AdapterSpec {
             package: "@agentclientprotocol/claude-agent-acp",
-            version: "0.76.0",
+            min_version: "0.76.0",
             binary: "claude-agent-acp",
         })
     }

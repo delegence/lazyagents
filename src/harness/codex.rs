@@ -31,7 +31,7 @@ impl Harness for Codex {
     fn adapter(&self) -> Option<AdapterSpec> {
         Some(AdapterSpec {
             package: "@agentclientprotocol/codex-acp",
-            version: "1.11.0",
+            min_version: "1.11.0",
             binary: "codex-acp",
         })
     }

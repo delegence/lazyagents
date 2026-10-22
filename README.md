@@ -28,7 +28,9 @@ lazyagents init
 lazyagents chat
 ```
 
-Setup asks for a harness, name, description, model, and reasoning level. It installs the required adapter and generates `.agents/SOUL.md` automatically.
+Setup asks for a harness, name, description, model, and reasoning level. It installs the latest release of the required adapter and generates `.agents/SOUL.md` automatically.
+
+Existing `.agents` folders are supported. Setup preserves skills, sessions, MCP settings, and `.gitignore`. If `agent.json`, `SOUL.md`, or the launcher already exists, setup lists those files and asks before replacing them. Failed or cancelled setup restores those files.
 
 The agent name determines the launcher name. Setup can also add a launcher symlink in `~/.local/bin`. Launchers work from any directory and use the `lazyagents` binary on `PATH`.
 
@@ -51,7 +53,7 @@ Type `/` to see commands. Keep typing to filter and use the arrow keys to select
 | `/model` | Select model and reasoning level; save them for new sessions |
 | `/permissions` | Select and save `ask for approval` or `full access` |
 | `/new` | Start an empty conversation with the current settings |
-| `/status` | Show session settings and usage reported by the harness |
+| `/status` | Show session settings, adapter version, and usage reported by the harness |
 | `/quit` | Exit chat |
 
 Unsent input is saved per agent and restored on the next launch. Tool output is shortened in chat; complete events are saved in `.agents/sessions/`.
@@ -125,7 +127,7 @@ Put each skill at `.agents/skills/<name>/SKILL.md`. The selected harness handles
 
 ## Troubleshooting
 
-Run `lazyagents repair` in the agent folder to reinstall its pinned ACP adapter. Interactive chat offers to install a missing adapter; for scripts, run repair first.
+Run `lazyagents repair` in the agent folder to update its ACP adapter to the latest release. Repair prints the installed version, and `/status` shows it during chat. Chat does not update the adapter. If the installed adapter is older than the oldest supported version, chat stops and asks you to run repair. Interactive chat offers to install a missing adapter; for scripts, run repair first.
 
 ## Pipes
 

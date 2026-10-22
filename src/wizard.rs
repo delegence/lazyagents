@@ -1,7 +1,7 @@
 use std::env;
-use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -10,7 +10,7 @@ use inquire::validator::{StringValidator, Validation};
 use inquire::{Confirm, InquireError, Select, Text};
 use tokio::process::Command;
 
-use crate::acp::{Client, ConfigChoice, ConfigKind, StreamEvent};
+use crate::acp::{Client, ConfigKind, StreamEvent};
 use crate::config::{paths, AgentConfig};
 use crate::harness;
 use crate::harness::Harness;
@@ -54,25 +54,38 @@ async fn run_setup(root: PathBuf) -> Result<()> {
     })?;
     print_answer("Agent description", &description)?;
 
-    let agent_paths = paths(&root);
-    let launcher = root.join(&slug);
-    if agent_paths.state.exists() || agent_paths.soul.exists() || launcher.exists() {
-        bail!(
-            "agent files already exist in {}; remove or move them before initialization",
-            root.display()
-        );
+    let files = AgentFiles::read(&root, &slug)?;
+    let existing = files.existing_paths();
+    if !existing.is_empty() {
+        println!("\nSetup will replace:");
+        for path in existing {
+            println!("  {}", display_path(path));
+        }
+        if !confirm("Replace these files", false)? {
+            return Err(Cancelled.into());
+        }
     }
     ensure_authentication(selected).await?;
 
+    let state = paths(&root).state;
+    let state_existed = state.exists();
     let workspace = root.join("workspace");
     let workspace_existed = workspace.exists();
     create_structure(&root)?;
     let result = create_agent(&root, selected, &name, &slug, &description).await;
     if let Err(error) = result {
-        let _ = fs::remove_dir_all(&agent_paths.state);
-        let _ = fs::remove_file(&launcher);
-        if !workspace_existed {
-            let _ = fs::remove_dir_all(&workspace);
+        let cleanup = files.restore().and_then(|()| {
+            if !state_existed {
+                fs::remove_dir_all(&state)?;
+            }
+            if !workspace_existed {
+                fs::remove_dir_all(&workspace)?;
+            }
+            Ok(())
+        });
+        // Report the setup failure, not a later cleanup failure.
+        if let Err(cleanup_error) = cleanup {
+            eprintln!("warning: could not undo setup changes: {cleanup_error:#}");
         }
         if error.downcast_ref::<crate::acp::ProtocolError>().is_some() {
             return Err(anyhow!(crate::acp::friendly_error(
@@ -91,7 +104,7 @@ async fn run_setup(root: PathBuf) -> Result<()> {
         if install_globally { "Yes" } else { "No" },
     )?;
     if install_globally {
-        install_global_link(&launcher, &slug)?;
+        install_global_link(&root.join(&slug), &slug)?;
     }
 
     println!("\nReady. Run ./{}", slug);
@@ -105,19 +118,8 @@ async fn create_agent(
     slug: &str,
     description: &str,
 ) -> Result<()> {
-    let mut config = AgentConfig {
-        color: Some(crate::config::AgentColor::random()),
-        name: name.trim().to_owned(),
-        slug: slug.to_owned(),
-        description: description.trim().to_owned(),
-        harness: selected.id().to_owned(),
-        model: None,
-        thinking: None,
-        permissions: Vec::new(),
-        permission_mode: Default::default(),
-        draft: String::new(),
-        idle_timeout: crate::config::default_idle_timeout(),
-    };
+    let mut config = AgentConfig::new(name.trim(), slug, description.trim(), selected.id());
+    config.color = Some(crate::config::AgentColor::random());
     harness::install_adapter(root, selected).await?;
 
     let launch = harness::launch(root, &config.harness, SOUL_WRITER)?;
@@ -227,12 +229,83 @@ fn create_structure(root: &Path) -> Result<()> {
     fs::create_dir_all(&agent_paths.skills)?;
     fs::create_dir_all(&agent_paths.runtime)?;
     fs::create_dir_all(&agent_paths.sessions)?;
-    fs::write(&agent_paths.mcp, b"[]\n")?;
-    fs::write(
-        agent_paths.state.join(".gitignore"),
+    write_if_missing(&agent_paths.mcp, b"[]\n")?;
+    write_if_missing(
+        &agent_paths.state.join(".gitignore"),
         b"agent.json\nSOUL.md\nmcps.json\nruntime/\nsessions/\n",
     )?;
     Ok(())
+}
+
+fn write_if_missing(path: &Path, contents: &[u8]) -> Result<()> {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(mut file) => file
+            .write_all(contents)
+            .with_context(|| format!("could not write {}", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("could not create {}", path.display())),
+    }
+}
+
+struct AgentFiles {
+    files: Vec<AgentFile>,
+}
+
+struct AgentFile {
+    path: PathBuf,
+    original: Option<(Vec<u8>, fs::Permissions)>,
+}
+
+impl AgentFiles {
+    fn read(root: &Path, slug: &str) -> Result<Self> {
+        let agent_paths = paths(root);
+        let mut files = Vec::new();
+        for path in [agent_paths.config, agent_paths.soul, root.join(slug)] {
+            let original = match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if !metadata.is_file() {
+                        bail!(
+                            "{} is not a regular file; move it before initialization",
+                            path.display()
+                        );
+                    }
+                    Some((fs::read(&path)?, metadata.permissions()))
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("could not inspect {}", path.display()))
+                }
+            };
+            files.push(AgentFile { path, original });
+        }
+        Ok(Self { files })
+    }
+
+    fn existing_paths(&self) -> Vec<&Path> {
+        self.files
+            .iter()
+            .filter_map(|file| file.original.as_ref().map(|_| file.path.as_path()))
+            .collect()
+    }
+
+    fn restore(&self) -> Result<()> {
+        for file in &self.files {
+            let path = &file.path;
+            match &file.original {
+                Some((contents, permissions)) => {
+                    fs::write(path, contents)?;
+                    fs::set_permissions(path, permissions.clone())?;
+                }
+                None => match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                },
+            }
+        }
+        Ok(())
+    }
 }
 
 async fn generate_soul(client: &mut Client, config: &AgentConfig) -> Result<String> {
@@ -337,28 +410,14 @@ async fn choose_option(
         });
     };
     let id = option.id.clone();
-    let choices = option
-        .choices
-        .iter()
-        .cloned()
-        .map(|mut choice| {
-            if matches!(kind, ConfigKind::Model) {
-                choice.label = choice.label.to_lowercase();
-            }
-            Choice(choice)
-        })
-        .collect::<Vec<_>>();
-    let cursor = choices
-        .iter()
-        .position(|choice| choice.0.value == option.current_value)
-        .unwrap_or_default();
+    let cursor = option.cursor();
+    let choices = option.choices.clone();
     let selected = inquire(label, || {
         Select::new(label, choices)
             .with_starting_cursor(cursor)
             .with_formatter(&|_| String::new())
             .prompt()
-    })?
-    .0;
+    })?;
     client.set_config_option(&id, &selected.value).await?;
     Ok(WizardSelection {
         value: Some(selected.value),
@@ -369,25 +428,6 @@ async fn choose_option(
 struct WizardSelection {
     value: Option<String>,
     label: String,
-}
-
-struct Choice(ConfigChoice);
-
-impl fmt::Display for Choice {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = crate::markdown::sanitize(&self.0.label);
-        match &self.0.description {
-            Some(description) if !description.is_empty() => {
-                write!(
-                    formatter,
-                    "{} - {}",
-                    label,
-                    crate::markdown::sanitize(description)
-                )
-            }
-            _ => formatter.write_str(&label),
-        }
-    }
 }
 
 fn inquire<T>(
@@ -432,13 +472,7 @@ exec lazyagents chat "$@"
 "##;
     fs::write(destination, script)
         .with_context(|| format!("could not write launcher {}", destination.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = fs::metadata(destination)?.permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(destination, permissions)?;
-    }
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o755))?;
     Ok(())
 }
 
@@ -449,17 +483,14 @@ fn install_global_link(launcher: &Path, slug: &str) -> Result<()> {
     let bin = home.join(".local/bin");
     fs::create_dir_all(&bin)?;
     let link = bin.join(slug);
-    if link.exists() || link.symlink_metadata().is_ok() {
+    if link.symlink_metadata().is_ok() {
         bail!(
             "{} already exists; the local launcher is still ready",
             link.display()
         );
     }
     let launcher = launcher.canonicalize()?;
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&launcher, &link)?;
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(&launcher, &link)?;
     println!("Linked {}", link.display());
     Ok(())
 }
@@ -483,15 +514,103 @@ fn make_slug(value: &str) -> Result<String> {
     if slug.is_empty() {
         bail!("the agent name must contain at least one letter or number");
     }
+    // The launcher shares the agent folder with the working directory.
+    if slug == "workspace" {
+        bail!("the agent name \"workspace\" is reserved; choose another name");
+    }
     Ok(slug)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+
+    #[test]
+    fn initializes_with_existing_skills_and_preserves_support_files() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let agent_paths = paths(root);
+        fs::create_dir_all(agent_paths.skills.join("job-search")).unwrap();
+        fs::write(agent_paths.skills.join("job-search/SKILL.md"), "Find jobs").unwrap();
+        fs::write(&agent_paths.mcp, "[{\"name\":\"jobs\"}]\n").unwrap();
+        fs::write(agent_paths.state.join(".gitignore"), "custom\n").unwrap();
+
+        assert!(AgentFiles::read(root, "attache")
+            .unwrap()
+            .existing_paths()
+            .is_empty());
+        create_structure(root).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(agent_paths.skills.join("job-search/SKILL.md")).unwrap(),
+            "Find jobs"
+        );
+        assert_eq!(
+            fs::read_to_string(agent_paths.mcp).unwrap(),
+            "[{\"name\":\"jobs\"}]\n"
+        );
+        assert_eq!(
+            fs::read_to_string(agent_paths.state.join(".gitignore")).unwrap(),
+            "custom\n"
+        );
+        assert!(agent_paths.sessions.is_dir());
+    }
+
+    #[test]
+    fn detects_each_file_that_setup_will_replace() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        create_structure(root).unwrap();
+        let agent_paths = paths(root);
+        let launcher = root.join("attache");
+        for path in [&agent_paths.config, &agent_paths.soul, &launcher] {
+            fs::write(path, "existing").unwrap();
+            assert!(AgentFiles::read(root, "attache")
+                .unwrap()
+                .existing_paths()
+                .contains(&path.as_path()));
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn restores_replaced_files_and_removes_partial_setup_files() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        create_structure(root).unwrap();
+        let agent_paths = paths(root);
+        fs::write(&agent_paths.config, "old config").unwrap();
+        fs::write(&agent_paths.soul, "old soul").unwrap();
+        fs::write(agent_paths.sessions.join("history.jsonl"), "history").unwrap();
+        let original = AgentFiles::read(root, "attache").unwrap();
+        fs::write(&agent_paths.config, "new config").unwrap();
+        fs::write(&agent_paths.soul, "new soul").unwrap();
+        write_launcher(&root.join("attache")).unwrap();
+
+        original.restore().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(agent_paths.config).unwrap(),
+            "old config"
+        );
+        assert_eq!(fs::read_to_string(agent_paths.soul).unwrap(), "old soul");
+        assert!(!root.join("attache").exists());
+        assert_eq!(
+            fs::read_to_string(agent_paths.sessions.join("history.jsonl")).unwrap(),
+            "history"
+        );
+    }
+
+    #[test]
+    fn rejects_a_launcher_symlink_without_changing_its_target() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("target");
+        fs::write(&target, "keep").unwrap();
+        std::os::unix::fs::symlink(&target, directory.path().join("attache")).unwrap();
+        assert!(AgentFiles::read(directory.path(), "attache").is_err());
+        assert_eq!(fs::read_to_string(target).unwrap(), "keep");
+    }
 
     #[test]
     fn writes_a_small_launcher_script() {
@@ -501,7 +620,6 @@ mod tests {
         let script = fs::read_to_string(&launcher).unwrap();
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains("exec lazyagents chat \"$@\""));
-        #[cfg(unix)]
         assert_ne!(
             fs::metadata(launcher).unwrap().permissions().mode() & 0o111,
             0
@@ -514,7 +632,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_an_empty_name() {
+    fn rejects_an_empty_or_reserved_name() {
         assert!(make_slug(" -- ").is_err());
+        assert!(make_slug("Workspace").is_err());
     }
 }

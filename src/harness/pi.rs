@@ -30,7 +30,7 @@ impl Harness for Pi {
     fn adapter(&self) -> Option<AdapterSpec> {
         Some(AdapterSpec {
             package: "@automatalabs/pi-acp",
-            version: "0.8.0",
+            min_version: "0.8.0",
             binary: "pi-acp",
         })
     }
@@ -38,6 +38,14 @@ impl Harness for Pi {
     fn authentication(&self) -> Option<Authentication> {
         // Pi has provider-specific authentication and no general login command.
         None
+    }
+
+    fn approves_tool_names(&self) -> bool {
+        true
+    }
+
+    fn always_allow_is_session_only(&self) -> bool {
+        true
     }
 
     fn launch_options(&self, context: LaunchContext<'_>) -> Result<LaunchOptions> {
